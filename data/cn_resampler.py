@@ -1,20 +1,17 @@
+
 """
-Resample Wakhan copy-number segments to fixed-length tensor sequences.
+Resample paired Wakhan haplotype copy-number segments to fixed tensors.
 
-The CN encoder consumes five channels in a fixed bin count:
+The CN encoder consumes a fixed bin count with these channels:
 
-    cn_total, cn_hp1, cn_hp2, loh, allele_imbalance
+    cn_total, cn_hp1, cn_hp2, log_coverage_total,
+    coverage_hp1_fraction, coverage_hp2_fraction,
+    confidence_hp1, confidence_hp2, loh, allele_imbalance,
+    breakpoint_count
 
-This module supports two related operations:
-
-1. Arm-level resampling:
-       one chromosomal arm -> [n_bins, 5]
-
-2. Base-pair-window resampling:
-       one genomic interval [start_bp, end_bp) -> [n_bins, 5]
-
-The bp-window interface is useful for masked CN pretraining because it makes
-the model learn over fixed genomic spans rather than fixed numbers of CN calls.
+The bp-window interface samples fixed genomic spans and resamples each span to
+[n_bins, len(CN_CHANNELS)]. Long CN segments naturally occupy more bins than
+short segments because bins are evenly spaced in bp coordinates.
 """
 
 from __future__ import annotations
@@ -24,9 +21,38 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
-CN_CHANNELS = ["cn_total", "cn_hp1", "cn_hp2", "loh", "allele_imbalance"]
-CONTINUOUS_CHANNELS = ["cn_total", "cn_hp1", "cn_hp2", "allele_imbalance"]
+CN_CHANNELS = [
+    "cn_total",
+    "cn_hp1",
+    "cn_hp2",
+    "log_coverage_total",
+    "coverage_hp1_fraction",
+    "coverage_hp2_fraction",
+    "confidence_hp1",
+    "confidence_hp2",
+    "loh",
+    "allele_imbalance",
+    "breakpoint_count",
+]
+
+DISCRETE_CHANNELS = {"loh", "breakpoint_count"}
+UNIT_INTERVAL_CHANNELS = {
+    "coverage_hp1_fraction",
+    "coverage_hp2_fraction",
+    "confidence_hp1",
+    "confidence_hp2",
+    "loh",
+    "allele_imbalance",
+}
+NONNEGATIVE_CHANNELS = {
+    "cn_total",
+    "cn_hp1",
+    "cn_hp2",
+    "log_coverage_total",
+    "breakpoint_count",
+}
 
 HG38_CENTROMERE: dict[str, int] = {
     "chr1": 123_459_000,
@@ -77,9 +103,6 @@ def _prepare_segments(
     start_bp: int | None = None,
     end_bp: int | None = None,
 ) -> pd.DataFrame:
-    """
-    Sort, optionally clip, and return valid non-empty CN segments.
-    """
     _validate_segment_columns(df)
 
     segs = df.copy()
@@ -94,19 +117,16 @@ def _prepare_segments(
     if start_bp is not None and end_bp is not None:
         start_bp = int(start_bp)
         end_bp = int(end_bp)
-
         if end_bp <= start_bp:
             raise ValueError("end_bp must be greater than start_bp")
 
         segs = segs[(segs["end"] > start_bp) & (segs["start"] < end_bp)].copy()
-
         if not segs.empty:
             segs["start"] = segs["start"].clip(lower=start_bp)
             segs["end"] = segs["end"].clip(upper=end_bp)
 
     segs = segs[segs["end"] > segs["start"]]
     segs = segs.sort_values(["start", "end"]).reset_index(drop=True)
-
     return segs
 
 
@@ -117,11 +137,20 @@ def _nearest_values(xp: np.ndarray, fp: np.ndarray, x: np.ndarray) -> np.ndarray
     insert = np.searchsorted(xp, x, side="left")
     left = np.clip(insert - 1, 0, xp.size - 1)
     right = np.clip(insert, 0, xp.size - 1)
-
     choose_right = np.abs(xp[right] - x) < np.abs(x - xp[left])
     nearest = np.where(choose_right, right, left)
-
     return fp[nearest].astype(np.float32)
+
+
+def _postprocess_channel(values: np.ndarray, col: str) -> np.ndarray:
+    out = values.astype(np.float32)
+    if col in DISCRETE_CHANNELS:
+        out = np.rint(out)
+    if col in UNIT_INTERVAL_CHANNELS:
+        out = np.clip(out, 0.0, 1.0)
+    if col in NONNEGATIVE_CHANNELS:
+        out = np.clip(out, 0.0, None)
+    return out.astype(np.float32)
 
 
 def _resample_segments(
@@ -130,12 +159,6 @@ def _resample_segments(
     span_start: int | None = None,
     span_end: int | None = None,
 ) -> np.ndarray:
-    """
-    Resample copy-number state over a fixed genomic span.
-
-    The output bins are evenly spaced in bp coordinates. This means long CN
-    segments naturally occupy more bins than short CN segments.
-    """
     if n_bins <= 0:
         raise ValueError("n_bins must be positive")
 
@@ -149,75 +172,38 @@ def _resample_segments(
         start = 0
         end = 1
 
-    if end <= start:
+    if end <= start or segs.empty:
         return np.zeros((n_bins, len(CN_CHANNELS)), dtype=np.float32)
 
-    if segs.empty:
-        return np.zeros((n_bins, len(CN_CHANNELS)), dtype=np.float32)
-
-    mids = (
-        segs["start"].to_numpy(dtype=np.float64)
-        + segs["end"].to_numpy(dtype=np.float64)
-    ) / 2.0
-
+    mids = (segs["start"].to_numpy(dtype=np.float64) + segs["end"].to_numpy(dtype=np.float64)) / 2.0
     order = np.argsort(mids)
     mids = mids[order]
     segs = segs.iloc[order].reset_index(drop=True)
 
-    # Collapse duplicate midpoints.
     if len(np.unique(mids)) != len(mids):
         temp = segs.copy()
         temp["_mid"] = mids
-        grouped = temp.groupby("_mid", sort=True, as_index=False)
-
-        agg = {col: "mean" for col in CONTINUOUS_CHANNELS}
-        agg["loh"] = "mean"
-
-        collapsed = grouped.agg(agg)
+        agg = {col: "mean" for col in CN_CHANNELS}
+        collapsed = temp.groupby("_mid", sort=True, as_index=False).agg(agg)
         mids = collapsed["_mid"].to_numpy(dtype=np.float64)
         segs = collapsed
 
     bin_edges = np.linspace(float(start), float(end), n_bins + 1, dtype=np.float64)
     bin_mids = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-
     out = np.zeros((n_bins, len(CN_CHANNELS)), dtype=np.float32)
 
     for j, col in enumerate(CN_CHANNELS):
         values = segs[col].to_numpy(dtype=np.float64)
-
-        if col == "loh":
-            out[:, j] = (
-                np.rint(_nearest_values(mids, values, bin_mids))
-                .clip(0, 1)
-                .astype(np.float32)
-            )
+        if col in DISCRETE_CHANNELS:
+            sampled = _nearest_values(mids, values, bin_mids)
         else:
-            out[:, j] = np.interp(
-                bin_mids,
-                mids,
-                values,
-                left=values[0],
-                right=values[-1],
-            ).astype(np.float32)
-
-    out[:, CN_CHANNELS.index("allele_imbalance")] = np.clip(
-        out[:, CN_CHANNELS.index("allele_imbalance")],
-        0.0,
-        1.0,
-    )
-    out[:, CN_CHANNELS.index("loh")] = np.clip(
-        out[:, CN_CHANNELS.index("loh")],
-        0.0,
-        1.0,
-    )
+            sampled = np.interp(bin_mids, mids, values, left=values[0], right=values[-1]).astype(np.float32)
+        out[:, j] = _postprocess_channel(sampled, col)
 
     return out.astype(np.float32)
 
 
 def resample_arm(df_arm: pd.DataFrame, n_bins: int = 256) -> np.ndarray:
-    """
-    Resample a single chromosomal arm to [n_bins, 5].
-    """
     segs = _prepare_segments(df_arm)
     return _resample_segments(segs, n_bins=n_bins)
 
@@ -228,22 +214,8 @@ def resample_region(
     end_bp: int,
     n_bins: int = 128,
 ) -> np.ndarray:
-    """
-    Resample CN segments overlapping [start_bp, end_bp) to [n_bins, 5].
-
-    This is the main primitive for bp-window pretraining.
-    """
-    segs = _prepare_segments(
-        df_segments,
-        start_bp=int(start_bp),
-        end_bp=int(end_bp),
-    )
-    return _resample_segments(
-        segs,
-        n_bins=n_bins,
-        span_start=int(start_bp),
-        span_end=int(end_bp),
-    )
+    segs = _prepare_segments(df_segments, start_bp=int(start_bp), end_bp=int(end_bp))
+    return _resample_segments(segs, n_bins=n_bins, span_start=int(start_bp), span_end=int(end_bp))
 
 
 def arm_to_tensor(df_arm: pd.DataFrame, n_bins: int = 256) -> torch.Tensor:
@@ -257,23 +229,14 @@ def region_to_tensor(
     n_bins: int = 128,
 ) -> torch.Tensor:
     return torch.as_tensor(
-        resample_region(
-            df_segments,
-            start_bp=start_bp,
-            end_bp=end_bp,
-            n_bins=n_bins,
-        ),
+        resample_region(df_segments, start_bp=start_bp, end_bp=end_bp, n_bins=n_bins),
         dtype=torch.float32,
     )
 
 
 def get_arm_bounds(df_chrom: pd.DataFrame) -> list[tuple[str, int, int]]:
-    """
-    Return arm intervals for one chromosome.
-    """
     if df_chrom.empty:
         return []
-
     if not {"chrom", "start", "end"}.issubset(df_chrom.columns):
         raise ValueError("df_chrom must contain chrom, start, and end columns")
 
@@ -283,22 +246,15 @@ def get_arm_bounds(df_chrom: pd.DataFrame) -> list[tuple[str, int, int]]:
 
     chrom = chrom_values[0]
     chrom_key = _normalise_chrom_for_centromere(chrom)
-
     span_start = int(pd.to_numeric(df_chrom["start"], errors="coerce").min())
     span_end = int(pd.to_numeric(df_chrom["end"], errors="coerce").max())
-
     if span_end <= span_start:
         return []
 
     split = HG38_CENTROMERE.get(chrom_key)
-
     if split is None or split <= span_start or split >= span_end:
         return [(f"{chrom}", span_start, span_end)]
-
-    return [
-        (f"{chrom}p", span_start, int(split)),
-        (f"{chrom}q", int(split), span_end),
-    ]
+    return [(f"{chrom}p", span_start, int(split)), (f"{chrom}q", int(split), span_end)]
 
 
 def build_bp_window_tensors(
@@ -308,76 +264,67 @@ def build_bp_window_tensors(
     windows_per_chrom_per_size: int = 40,
     min_covered_fraction: float = 0.10,
     rng: np.random.Generator | None = None,
+    max_windows: int | None = None,
+    progress: bool = False,
 ) -> tuple[list[torch.Tensor], pd.DataFrame]:
     """
-    Build training examples from fixed-size base-pair windows.
+    Build fixed-size genomic-window training examples.
 
-    For each sample/chromosome and each requested bp size, this samples genomic
-    intervals of that bp length, clips CN segments to the interval, and resamples
-    the interval to [n_bins, 5].
+    For each sample/chromosome and requested bp size, this samples intervals,
+    clips paired CN segments to the interval, and resamples to
+    [n_bins, len(CN_CHANNELS)].
 
-    Parameters
-    ----------
-    df:
-        Canonical Wakhan segment DataFrame.
-    window_bp_sizes:
-        Genomic span sizes, for example [50_000, 100_000, 500_000, 1_000_000].
-    n_bins:
-        Transformer sequence length after bp resampling.
-    windows_per_chrom_per_size:
-        Number of random windows sampled per sample/chromosome/window size.
-    min_covered_fraction:
-        Require at least this fraction of the bp window to be overlapped by
-        observed CN segments. This avoids mostly-empty examples.
-    rng:
-        Optional numpy random generator.
-
-    Returns
-    -------
-    tensors:
-        List of torch.float32 tensors, each [n_bins, 5].
-    metadata:
-        DataFrame with sample_id, chrom, start_bp, end_bp, window_bp_size,
-        covered_bp, covered_fraction, n_segments.
+    max_windows optionally caps the number of accepted tensors. This is useful
+    for large cohorts where samples * chromosomes * sizes * random windows can
+    easily produce hundreds of thousands of examples before training starts.
     """
     if rng is None:
         rng = np.random.default_rng()
-
     if not window_bp_sizes:
         raise ValueError("window_bp_sizes must contain at least one bp size")
 
     bad_sizes = [int(x) for x in window_bp_sizes if int(x) <= 0]
     if bad_sizes:
         raise ValueError(f"window_bp_sizes must be positive; got {bad_sizes}")
+    if max_windows is not None and int(max_windows) <= 0:
+        raise ValueError("max_windows must be positive when provided")
 
+    max_windows = int(max_windows) if max_windows is not None else None
     tensors: list[torch.Tensor] = []
     meta: list[dict[str, object]] = []
 
-    for (sample_id, chrom), grp in df.groupby(["sample_id", "chrom"], sort=False):
-        grp = grp.sort_values(["start", "end"]).reset_index(drop=True)
+    groups = list(df.groupby(["sample_id", "chrom"], sort=False))
+    group_iter = tqdm(groups, desc="build windows", unit="chrom", leave=False) if progress else groups
+
+    for (sample_id, chrom), grp_raw in group_iter:
+        if max_windows is not None and len(tensors) >= max_windows:
+            break
+
+        # Prepare numeric, sorted segments once per sample/chromosome. Each
+        # sampled window then only clips the already-prepared overlap.
+        grp = _prepare_segments(grp_raw)
+        if grp.empty:
+            continue
 
         chrom_start = int(grp["start"].min())
         chrom_end = int(grp["end"].max())
-
         if chrom_end <= chrom_start:
             continue
 
         for window_bp in window_bp_sizes:
-            window_bp = int(window_bp)
+            if max_windows is not None and len(tensors) >= max_windows:
+                break
 
+            window_bp = int(window_bp)
             if window_bp > chrom_end - chrom_start:
-                # For small chromosomes or sparse observed spans, use the full
-                # observed span rather than dropping the chromosome entirely.
                 candidate_starts = np.array([chrom_start], dtype=np.int64)
                 effective_window_bp = chrom_end - chrom_start
             else:
                 max_start = chrom_end - window_bp
                 possible = max_start - chrom_start + 1
-
                 n_samples = min(int(windows_per_chrom_per_size), int(possible))
                 if n_samples <= 0:
                     continue
-
                 candidate_starts = rng.integers(
                     low=chrom_start,
                     high=max_start + 1,
@@ -388,30 +335,33 @@ def build_bp_window_tensors(
                 effective_window_bp = window_bp
 
             for start_bp in candidate_starts:
+                if max_windows is not None and len(tensors) >= max_windows:
+                    break
+
                 start_bp = int(start_bp)
                 end_bp = int(start_bp + effective_window_bp)
-
-                overlap = grp[
-                    (grp["end"] > start_bp)
-                    & (grp["start"] < end_bp)
-                ].copy()
-
+                overlap = grp[(grp["end"] > start_bp) & (grp["start"] < end_bp)]
                 if overlap.empty:
                     continue
 
                 clipped_start = overlap["start"].clip(lower=start_bp)
                 clipped_end = overlap["end"].clip(upper=end_bp)
                 covered_bp = int((clipped_end - clipped_start).clip(lower=0).sum())
-
                 covered_fraction = covered_bp / max(end_bp - start_bp, 1)
                 if covered_fraction < min_covered_fraction:
                     continue
 
-                tensor = region_to_tensor(
-                    grp,
-                    start_bp=start_bp,
-                    end_bp=end_bp,
-                    n_bins=n_bins,
+                clipped = overlap.copy()
+                clipped["start"] = clipped_start
+                clipped["end"] = clipped_end
+                tensor = torch.as_tensor(
+                    _resample_segments(
+                        clipped,
+                        n_bins=n_bins,
+                        span_start=start_bp,
+                        span_end=end_bp,
+                    ),
+                    dtype=torch.float32,
                 )
 
                 tensors.append(tensor)

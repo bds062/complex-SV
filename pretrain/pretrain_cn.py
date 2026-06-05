@@ -1,22 +1,21 @@
 """
 Phase 1 CN encoder pretraining entry point.
 
-Trains a BERT-style masked copy-number autoencoder on unlabeled Wakhan CNV
-calls. Parsing is delegated to data.wakhan_parser, and arm-level resampling is
-delegated to data.cn_resampler.
+Trains a BERT-style masked copy-number autoencoder on paired Wakhan haplotype
+BED outputs. Input is provided only through --input_list, with one BED root per
+line; each root resolves to the matching HP_1 and HP_2 BED files.
 
-Compared with the older version, this script follows the working MAE pattern:
+Training follows the masked-autoencoder pattern:
 
     dataset returns x_masked, x_target, mask
     loss is computed only at masked bins
     training uses one shared feature space across all samples
-    checkpoint also stores arm metadata and extracted embeddings when possible
+    checkpoints store channel metadata and optional window embeddings
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 import logging
 import math
 import sys
@@ -38,7 +37,7 @@ from tqdm import tqdm
 
 try:
     from config import CNEncoderConfig
-    from data.cn_resampler import build_bp_window_tensors
+    from data.cn_resampler import CN_CHANNELS, build_bp_window_tensors
     from data.wakhan_parser import parse_all_wakhan
     from utils import get_device, save_checkpoint, set_seed, setup_logging
     from pretrain.cn_encoder import CNMaskedAutoencoder
@@ -48,7 +47,7 @@ except ImportError:
         sys.path.insert(0, str(ROOT))
 
     from config import CNEncoderConfig
-    from data.cn_resampler import build_bp_window_tensors
+    from data.cn_resampler import CN_CHANNELS, build_bp_window_tensors
     from data.wakhan_parser import parse_all_wakhan
     from utils import get_device, save_checkpoint, set_seed, setup_logging
     from pretrain.cn_encoder import CNMaskedAutoencoder
@@ -56,55 +55,37 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 
-def _resolve_inputs(
-    input_patterns: list[str] | None,
-    input_list: str | None,
-) -> list[str]:
+def _status(message: str) -> None:
+    print(f"[pretrain_cn] {message}", flush=True)
+
+
+def _resolve_input_roots(input_list: str) -> list[str]:
     """
-    Collect Wakhan paths from --input and/or --input_list.
+    Collect Wakhan BED roots from --input_list.
+
+    Each non-comment line should be either a BED root, a
+    *_copynumbers_segments prefix, or one of the paired HP BED paths.
     """
-    paths: list[str] = []
+    list_path = Path(input_list)
+    if not list_path.exists():
+        raise FileNotFoundError(f"--input_list not found: {list_path}")
 
-    if input_patterns:
-        for pattern in input_patterns:
-            expanded = glob.glob(pattern)
-            if expanded:
-                paths.extend(expanded)
-            else:
-                paths.append(pattern)
+    roots: list[str] = []
+    with list_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            item = line.strip()
+            if item and not item.startswith("#"):
+                roots.append(item)
 
-    if input_list:
-        list_path = Path(input_list)
-        if not list_path.exists():
-            raise FileNotFoundError(f"--input_list not found: {list_path}")
+    unique = list(dict.fromkeys(roots))
+    if not unique:
+        raise FileNotFoundError("--input_list did not contain any Wakhan BED roots")
 
-        with list_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                item = line.strip()
-                if item and not item.startswith("#"):
-                    paths.append(item)
-
-    seen: set[str] = set()
-    unique: list[str] = []
-    for path in paths:
-        if path not in seen:
-            seen.add(path)
-            unique.append(path)
-
-    missing = [p for p in unique if not Path(p).exists()]
-    if missing:
-        log.warning("%d input path(s) do not exist; examples: %s", len(missing), missing[:5])
-
-    valid = [p for p in unique if Path(p).exists()]
-    if not valid:
-        raise FileNotFoundError("No valid Wakhan inputs found. Use --input or --input_list.")
-
-    return valid
-
+    return unique
 
 class CNWindowDataset(Dataset):
     """
-    One item is one bp-window resampled to [n_bins, 5].
+    One item is one bp-window resampled to [n_bins, len(CN_CHANNELS)].
     """
 
     def __init__(self, tensors: list[torch.Tensor], mask_prob: float) -> None:
@@ -130,20 +111,35 @@ class CNWindowDataset(Dataset):
 
 
 def _build_training_tensors(
-    wakhan_paths: list[str],
+    wakhan_roots: list[str],
     window_bp_sizes: list[int],
     n_bins: int,
     windows_per_chrom_per_size: int,
     min_covered_fraction: float,
     seed: int,
+    max_windows: int | None = None,
 ) -> tuple[list[torch.Tensor], pd.DataFrame]:
     """
-    Parse Wakhan inputs and build fixed-bp genomic windows.
+    Parse Wakhan BED roots and build fixed-bp genomic windows.
 
     Each training example is a genomic interval of size window_bp_size, resampled
-    to [n_bins, 5]. Long CN segments therefore occupy proportionally more bins.
+    to [n_bins, len(CN_CHANNELS)]. Long CN segments therefore occupy proportionally more bins.
     """
-    df = parse_all_wakhan(wakhan_paths)
+    _status(f"Parsing {len(wakhan_roots):,} Wakhan BED root(s)")
+    df = parse_all_wakhan(wakhan_roots)
+    n_samples = df["sample_id"].nunique()
+    n_chrom_groups = df.groupby(["sample_id", "chrom"], sort=False).ngroups
+    upper_bound = n_chrom_groups * len(window_bp_sizes) * int(windows_per_chrom_per_size)
+    _status(
+        f"Parsed {len(df):,} paired segment(s) across {n_samples:,} sample(s); "
+        f"{n_chrom_groups:,} sample/chromosome group(s)"
+    )
+    _status(
+        f"Building bp-window tensors: n_bins={n_bins}, sizes={window_bp_sizes}, "
+        f"windows_per_chrom_per_size={windows_per_chrom_per_size}, "
+        f"upper_bound~{upper_bound:,}, max_windows={max_windows}"
+    )
+
     rng = np.random.default_rng(seed)
 
     tensors, meta = build_bp_window_tensors(
@@ -153,7 +149,10 @@ def _build_training_tensors(
         windows_per_chrom_per_size=windows_per_chrom_per_size,
         min_covered_fraction=min_covered_fraction,
         rng=rng,
+        max_windows=max_windows,
+        progress=True,
     )
+    _status(f"Built {len(tensors):,} accepted bp-window tensor(s)")
 
     if not tensors:
         raise RuntimeError(
@@ -188,6 +187,7 @@ def _make_encoder_cfg(base: CNEncoderConfig) -> SimpleNamespace:
     """
     Provide project-spec names plus legacy prototype names.
     """
+    max_bins = max(base.n_bins_arm, base.n_bins_region)
     return SimpleNamespace(
         d_model=base.d_model,
         n_heads=base.n_heads,
@@ -195,13 +195,12 @@ def _make_encoder_cfg(base: CNEncoderConfig) -> SimpleNamespace:
         ff_dim=base.ff_dim,
         d_ff=base.ff_dim,
         dropout=base.dropout,
-        n_bins_arm=base.n_bins_arm,
+        n_bins_arm=max_bins,
         n_bins_region=base.n_bins_region,
-        seq_len=base.n_bins_arm,
+        seq_len=max_bins,
         mask_prob=base.mask_prob,
         embed_dim=base.d_model,
     )
-
 
 def _forward_cn(
     model: nn.Module,
@@ -348,6 +347,7 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
     output_dir = Path(args.output_dir)
     logger = setup_logging(output_dir)
     logger.info("Starting CN encoder pretraining")
+    _status("Starting CN encoder pretraining")
 
     cfg = CNEncoderConfig(
         d_model=args.d_model,
@@ -360,21 +360,25 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
         mask_prob=args.mask_prob,
     )
 
-    inputs = _resolve_inputs(args.input, args.input_list)
+    input_roots = _resolve_input_roots(args.input_list)
+    _status(f"Loaded {len(input_roots):,} input root(s) from {args.input_list}")
 
     window_tensors, window_meta = _build_training_tensors(
-        wakhan_paths=inputs,
+        wakhan_roots=input_roots,
         window_bp_sizes=args.window_bp_sizes,
         n_bins=cfg.n_bins_region,
         windows_per_chrom_per_size=args.windows_per_chrom_per_size,
         min_covered_fraction=args.min_covered_fraction,
         seed=args.seed,
+        max_windows=args.max_windows,
     )
 
     dataset = CNWindowDataset(window_tensors, mask_prob=cfg.mask_prob)
+    _status(f"Dataset ready with {len(dataset):,} window(s)")
 
     val_size = max(1, int(round(args.val_fraction * len(dataset)))) if len(dataset) > 1 else 0
     train_size = len(dataset) - val_size
+    _status(f"Train/val split: {train_size:,} train window(s), {val_size:,} val window(s)")
 
     if val_size > 0:
         generator = torch.Generator().manual_seed(args.seed)
@@ -401,10 +405,12 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
 
     device = get_device()
     logger.info("Device: %s", device)
+    _status(f"Using device: {device}")
 
     model = CNMaskedAutoencoder(_make_encoder_cfg(cfg)).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("CN model parameters: %s", f"{n_params:,}")
+    _status(f"CN model parameters: {n_params:,}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -477,8 +483,10 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
             "window_bp_sizes": args.window_bp_sizes,
             "windows_per_chrom_per_size": args.windows_per_chrom_per_size,
             "min_covered_fraction": args.min_covered_fraction,
+            "max_windows": args.max_windows,
         },
-        "input_files": inputs,
+        "input_bed_roots": input_roots,
+        "cn_channels": list(CN_CHANNELS),
     }
 
     save_checkpoint(
@@ -495,7 +503,7 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
     logger.info("Saved bp-window metadata to %s", output_dir / "cn_bp_window_metadata.tsv")
 
     if args.save_embeddings:
-        logger.info("Extracting arm embeddings ...")
+        logger.info("Extracting bp-window embeddings ...")
         embeddings = _extract_embeddings(
             model,
             dataset,
@@ -503,22 +511,31 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
             batch_size=max(args.batch_size, 128),
         )
 
+        embed_meta = window_meta.reset_index(drop=True).copy()
+        if len(embed_meta) != embeddings.shape[0]:
+            raise RuntimeError(
+                "Embedding count does not match window metadata count: "
+                f"{embeddings.shape[0]} vs {len(embed_meta)}"
+            )
+
+        meta_arrays = {}
+        for col in embed_meta.columns:
+            values = embed_meta[col].values
+            if values.dtype == object:
+                values = values.astype(str)
+            meta_arrays[col] = values
+
         np.savez(
-            output_dir / "cn_arm_embeddings.npz",
+            output_dir / "cn_window_embeddings.npz",
             embeddings=embeddings,
-            sample_id=arm_meta["sample_id"].values.astype(str),
-            chrom=arm_meta["chrom"].values.astype(str),
-            arm=arm_meta["arm"].values.astype(str),
-            arm_start=arm_meta["arm_start"].values,
-            arm_end=arm_meta["arm_end"].values,
-            n_segments=arm_meta["n_segments"].values,
             train_losses=np.asarray(train_losses, dtype=np.float32),
             val_losses=np.asarray(val_losses, dtype=np.float32),
+            **meta_arrays,
         )
 
         logger.info(
-            "Saved arm embeddings to %s shape=%s",
-            output_dir / "cn_arm_embeddings.npz",
+            "Saved bp-window embeddings to %s shape=%s",
+            output_dir / "cn_window_embeddings.npz",
             embeddings.shape,
         )
 
@@ -544,13 +561,20 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     defaults = CNEncoderConfig()
 
     parser = argparse.ArgumentParser(
-        description="Pretrain the masked CN Transformer encoder on Wakhan outputs.",
+        description="Pretrain the masked CN Transformer encoder on paired Wakhan BED roots.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     inp = parser.add_argument_group("Input")
-    inp.add_argument("--input", nargs="+", metavar="WAKHAN")
-    inp.add_argument("--input_list", metavar="FILE")
+    inp.add_argument(
+        "--input_list",
+        required=True,
+        metavar="FILE",
+        help=(
+            "Text file with one Wakhan BED root per line. Each root resolves to "
+            "ROOT_copynumbers_segments_HP_1.bed and ROOT_copynumbers_segments_HP_2.bed."
+        ),
+    )
 
     parser.add_argument("--output_dir", default=".")
 
@@ -565,7 +589,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--save_embeddings",
         action="store_true",
-        help="Also save unmasked arm-level CLS embeddings to cn_arm_embeddings.npz.",
+        help="Also save unmasked bp-window CLS embeddings to cn_window_embeddings.npz.",
     )
 
     parser.add_argument("--d_model", type=int, default=defaults.d_model)
@@ -594,6 +618,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.10,
         help="Minimum fraction of a bp window overlapped by observed CN segments.",
+    )
+    parser.add_argument(
+        "--max_windows",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on the number of accepted bp-window tensors built before training. "
+            "Useful for large cohorts where samples * chromosomes * sizes * windows is huge."
+        ),
     )
 
     return parser.parse_args(argv)
