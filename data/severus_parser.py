@@ -2,7 +2,7 @@
 Parse Severus VCF output and construct graph-node feature matrices.
 
 This module is the only project component that reads Severus VCF text.  It
-produces the canonical per-SV DataFrame and the 31-dimensional node feature
+produces the canonical per-SV DataFrame and the canonical node feature
 matrix expected by the heterogeneous graph encoder.
 
 Canonical coordinates are 0-based half-open intervals.  VCF POS is converted
@@ -40,7 +40,17 @@ CONTINUOUS_COLS = [
     "phase_balance",
     "n_samples_gt",
 ]
-BINARY_COLS = ["is_precise", "is_vntr", "is_bnd", "has_phase", "hp_concordant"]
+BINARY_COLS = [
+    "is_precise",
+    "is_vntr",
+    "is_bnd",
+    "has_phase",
+    "hp_concordant",
+    "strand_1_plus",
+    "strand_1_minus",
+    "strand_2_plus",
+    "strand_2_minus",
+]
 SV_TYPE_MAP = {"DEL": 0, "INS": 1, "DUP": 2, "BND": 3, "sBND": 4, "INV": 5}
 GT_MAP = {"0/0": 0, "0/1": 1, "1/1": 2, "./.": 3}
 
@@ -183,9 +193,73 @@ def _parse_phase_set(value: object) -> int:
         return 0
 
 
+def _parse_strands(value: object) -> tuple[float, float, float, float]:
+    """
+    Encode Severus INFO/STRANDS as ordered breakpoint-side orientation flags.
+
+    Severus emits two-character orientations such as '+-', '-+', '++', and
+    '--'. Single breakends can carry one side only. Unknown/missing sides are
+    all-zero.
+    """
+    text = "" if value is None or value is True else str(value).strip()
+    signs = [ch for ch in text if ch in {"+", "-"}]
+    first = signs[0] if len(signs) >= 1 else ""
+    second = signs[1] if len(signs) >= 2 else ""
+    return (
+        1.0 if first == "+" else 0.0,
+        1.0 if first == "-" else 0.0,
+        1.0 if second == "+" else 0.0,
+        1.0 if second == "-" else 0.0,
+    )
+
+
 def _chrom_sort_key(chrom: object) -> int:
     text = str(chrom)
     return CHROM_ORDER.get(text, CHROM_ORDER.get(text.removeprefix("chr"), 99))
+
+
+def _clean_sample_id_part(part: str) -> str:
+    if part.startswith("wakhan_") and len(part) > len("wakhan_"):
+        return part.replace("wakhan_", "", 1)
+    return part
+
+
+def _looks_like_analysis_dir(part: str) -> bool:
+    return part.startswith("sv_cna_") or part in {"lumos_out", "mishas_analysis", "sniffles2"}
+
+
+def infer_sample_id_from_vcf(path: str | Path) -> str:
+    """
+    Infer a stable sample id from a Severus VCF path.
+
+    Many cohort layouts store every VCF under the same basename, for example:
+        sample_a/severus/somatic_SVs/severus_somatic.vcf
+        sample_a/sv_cna_v2/severus/somatic_SVs/severus_somatic.vcf
+
+    Falling back to only path.stem would collapse those inputs into one sample.
+    Prefer the enclosing sample directory when a standard Severus path shape is
+    present, then use informative parent directory names before the stem.
+    """
+    path = Path(path)
+
+    if path.parent.name in {"somatic_SVs", "all_SVs"} and path.parent.parent.name == "severus":
+        before_severus = path.parent.parent.parent
+        if _looks_like_analysis_dir(before_severus.name) and len(path.parents) > 3:
+            return _clean_sample_id_part(path.parents[3].name)
+        return _clean_sample_id_part(before_severus.name)
+
+    if path.stem in {"severus_somatic", "severus_all", "severus", "somatic_SVs", "all_SVs"}:
+        for parent in path.parents:
+            if parent.name == "severus" and parent.parent.name:
+                return _clean_sample_id_part(parent.parent.name)
+        if path.parent.name:
+            return _clean_sample_id_part(path.parent.name)
+
+    for part in reversed(path.parts):
+        if part.startswith("wakhan_") and part not in {"wakhan_paper"}:
+            return _clean_sample_id_part(part)
+
+    return path.stem
 
 
 def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataFrame:
@@ -198,7 +272,7 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
     """
     path = Path(path)
     if sample_id is None:
-        sample_id = path.stem
+        sample_id = infer_sample_id_from_vcf(path)
     if not path.exists():
         raise FileNotFoundError(f"Severus VCF not found: {path}")
 
@@ -238,6 +312,9 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
             supp_total, supp_hp1, supp_hp2 = _parse_supp(info.get("SUPP_READS", "0"))
             ref_total = _parse_ref_reads(info.get("REF_READS", "0"))
             has_phase_hp, hp_concordant = _parse_hp(info.get("HP", "0|0"))
+            strand_1_plus, strand_1_minus, strand_2_plus, strand_2_minus = _parse_strands(
+                info.get("STRANDS", "")
+            )
 
             vafs: list[float] = []
             drs: list[float] = []
@@ -305,6 +382,10 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
                     "is_bnd": float(is_bnd),
                     "has_phase": 1.0 if (phase_set != 0 or has_phase_hp) else 0.0,
                     "hp_concordant": 1.0 if hp_concordant else 0.0,
+                    "strand_1_plus": strand_1_plus,
+                    "strand_1_minus": strand_1_minus,
+                    "strand_2_plus": strand_2_plus,
+                    "strand_2_minus": strand_2_minus,
                 }
             )
 
@@ -356,11 +437,11 @@ def build_node_features(
     scaler: RobustScaler | None = None,
 ) -> tuple[np.ndarray, RobustScaler]:
     """
-    Build the 31-dimensional graph-node feature matrix.
+    Build the graph-node feature matrix.
 
     Column order:
       16 continuous features after percentile clipping and RobustScaler,
-      5 binary features,
+      binary features, including ordered STRANDS orientation flags,
       6 SVTYPE one-hot features,
       4 genotype one-hot features.
     """

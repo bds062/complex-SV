@@ -49,6 +49,15 @@ def save_checkpoint(
     torch.save(checkpoint, path)
 
 
+def torch_load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
+    """Load trusted project checkpoints across PyTorch 2.6 weights_only default changes."""
+    path = Path(path)
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def load_checkpoint(
     path: str | Path,
     model: nn.Module,
@@ -64,7 +73,7 @@ def load_checkpoint(
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch_load_checkpoint(path, map_location="cpu")
     if "model_state_dict" not in checkpoint:
         raise KeyError(f"Checkpoint is missing 'model_state_dict': {path}")
 

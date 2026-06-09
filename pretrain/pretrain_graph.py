@@ -1,357 +1,550 @@
 """
-Visualise pretrained Severus graph encoder regional embeddings.
+Phase 2 graph encoder pretraining entry point.
 
-Recommended pipeline position
------------------------------
-Run after Phase 2 pretraining:
-
-    python -m complex_sv.pretrain.visualize_graph_embeddings \
-        --input severus_outputs/*.vcf \
-        --checkpoint results/graph_encoder.pt \
-        --output_dir results/graph_embedding_qc
-
-Outputs:
-    graph_embedding_plot.png
-    graph_embedding_facets.png
-    graph_cluster_summary.tsv
-    graph_embedding_metrics.npz
-    graph_silhouette_sweep.png  (optional)
+Trains the Severus heterogeneous graph masked autoencoder on fixed genomic bp
+windows sampled from VCF-derived breakpoint graphs.  This mirrors the CN
+encoder's bp-window workflow while preserving graph topology inside each region.
 """
 
 from __future__ import annotations
 
 import argparse
-import glob
 import logging
+import math
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.gridspec import GridSpec
 import numpy as np
-import pandas as pd
 import torch
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from sklearn.preprocessing import RobustScaler
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset, random_split
+from tqdm import tqdm
+
+try:
+    from torch_geometric.data import Batch
+except ImportError as exc:  # pragma: no cover - dependency message only
+    raise ImportError(
+        "PyTorch Geometric is required for complex_sv.pretrain.pretrain_graph. "
+        "Install torch-geometric and matching PyG wheels for your torch build."
+    ) from exc
 
 try:
     from config import GraphEncoderConfig
-    from data.graph_builder import build_all_graphs
-    from data.severus_parser import CHROM_ORDER, CONTINUOUS_COLS, N_CONT, build_node_features, parse_all_severus
+    from data.severus_parser import CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
+    from data.sv_region_sampler import build_region_graphs, build_sv_bp_windows, window_metadata_frame
     from pretrain.graph_encoder import SVGraphMAE
-    from utils import get_device, l2_normalize, setup_logging
+    from utils import get_device, l2_normalize, save_checkpoint, set_seed, setup_logging
 except ImportError:
     ROOT = Path(__file__).resolve().parents[1]
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    from config import GraphEncoderConfig
-    from data.graph_builder import build_all_graphs
-    from data.severus_parser import CHROM_ORDER, CONTINUOUS_COLS, N_CONT, build_node_features, parse_all_severus
-    from pretrain.graph_encoder import SVGraphMAE
-    from utils import get_device, l2_normalize, setup_logging
 
+    from config import GraphEncoderConfig
+    from data.severus_parser import CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
+    from data.sv_region_sampler import build_region_graphs, build_sv_bp_windows, window_metadata_frame
+    from pretrain.graph_encoder import SVGraphMAE
+    from utils import get_device, l2_normalize, save_checkpoint, set_seed, setup_logging
+
+
+LOG_NAME = "graph_pretrain.log"
 log = logging.getLogger(__name__)
 
-_PALETTE_20 = [
-    "#E63946", "#457B9D", "#2A9D8F", "#E9C46A", "#F4A261",
-    "#6A4C93", "#1982C4", "#8AC926", "#FF595E", "#6A994E",
-    "#3A86FF", "#FB5607", "#FFBE0B", "#8338EC", "#06D6A0",
-    "#EF476F", "#118AB2", "#FFD166", "#073B4C", "#B5838D",
-]
 
-SV_COLOURS = {
-    "DEL": "#E63946",
-    "INS": "#2A9D8F",
-    "DUP": "#457B9D",
-    "BND": "#E9C46A",
-    "sBND": "#F4A261",
-    "INV": "#6A4C93",
-}
+def _status(message: str) -> None:
+    print(f"[pretrain_graph] {message}", flush=True)
 
 
-def _resolve_inputs(input_patterns: list[str] | None, input_list: str | None) -> list[str]:
+def _setup_script_logging(output_dir: Path) -> logging.Logger:
+    logger = setup_logging(output_dir)
+    dedicated = output_dir / LOG_NAME
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler = logging.FileHandler(dedicated)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.info("Writing dedicated graph pretraining log to %s", dedicated)
+    return logger
+
+
+def _resolve_input_paths(input_list: str) -> list[str]:
+    list_path = Path(input_list)
+    if not list_path.exists():
+        raise FileNotFoundError(f"--input_list not found: {list_path}")
+
     paths: list[str] = []
-    if input_patterns:
-        for pattern in input_patterns:
-            expanded = glob.glob(pattern)
-            paths.extend(expanded if expanded else [pattern])
-    if input_list:
-        list_path = Path(input_list)
-        if not list_path.exists():
-            raise FileNotFoundError(f"--input_list not found: {list_path}")
-        with list_path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                item = line.strip()
-                if item and not item.startswith("#"):
-                    paths.append(item)
+    with list_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            item = line.strip()
+            if item and not item.startswith("#"):
+                paths.append(item)
+
     unique = list(dict.fromkeys(paths))
     valid = [p for p in unique if Path(p).exists()]
     if not valid:
-        raise FileNotFoundError("No valid Severus VCF input files found")
+        raise FileNotFoundError("--input_list did not contain any valid Severus VCF paths")
+    missing = [p for p in unique if not Path(p).exists()]
+    if missing:
+        log.warning("Skipping %d missing VCF path(s) from input list", len(missing))
     return valid
 
 
-def _cfg_from_checkpoint(ckpt: dict) -> GraphEncoderConfig:
-    raw = ckpt.get("config", {})
-    if "graph_encoder" in raw:
-        raw = raw["graph_encoder"]
-    return GraphEncoderConfig(
-        d_model=raw.get("d_model", 128),
-        n_heads=raw.get("n_heads", 8),
-        n_layers=raw.get("n_layers", 4),
-        embed_dim=raw.get("embed_dim", 64),
-        dropout=raw.get("dropout", 0.1),
-        proximity_bp=raw.get("proximity_bp", 1_000_000),
-        mask_prob=raw.get("mask_prob", 0.15),
+class SVRegionGraphDataset(Dataset):
+    """One item is one fixed-bp regional SV graph with a random node mask."""
+
+    def __init__(self, graphs: list, mask_prob: float) -> None:
+        if not graphs:
+            raise ValueError("SVRegionGraphDataset requires at least one graph")
+        self.graphs = graphs
+        self.mask_prob = float(mask_prob)
+
+    def __len__(self) -> int:
+        return len(self.graphs)
+
+    def __getitem__(self, idx: int):
+        graph = self.graphs[idx]
+        n_nodes = int(graph["sv"].x.shape[0])
+        if n_nodes <= 0:
+            raise ValueError("Regional graph has no SV nodes")
+        mask = torch.rand(n_nodes) < self.mask_prob
+        if not mask.any():
+            mask[torch.randint(0, n_nodes, (1,)).item()] = True
+        return graph, mask
+
+
+def collate_region_graphs(batch):
+    graphs, masks = zip(*batch)
+    batched = Batch.from_data_list(list(graphs))
+    return batched, torch.cat(list(masks), dim=0)
+
+
+def _masked_node_mse(recon: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_f = mask.unsqueeze(-1).to(dtype=recon.dtype)
+    return ((recon - target) ** 2 * mask_f).sum() / (mask_f.sum() * target.shape[-1] + 1e-9)
+
+
+class WarmupCosineScheduler:
+    """Epoch-level warmup followed by cosine decay."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        base_lr: float,
+        epochs: int,
+        warmup_epochs: int = 5,
+        min_lr_fraction: float = 0.01,
+    ) -> None:
+        self.optimizer = optimizer
+        self.base_lr = float(base_lr)
+        self.epochs = max(int(epochs), 1)
+        self.warmup_epochs = max(int(warmup_epochs), 0)
+        self.min_lr_fraction = float(min_lr_fraction)
+
+    def step(self, epoch: int) -> float:
+        if self.warmup_epochs > 0 and epoch <= self.warmup_epochs:
+            lr = self.base_lr * epoch / self.warmup_epochs
+        else:
+            denom = max(self.epochs - self.warmup_epochs, 1)
+            progress = min(max(epoch - self.warmup_epochs, 0), denom) / denom
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            min_lr = self.base_lr * self.min_lr_fraction
+            lr = min_lr + (self.base_lr - min_lr) * cosine
+
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+        return lr
+
+
+def _run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> float:
+    training = optimizer is not None
+    model.train(training)
+
+    total_loss = 0.0
+    n_batches = 0
+    for batch_graph, mask in tqdm(loader, desc="train" if training else "val", leave=False):
+        batch_graph = batch_graph.to(device)
+        mask = mask.to(device=device, dtype=torch.bool)
+        target = batch_graph["sv"].x.to(device=device, dtype=torch.float32)
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+
+        recon, _node_h = model(batch_graph, mask)
+        loss = _masked_node_mse(recon, target, mask)
+
+        if training:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+        total_loss += float(loss.detach().cpu())
+        n_batches += 1
+
+    if n_batches == 0:
+        raise RuntimeError("DataLoader produced no batches")
+    return total_loss / n_batches
+
+
+def _extract_embeddings(
+    model: SVGraphMAE,
+    graphs: list,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    model.eval()
+    loader = DataLoader(graphs, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=Batch.from_data_list)
+    all_embeds: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for batch_graph in tqdm(loader, desc="embed", leave=False):
+            batch_graph = batch_graph.to(device)
+            mask = torch.zeros(batch_graph["sv"].x.shape[0], dtype=torch.bool, device=device)
+            _recon, node_h = model(batch_graph, mask)
+            batch_vec = batch_graph["sv"].batch
+            batch_embeds: list[torch.Tensor] = []
+            for graph_idx in range(int(batch_graph.num_graphs)):
+                node_idx = torch.nonzero(batch_vec == graph_idx, as_tuple=False).flatten().tolist()
+                if not node_idx:
+                    continue
+                batch_embeds.append(l2_normalize(model.regional_embed(node_h, node_idx), dim=-1))
+            if batch_embeds:
+                all_embeds.append(torch.stack(batch_embeds, dim=0).cpu().numpy())
+
+    if not all_embeds:
+        raise RuntimeError("No graph window embeddings extracted")
+    return np.concatenate(all_embeds, axis=0)
+
+
+def _build_training_graphs(
+    input_paths: list[str],
+    cfg: GraphEncoderConfig,
+    window_bp_sizes: list[int],
+    windows_per_chrom_per_size: int,
+    cluster_windows_per_chrom_per_size: int,
+    min_sv_per_window: int,
+    max_windows: int | None,
+    seed: int,
+) -> tuple[list, object, object, object]:
+    _status(f"Parsing {len(input_paths):,} Severus VCF file(s)")
+    df = parse_all_severus(input_paths)
+    _status(
+        f"Parsed {len(df):,} SV record(s) across "
+        f"{df['sample_id'].nunique():,} sample(s)"
     )
 
+    feat_matrix, scaler = build_node_features(df)
+    n_chrom_groups = df.groupby(["sample_id", "chrom"], sort=False).ngroups
+    upper_bound = n_chrom_groups * len(window_bp_sizes) * (
+        int(windows_per_chrom_per_size) + int(cluster_windows_per_chrom_per_size)
+    )
+    _status(
+        "Building SV bp windows: "
+        f"sizes={window_bp_sizes}, random_per_chrom={windows_per_chrom_per_size}, "
+        f"dense_per_chrom={cluster_windows_per_chrom_per_size}, "
+        f"min_sv_per_window={min_sv_per_window}, upper_bound~{upper_bound:,}, "
+        f"max_windows={max_windows}"
+    )
 
-def _scaler_from_checkpoint(ckpt: dict) -> RobustScaler | None:
-    if "scaler_center" not in ckpt or "scaler_scale" not in ckpt:
-        return None
-    scaler = RobustScaler()
-    scaler.center_ = np.asarray(ckpt["scaler_center"])
-    scaler.scale_ = np.asarray(ckpt["scaler_scale"])
-    scaler.n_features_in_ = int(ckpt.get("scaler_n_features_in", ckpt.get("n_cont", N_CONT)))
-    scaler.feature_names_in_ = np.asarray(CONTINUOUS_COLS, dtype=object)
-    return scaler
-
-
-def build_regional_windows(
-    df: pd.DataFrame,
-    window_sizes: list[int],
-    windows_per_chrom_per_size: int,
-    rng: np.random.Generator,
-) -> list[dict]:
-    windows: list[dict] = []
-    for (sample_id, chrom), grp in df.groupby(["sample_id", "chrom"], sort=False):
-        idx = grp.index.tolist()
-        n = len(idx)
-        if n < 2:
-            continue
-        for ws in window_sizes:
-            ws_actual = min(ws, n)
-            max_start = n - ws_actual
-            n_samples = min(windows_per_chrom_per_size, max_start + 1)
-            starts = (
-                rng.choice(max_start + 1, size=n_samples, replace=False)
-                if max_start >= n_samples
-                else np.arange(max_start + 1)
-            )
-            for start in starts:
-                win_idx = idx[start : start + ws_actual]
-                windows.append({
-                    "sample_id": sample_id,
-                    "chrom": chrom,
-                    "start_bp": int(df.loc[win_idx[0], "pos"]),
-                    "end_bp": int(df.loc[win_idx[-1], "end"]),
-                    "window_size": int(ws_actual),
-                    "global_node_indices": win_idx,
-                    "dom_sv_type": str(pd.Series(df.loc[win_idx, "sv_type_str"].values).mode()[0]),
-                    "mean_vaf": float(df.loc[win_idx, "vaf_mean"].mean()),
-                    "n_bnd": int((df.loc[win_idx, "is_bnd"] > 0).sum()),
-                    "n_phased": int((df.loc[win_idx, "has_phase"] > 0).sum()),
-                })
+    rng = np.random.default_rng(seed)
+    windows = build_sv_bp_windows(
+        df,
+        window_bp_sizes=window_bp_sizes,
+        windows_per_chrom_per_size=windows_per_chrom_per_size,
+        cluster_windows_per_chrom_per_size=cluster_windows_per_chrom_per_size,
+        min_sv_per_window=min_sv_per_window,
+        rng=rng,
+        max_windows=max_windows,
+        progress=True,
+    )
     if not windows:
-        raise RuntimeError("No graph regional windows were generated")
-    return windows
+        raise RuntimeError(
+            "No SV bp windows were generated. Try smaller --window_bp_sizes "
+            "or lower --min_sv_per_window."
+        )
+    _status(f"Built {len(windows):,} accepted SV bp window(s)")
+
+    graphs = build_region_graphs(df, feat_matrix, windows, proximity_bp=cfg.proximity_bp, progress=True)
+    if not graphs:
+        raise RuntimeError("No regional graph objects were built")
+    _status(f"Built {len(graphs):,} regional graph object(s)")
+    return graphs, windows, df, scaler
 
 
-def reduce_2d(embeddings: np.ndarray, method: str = "umap") -> np.ndarray:
-    if method == "umap":
-        try:
-            import umap
-            return umap.UMAP(
-                n_components=2,
-                n_neighbors=min(15, max(2, len(embeddings) - 1)),
-                min_dist=0.1,
-                metric="cosine",
-                random_state=42,
-            ).fit_transform(embeddings)
-        except ImportError:
-            log.warning("umap-learn not installed; falling back to t-SNE")
-            method = "tsne"
-    if method == "tsne":
-        from sklearn.manifold import TSNE
-        perplexity = min(30, max(2, len(embeddings) // 10))
-        return TSNE(n_components=2, perplexity=perplexity, random_state=42).fit_transform(embeddings)
-    if method == "pca":
-        from sklearn.decomposition import PCA
-        return PCA(n_components=2, random_state=42).fit_transform(embeddings)
-    raise ValueError(f"Unknown reduction method: {method}")
+def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
+    set_seed(args.seed)
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger = _setup_script_logging(output_dir)
+    logger.info("Starting graph encoder pretraining")
+    _status("Starting graph encoder pretraining")
 
-def _color_map(labels: list[str]) -> dict[str, str]:
-    unique = list(dict.fromkeys(labels))
-    return {label: _PALETTE_20[i % len(_PALETTE_20)] for i, label in enumerate(unique)}
+    cfg = GraphEncoderConfig(
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        embed_dim=args.embed_dim,
+        dropout=args.dropout,
+        proximity_bp=args.proximity_bp,
+        mask_prob=args.mask_prob,
+    )
 
+    input_paths = _resolve_input_paths(args.input_list)
+    _status(f"Loaded {len(input_paths):,} VCF path(s) from {args.input_list}")
 
-def _scatter_categorical(ax, xy: np.ndarray, labels: list[str], title: str, legend_title: str, colors: dict[str, str] | None = None) -> None:
-    cmap = colors or _color_map(labels)
-    ax.scatter(xy[:, 0], xy[:, 1], c=[cmap.get(x, "#999999") for x in labels], s=16, alpha=0.75, linewidths=0, rasterized=True)
-    handles = [mpatches.Patch(color=color, label=str(label)) for label, color in cmap.items() if label in set(labels)]
-    ax.legend(handles=handles, title=legend_title, fontsize=7, title_fontsize=8, loc="best", framealpha=0.85)
-    ax.set_title(title, fontsize=10, fontweight="bold")
-    ax.set_xlabel("Dim 1")
-    ax.set_ylabel("Dim 2")
+    graphs, windows, _df, scaler = _build_training_graphs(
+        input_paths=input_paths,
+        cfg=cfg,
+        window_bp_sizes=args.window_bp_sizes,
+        windows_per_chrom_per_size=args.windows_per_chrom_per_size,
+        cluster_windows_per_chrom_per_size=args.cluster_windows_per_chrom_per_size,
+        min_sv_per_window=args.min_sv_per_window,
+        max_windows=args.max_windows,
+        seed=args.seed,
+    )
 
+    dataset = SVRegionGraphDataset(graphs, mask_prob=cfg.mask_prob)
+    val_size = max(1, int(round(args.val_fraction * len(dataset)))) if len(dataset) > 1 else 0
+    train_size = len(dataset) - val_size
+    _status(f"Train/val split: {train_size:,} train window(s), {val_size:,} val window(s)")
 
-def _scatter_continuous(ax, xy: np.ndarray, values: np.ndarray, title: str, label: str) -> None:
-    sc = ax.scatter(xy[:, 0], xy[:, 1], c=values, s=16, alpha=0.75, linewidths=0, rasterized=True)
-    plt.colorbar(sc, ax=ax, fraction=0.035, pad=0.02, label=label)
-    ax.set_title(title, fontsize=10, fontweight="bold")
-    ax.set_xlabel("Dim 1")
-    ax.set_ylabel("Dim 2")
+    if val_size > 0:
+        generator = torch.Generator().manual_seed(args.seed)
+        train_ds, val_ds = random_split(dataset, [train_size, val_size], generator=generator)
+    else:
+        train_ds, val_ds = dataset, dataset
 
-
-def _plot_silhouette_sweep(embeddings: np.ndarray, k_min: int, k_max: int, out_dir: Path) -> None:
-    ks, scores = [], []
-    max_k = min(k_max, len(embeddings) - 1)
-    for k in range(k_min, max_k + 1):
-        labels = KMeans(n_clusters=k, random_state=42, n_init=20).fit_predict(embeddings)
-        ks.append(k)
-        scores.append(silhouette_score(embeddings, labels))
-    if not ks:
-        return
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(ks, scores, "-o")
-    ax.set_xlabel("Number of clusters")
-    ax.set_ylabel("Silhouette score")
-    ax.set_title("Graph embedding silhouette sweep")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_dir / "graph_silhouette_sweep.png", dpi=150)
-    plt.close(fig)
-
-
-def run(args: argparse.Namespace) -> None:
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(out_dir)
-
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
-    cfg = _cfg_from_checkpoint(ckpt)
-    window_sizes = args.window_sizes or [5, 10, 20, 50]
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=collate_region_graphs,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_region_graphs,
+    )
 
     device = get_device()
+    logger.info("Device: %s", device)
+    _status(f"Using device: {device}")
+
     model = SVGraphMAE(cfg).to(device)
-    model.load_state_dict(ckpt["model_state_dict"], strict=args.strict)
-    model.eval()
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info("Graph model parameters: %s", f"{n_params:,}")
+    _status(f"Graph model parameters: {n_params:,}")
 
-    inputs = _resolve_inputs(args.input, args.input_list)
-    df = parse_all_severus(inputs)
-    scaler = _scaler_from_checkpoint(ckpt)
-    feat_matrix, _ = build_node_features(df, scaler=scaler)
-    graphs, sample_ids = build_all_graphs(df, feat_matrix, proximity_bp=cfg.proximity_bp)
-
-    rng = np.random.default_rng(args.seed)
-    windows = build_regional_windows(df, window_sizes, args.windows_per_chrom_per_size, rng)
-    sample_dfs = {sid: grp.reset_index() for sid, grp in df.groupby("sample_id", sort=False)}
-
-    sample_node_embeds: dict[str, torch.Tensor] = {}
-    with torch.no_grad():
-        for graph, sample_id in zip(graphs, sample_ids):
-            graph = graph.to(device)
-            mask = torch.zeros(graph["sv"].x.shape[0], dtype=torch.bool, device=device)
-            _recon, node_h = model(graph, mask)
-            sample_node_embeds[sample_id] = node_h
-
-    embeddings: list[np.ndarray] = []
-    records: list[dict] = []
-    with torch.no_grad():
-        for win in windows:
-            sid = win["sample_id"]
-            sample_df = sample_dfs[sid]
-            global_to_local = {orig: local for local, orig in enumerate(sample_df["index"].values)}
-            local_idx = [global_to_local[i] for i in win["global_node_indices"] if i in global_to_local]
-            if not local_idx:
-                continue
-            emb = model.regional_embed(sample_node_embeds[sid], local_idx)
-            emb = l2_normalize(emb, dim=-1)
-            embeddings.append(emb.cpu().numpy())
-            records.append({k: v for k, v in win.items() if k != "global_node_indices"})
-
-    if not embeddings:
-        raise RuntimeError("No regional graph embeddings were extracted")
-    emb_arr = np.stack(embeddings, axis=0)
-    meta = pd.DataFrame(records)
-
-    xy = reduce_2d(emb_arr, method=args.reduction)
-    if args.n_clusters >= len(emb_arr):
-        raise ValueError("--n_clusters must be smaller than the number of embeddings")
-    cluster = KMeans(n_clusters=args.n_clusters, random_state=42, n_init=20).fit_predict(emb_arr)
-    meta["cluster"] = cluster
-    sil = silhouette_score(emb_arr, cluster) if args.n_clusters > 1 else float("nan")
-
-    meta.to_csv(out_dir / "graph_cluster_summary.tsv", sep="\t", index=False)
-    np.savez(
-        out_dir / "graph_embedding_metrics.npz",
-        embeddings=emb_arr,
-        xy=xy,
-        cluster=cluster,
-        silhouette=np.array([sil]),
-        **{c: meta[c].values.astype(str) if meta[c].dtype == object else meta[c].values for c in meta.columns},
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        base_lr=args.lr,
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
     )
 
-    fig, ax = plt.subplots(figsize=(9, 7))
-    _scatter_categorical(ax, xy, [str(x) for x in cluster], f"Graph regional embeddings ({args.reduction.upper()}); silhouette={sil:.3f}", "Cluster")
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    best_val = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+
+    for epoch in range(1, args.epochs + 1):
+        lr = scheduler.step(epoch)
+        train_loss = _run_epoch(model, train_loader, device, optimizer=optimizer)
+        with torch.no_grad():
+            val_loss = _run_epoch(model, val_loader, device, optimizer=None)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        logger.info(
+            "Epoch %3d/%d  train=%.6f  val=%.6f  lr=%.3e",
+            epoch,
+            args.epochs,
+            train_loss,
+            val_loss,
+            lr,
+        )
+        _status(
+            f"Epoch {epoch:3d}/{args.epochs} train={train_loss:.6f} "
+            f"val={val_loss:.6f} lr={lr:.3e}"
+        )
+
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    config_dict = {
+        "graph_encoder": asdict(cfg),
+        "training": {
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "warmup_epochs": args.warmup_epochs,
+            "seed": args.seed,
+            "window_bp_sizes": args.window_bp_sizes,
+            "windows_per_chrom_per_size": args.windows_per_chrom_per_size,
+            "cluster_windows_per_chrom_per_size": args.cluster_windows_per_chrom_per_size,
+            "min_sv_per_window": args.min_sv_per_window,
+            "max_windows": args.max_windows,
+        },
+        "input_vcfs": input_paths,
+        "severus_continuous_cols": list(CONTINUOUS_COLS),
+        "n_feat": N_FEAT,
+    }
+
+    save_checkpoint(
+        output_dir / "graph_encoder.pt",
+        model,
+        config_dict,
+        train_losses=train_losses,
+        val_losses=val_losses,
+        best_val_loss=best_val,
+        scaler_center=scaler.center_,
+        scaler_scale=scaler.scale_,
+        scaler_n_features_in=getattr(scaler, "n_features_in_", N_CONT),
+        n_cont=N_CONT,
+    )
+    logger.info("Saved graph checkpoint to %s", output_dir / "graph_encoder.pt")
+
+    meta = window_metadata_frame(windows, include_node_indices=True)
+    meta.to_csv(output_dir / "graph_bp_window_metadata.tsv", sep="\t", index=False)
+    logger.info("Saved graph window metadata to %s", output_dir / "graph_bp_window_metadata.tsv")
+
+    if args.save_embeddings:
+        logger.info("Extracting graph window embeddings ...")
+        embeddings = _extract_embeddings(model, graphs, device=device, batch_size=max(args.batch_size, 128))
+        embed_meta = meta.reset_index(drop=True).copy()
+        if len(embed_meta) != embeddings.shape[0]:
+            raise RuntimeError(
+                "Embedding count does not match window metadata count: "
+                f"{embeddings.shape[0]} vs {len(embed_meta)}"
+            )
+        meta_arrays = {}
+        for col in embed_meta.columns:
+            values = embed_meta[col].values
+            if values.dtype == object:
+                values = values.astype(str)
+            meta_arrays[col] = values
+        np.savez(
+            output_dir / "graph_window_embeddings.npz",
+            embeddings=embeddings,
+            train_losses=np.asarray(train_losses, dtype=np.float32),
+            val_losses=np.asarray(val_losses, dtype=np.float32),
+            **meta_arrays,
+        )
+        logger.info(
+            "Saved graph window embeddings to %s shape=%s",
+            output_dir / "graph_window_embeddings.npz",
+            embeddings.shape,
+        )
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(range(1, len(train_losses) + 1), train_losses, label="train")
+    ax.plot(range(1, len(val_losses) + 1), val_losses, label="val")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Masked node MSE")
+    ax.set_title("Graph encoder pretraining")
+    ax.legend()
+    ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(out_dir / "graph_embedding_plot.png", dpi=180)
+    fig.savefig(output_dir / "graph_training_loss.png", dpi=150)
     plt.close(fig)
-
-    fig = plt.figure(figsize=(20, 12))
-    gs = GridSpec(2, 3, figure=fig, hspace=0.34, wspace=0.25)
-    facet_specs = [
-        ("cluster", "Cluster", "Cluster", None),
-        ("sample_id", "Sample ID", "Sample", None),
-        ("chrom", "Chromosome", "Chrom", None),
-        ("window_size", "Window size (# SVs)", "Window", None),
-        ("dom_sv_type", "Dominant SV type", "SV type", SV_COLOURS),
-    ]
-    for i, (col, title, legend_title, colors) in enumerate(facet_specs):
-        ax = fig.add_subplot(gs[i // 3, i % 3])
-        labels = meta[col].astype(str).tolist()
-        if col == "chrom":
-            order = sorted(set(labels), key=lambda c: CHROM_ORDER.get(c, 99))
-            colors = {label: _PALETTE_20[j % len(_PALETTE_20)] for j, label in enumerate(order)}
-        _scatter_categorical(ax, xy, labels, title, legend_title, colors=colors)
-    ax6 = fig.add_subplot(gs[1, 2])
-    _scatter_continuous(ax6, xy, meta["mean_vaf"].values, "Mean VAF", "Mean VAF")
-    fig.suptitle("SV graph encoder embedding QC", fontsize=13, fontweight="bold")
-    fig.savefig(out_dir / "graph_embedding_facets.png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-    if args.sweep_clusters:
-        _plot_silhouette_sweep(emb_arr, args.sweep_k_min, args.sweep_k_max, out_dir)
-
-    log.info("Saved graph embedding visualisation outputs to %s", out_dir)
+    logger.info("Saved loss curve to %s", output_dir / "graph_training_loss.png")
+    logger.info("Done.")
+    _status(f"Done. Dedicated log: {output_dir / LOG_NAME}")
+    return train_losses, val_losses
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    defaults = GraphEncoderConfig()
     parser = argparse.ArgumentParser(
-        description="Visualise pretrained SV graph encoder regional embeddings.",
+        description="Pretrain the Severus graph masked autoencoder on genomic bp windows.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--input", nargs="+", metavar="VCF")
-    parser.add_argument("--input_list", metavar="FILE")
-    parser.add_argument("--checkpoint", required=True)
+
+    parser.add_argument(
+        "--input_list",
+        required=True,
+        metavar="FILE",
+        help="Text file with one Severus VCF path per line.",
+    )
     parser.add_argument("--output_dir", default=".")
-    parser.add_argument("--window_sizes", type=int, nargs="+", default=None)
-    parser.add_argument("--windows_per_chrom_per_size", type=int, default=30)
-    parser.add_argument("--n_clusters", type=int, default=6)
-    parser.add_argument("--reduction", choices=["umap", "tsne", "pca"], default="umap")
-    parser.add_argument("--sweep_clusters", action="store_true")
-    parser.add_argument("--sweep_k_min", type=int, default=2)
-    parser.add_argument("--sweep_k_max", type=int, default=15)
+
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--val_fraction", type=float, default=0.10)
+    parser.add_argument("--mask_prob", type=float, default=defaults.mask_prob)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--strict", action="store_true", help="Use strict checkpoint loading.")
+    parser.add_argument(
+        "--save_embeddings",
+        action="store_true",
+        help="Also save unmasked graph bp-window embeddings to graph_window_embeddings.npz.",
+    )
+
+    parser.add_argument("--d_model", type=int, default=defaults.d_model)
+    parser.add_argument("--n_heads", type=int, default=defaults.n_heads)
+    parser.add_argument("--n_layers", type=int, default=defaults.n_layers)
+    parser.add_argument("--embed_dim", type=int, default=defaults.embed_dim)
+    parser.add_argument("--dropout", type=float, default=defaults.dropout)
+    parser.add_argument("--proximity_bp", type=int, default=defaults.proximity_bp)
+
+    parser.add_argument(
+        "--window_bp_sizes",
+        type=int,
+        nargs="+",
+        default=[100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000, 10_000_000],
+        help="Fixed genomic bp window sizes used for graph pretraining.",
+    )
+    parser.add_argument(
+        "--windows_per_chrom_per_size",
+        type=int,
+        default=20,
+        help="Random bp windows sampled per sample/chromosome/window size.",
+    )
+    parser.add_argument(
+        "--cluster_windows_per_chrom_per_size",
+        type=int,
+        default=20,
+        help="Dense breakpoint windows retained per sample/chromosome/window size.",
+    )
+    parser.add_argument(
+        "--min_sv_per_window",
+        type=int,
+        default=2,
+        help="Minimum SV nodes required for a training window.",
+    )
+    parser.add_argument(
+        "--max_windows",
+        type=int,
+        default=None,
+        help="Optional cap on accepted graph windows before training.",
+    )
+
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    run(parse_args())
+    train(parse_args())

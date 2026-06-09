@@ -31,7 +31,7 @@ except ImportError:  # Allows direct local imports during early development.
     EDGE_PROXIMITY = ("sv", "proximal_to", "sv")
     EDGE_MATE = ("sv", "mate_of", "sv")
     EDGE_PHASE = ("sv", "phase_linked", "sv")
-    N_FEAT = 31
+    N_FEAT = 35
 
 
 D_MODEL_GRAPH = 128
@@ -184,7 +184,7 @@ class SVGraphMAE(nn.Module):
         encode(data) -> [N, d_model]
         regional_embed(node_h, node_indices) -> [embed_dim]
         global_embed(node_h) -> [embed_dim]
-        forward(data, mask) -> (recon [N, 31], node_h [N, d_model])
+        forward(data, mask) -> (recon [N, N_FEAT], node_h [N, d_model])
     """
 
     def __init__(self, cfg: GraphEncoderConfig | Any):

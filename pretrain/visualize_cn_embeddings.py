@@ -29,9 +29,11 @@ Outputs:
     cn_embedding_facets.png
     cn_embedding_continuous_facets.png
     cn_cluster_summary.tsv
+    cn_embedding_association_scores.tsv
     cn_embedding_metrics.npz
     cn_highlighted_points.tsv      optional
     cn_silhouette_sweep.png        optional
+    cn_visualize.log
 """
 
 from __future__ import annotations
@@ -64,7 +66,7 @@ try:
     from data.severus_parser import CHROM_ORDER
     from data.wakhan_parser import parse_all_wakhan, parse_wakhan
     from pretrain.cn_encoder import CNMaskedAutoencoder
-    from utils import get_device, l2_normalize, setup_logging
+    from utils import get_device, l2_normalize, setup_logging, torch_load_checkpoint
 except ImportError:
     ROOT = Path(__file__).resolve().parents[1]
     if str(ROOT) not in sys.path:
@@ -75,10 +77,31 @@ except ImportError:
     from data.severus_parser import CHROM_ORDER
     from data.wakhan_parser import parse_all_wakhan, parse_wakhan
     from pretrain.cn_encoder import CNMaskedAutoencoder
-    from utils import get_device, l2_normalize, setup_logging
+    from utils import get_device, l2_normalize, setup_logging, torch_load_checkpoint
 
 
 log = logging.getLogger(__name__)
+LOG_NAME = "cn_visualize.log"
+
+
+def _setup_script_logging(output_dir: Path) -> logging.Logger:
+    logger = setup_logging(output_dir)
+    dedicated = (output_dir / LOG_NAME).resolve()
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == dedicated:
+            logger.info("Writing dedicated CN visualisation log to %s", dedicated)
+            return logger
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler = logging.FileHandler(dedicated)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.info("Writing dedicated CN visualisation log to %s", dedicated)
+    return logger
 
 
 def _status(message: str) -> None:
@@ -470,6 +493,124 @@ def reduce_2d(embeddings: np.ndarray, method: str = "umap") -> np.ndarray:
     raise ValueError(f"Unknown reduction method: {method}")
 
 
+
+
+def _pairwise_euclidean(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    sq = np.sum(x * x, axis=1, keepdims=True)
+    dist2 = sq + sq.T - 2.0 * (x @ x.T)
+    return np.sqrt(np.maximum(dist2, 0.0))
+
+
+def _double_center(dist: np.ndarray) -> np.ndarray:
+    dist = np.asarray(dist, dtype=np.float64)
+    return dist - dist.mean(axis=0, keepdims=True) - dist.mean(axis=1, keepdims=True) + dist.mean()
+
+
+def _distance_correlation_from_distances(x_dist: np.ndarray, y_dist: np.ndarray) -> float:
+    x_centered = _double_center(x_dist)
+    y_centered = _double_center(y_dist)
+    dcov2 = float(np.mean(x_centered * y_centered))
+    dvar_x2 = float(np.mean(x_centered * x_centered))
+    dvar_y2 = float(np.mean(y_centered * y_centered))
+    if dvar_x2 <= 0.0 or dvar_y2 <= 0.0:
+        return float("nan")
+    return float(np.sqrt(max(dcov2, 0.0) / np.sqrt(dvar_x2 * dvar_y2)))
+
+
+def _facet_distance(values: pd.Series, kind: str) -> tuple[np.ndarray, np.ndarray, str]:
+    if kind == "numeric":
+        numeric = pd.to_numeric(values, errors="coerce").to_numpy(dtype=np.float64)
+        valid = np.isfinite(numeric)
+        if valid.sum() < 3 or np.unique(numeric[valid]).size < 2:
+            return np.zeros((0, 0)), valid, "constant_or_insufficient_numeric_values"
+        y = numeric[valid]
+        return np.abs(y[:, None] - y[None, :]), valid, "ok"
+
+    labels = values.astype(str).fillna("NA").to_numpy()
+    valid = pd.notna(values).to_numpy()
+    if valid.sum() < 3 or np.unique(labels[valid]).size < 2:
+        return np.zeros((0, 0)), valid, "constant_or_insufficient_categories"
+    y = labels[valid]
+    return (y[:, None] != y[None, :]).astype(np.float64), valid, "ok"
+
+
+def _embedding_association_scores(
+    embeddings: np.ndarray,
+    meta: pd.DataFrame,
+    facets: list[tuple[str, str, str]],
+    max_samples: int,
+    seed: int,
+) -> pd.DataFrame:
+    """
+    Estimate dependence between each metadata facet and the original embeddings.
+
+    The reported score is distance correlation (dCor): values near 0 indicate
+    weak association, while larger values indicate that the facet is more tied
+    to geometry in the embedding space. Categorical facets use a same/different
+    label distance; numeric facets use absolute value differences.
+    """
+    rng = np.random.default_rng(seed)
+    rows: list[dict[str, object]] = []
+    n_total = int(len(embeddings))
+    max_samples = max(10, int(max_samples))
+
+    for col, label, kind in facets:
+        if col not in meta.columns:
+            rows.append({"facet": col, "label": label, "kind": kind, "distance_correlation": np.nan, "n_used": 0, "n_total": n_total, "note": "missing_column"})
+            continue
+
+        y_dist_full, valid_mask, note = _facet_distance(meta[col], kind)
+        valid_indices = np.flatnonzero(valid_mask)
+        if note != "ok":
+            rows.append({"facet": col, "label": label, "kind": kind, "distance_correlation": np.nan, "n_used": int(valid_indices.size), "n_total": n_total, "note": note})
+            continue
+
+        if valid_indices.size > max_samples:
+            chosen = np.sort(rng.choice(valid_indices, size=max_samples, replace=False))
+            values = meta[col].iloc[chosen]
+            y_dist, valid_submask, note = _facet_distance(values, kind)
+            sample_indices = chosen[np.flatnonzero(valid_submask)]
+        else:
+            sample_indices = valid_indices
+            y_dist = y_dist_full
+
+        if sample_indices.size < 3 or y_dist.shape[0] < 3:
+            score = float("nan")
+            note = "insufficient_after_sampling"
+        else:
+            x_dist = _pairwise_euclidean(embeddings[sample_indices])
+            score = _distance_correlation_from_distances(x_dist, y_dist)
+            note = "ok"
+
+        rows.append(
+            {
+                "facet": col,
+                "label": label,
+                "kind": kind,
+                "distance_correlation": score,
+                "n_used": int(sample_indices.size),
+                "n_total": n_total,
+                "note": note,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _score_map(score_df: pd.DataFrame) -> dict[str, float]:
+    if score_df.empty:
+        return {}
+    return dict(zip(score_df["facet"].astype(str), pd.to_numeric(score_df["distance_correlation"], errors="coerce")))
+
+
+def _title_with_score(title: str, scores: dict[str, float], facet: str) -> str:
+    score = scores.get(facet)
+    if score is None or not np.isfinite(score):
+        return f"{title} (dCor=NA)"
+    return f"{title} (dCor={score:.2f})"
+
+
 def _color_map(labels: list[str]) -> dict[str, str]:
     unique = list(dict.fromkeys(labels))
     return {label: _PALETTE_20[i % len(_PALETTE_20)] for i, label in enumerate(unique)}
@@ -610,10 +751,10 @@ def _load_model_state_dict(ckpt: dict) -> dict:
 def run(args: argparse.Namespace) -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(out_dir)
+    logger = _setup_script_logging(out_dir)
 
     _status(f"Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    ckpt = torch_load_checkpoint(args.checkpoint, map_location="cpu")
     cfg = _cfg_from_checkpoint(ckpt)
     training_cfg = _training_config_from_checkpoint(ckpt)
 
@@ -713,6 +854,29 @@ def run(args: argparse.Namespace) -> None:
     meta["cluster"] = cluster
     sil = silhouette_score(emb, cluster) if args.n_clusters > 1 else float("nan")
 
+    size_col = "requested_window_bp_size" if "requested_window_bp_size" in meta.columns else "window_bp_size"
+    bp_score_col = "mean_breakpoint_count" if "mean_breakpoint_count" in meta.columns else "covered_fraction"
+    association_facets = [
+        ("cluster", "Cluster", "categorical"),
+        ("sample_id", "Sample ID", "categorical"),
+        ("chrom", "Chromosome", "categorical"),
+        (size_col, "Window bp size", "numeric"),
+        ("mean_cn_total", "Mean total CN", "numeric"),
+        ("mean_allele_imbalance", "Mean allele imbalance", "numeric"),
+        ("loh_fraction", "LOH fraction", "numeric"),
+        (bp_score_col, "Mean breakpoint count" if bp_score_col == "mean_breakpoint_count" else "Window covered fraction", "numeric"),
+    ]
+    association_scores = _embedding_association_scores(
+        emb,
+        meta,
+        association_facets,
+        max_samples=args.association_max_samples,
+        seed=args.seed,
+    )
+    association_scores.to_csv(out_dir / "cn_embedding_association_scores.tsv", sep="\t", index=False)
+    score_by_facet = _score_map(association_scores)
+    _status(f"Saved association scores: {out_dir / 'cn_embedding_association_scores.tsv'}")
+
     if len(highlight_emb) > 0:
         highlight_meta = highlight_meta.copy()
         highlight_meta["cluster"] = kmeans.predict(highlight_emb)
@@ -767,7 +931,10 @@ def run(args: argparse.Namespace) -> None:
         ax,
         xy,
         [str(x) for x in cluster],
-        f"CN bp-window embeddings ({args.reduction.upper()}); silhouette={sil:.3f}",
+        (
+            f"CN bp-window embeddings ({args.reduction.upper()}); "
+            f"silhouette={sil:.3f}; {_title_with_score('cluster', score_by_facet, 'cluster')}"
+        ),
         "Cluster",
     )
     _overlay_highlights(ax, highlight_xy, highlight_labels, annotate=True)
@@ -779,24 +946,24 @@ def run(args: argparse.Namespace) -> None:
     gs = GridSpec(2, 2, figure=fig, hspace=0.32, wspace=0.25)
 
     ax1 = fig.add_subplot(gs[0, 0])
-    _scatter_categorical(ax1, xy, meta["cluster"].astype(str).tolist(), "Cluster", "Cluster")
+    _scatter_categorical(ax1, xy, meta["cluster"].astype(str).tolist(), _title_with_score("Cluster", score_by_facet, "cluster"), "Cluster")
     _overlay_highlights(ax1, highlight_xy, highlight_labels)
 
     ax2 = fig.add_subplot(gs[0, 1])
-    _scatter_categorical(ax2, xy, meta["sample_id"].astype(str).tolist(), "Sample ID", "Sample")
+    _scatter_categorical(ax2, xy, meta["sample_id"].astype(str).tolist(), _title_with_score("Sample ID", score_by_facet, "sample_id"), "Sample")
     _overlay_highlights(ax2, highlight_xy, highlight_labels)
 
     ax3 = fig.add_subplot(gs[1, 0])
     chrom_labels = meta["chrom"].astype(str).tolist()
     chrom_order = sorted(set(chrom_labels), key=lambda c: CHROM_ORDER.get(c, CHROM_ORDER.get(c.removeprefix("chr"), 99)))
-    _scatter_categorical_ordered(ax3, xy, chrom_labels, chrom_order, "Chromosome", "Chrom")
+    _scatter_categorical_ordered(ax3, xy, chrom_labels, chrom_order, _title_with_score("Chromosome", score_by_facet, "chrom"), "Chrom")
     _overlay_highlights(ax3, highlight_xy, highlight_labels)
 
     ax4 = fig.add_subplot(gs[1, 1])
     size_col = "requested_window_bp_size" if "requested_window_bp_size" in meta.columns else "window_bp_size"
     window_labels = meta[size_col].astype(int).astype(str).tolist()
     window_order = [str(x) for x in sorted(meta[size_col].astype(int).unique().tolist())]
-    _scatter_categorical_ordered(ax4, xy, window_labels, window_order, "Window bp size", "bp")
+    _scatter_categorical_ordered(ax4, xy, window_labels, window_order, _title_with_score("Window bp size", score_by_facet, size_col), "bp")
     _overlay_highlights(ax4, highlight_xy, highlight_labels)
 
     fig.suptitle("CN encoder bp-window embedding QC", fontsize=13, fontweight="bold")
@@ -807,7 +974,7 @@ def run(args: argparse.Namespace) -> None:
     gs = GridSpec(2, 2, figure=fig, hspace=0.32, wspace=0.25)
 
     ax1 = fig.add_subplot(gs[0, 0])
-    _scatter_continuous(ax1, xy, meta["mean_cn_total"].values, "Mean total CN", "Mean total CN")
+    _scatter_continuous(ax1, xy, meta["mean_cn_total"].values, _title_with_score("Mean total CN", score_by_facet, "mean_cn_total"), "Mean total CN")
     _overlay_highlights(ax1, highlight_xy, highlight_labels)
 
     ax2 = fig.add_subplot(gs[0, 1])
@@ -815,13 +982,13 @@ def run(args: argparse.Namespace) -> None:
         ax2,
         xy,
         meta["mean_allele_imbalance"].values,
-        "Mean allele imbalance",
+        _title_with_score("Mean allele imbalance", score_by_facet, "mean_allele_imbalance"),
         "Mean allele imbalance",
     )
     _overlay_highlights(ax2, highlight_xy, highlight_labels)
 
     ax3 = fig.add_subplot(gs[1, 0])
-    _scatter_continuous(ax3, xy, meta["loh_fraction"].values, "LOH fraction", "LOH fraction")
+    _scatter_continuous(ax3, xy, meta["loh_fraction"].values, _title_with_score("LOH fraction", score_by_facet, "loh_fraction"), "LOH fraction")
     _overlay_highlights(ax3, highlight_xy, highlight_labels)
 
     ax4 = fig.add_subplot(gs[1, 1])
@@ -830,11 +997,11 @@ def run(args: argparse.Namespace) -> None:
             ax4,
             xy,
             meta["mean_breakpoint_count"].values,
-            "Mean breakpoint count",
+            _title_with_score("Mean breakpoint count", score_by_facet, "mean_breakpoint_count"),
             "Mean breakpoint count",
         )
     else:
-        _scatter_continuous(ax4, xy, meta["covered_fraction"].values, "Window covered fraction", "Covered fraction")
+        _scatter_continuous(ax4, xy, meta["covered_fraction"].values, _title_with_score("Window covered fraction", score_by_facet, "covered_fraction"), "Covered fraction")
     _overlay_highlights(ax4, highlight_xy, highlight_labels)
 
     fig.suptitle("CN encoder bp-window continuous QC", fontsize=13, fontweight="bold")
@@ -846,7 +1013,8 @@ def run(args: argparse.Namespace) -> None:
         _plot_silhouette_sweep(emb, args.sweep_k_min, args.sweep_k_max, out_dir)
 
     _status(f"Done. Outputs written to {out_dir}")
-    log.info("Saved CN bp-window embedding visualisation outputs to %s", out_dir)
+    logger.info("Saved CN bp-window embedding visualisation outputs to %s", out_dir)
+    _status(f"Dedicated log: {out_dir / LOG_NAME}")
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -909,6 +1077,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--association_max_samples",
+        type=int,
+        default=2000,
+        help="Maximum background embeddings sampled per facet when estimating distance-correlation scores.",
+    )
     parser.add_argument("--n_clusters", type=int, default=6)
     parser.add_argument("--reduction", choices=["umap", "tsne", "pca"], default="umap")
     parser.add_argument("--sweep_clusters", action="store_true")

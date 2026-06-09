@@ -2,7 +2,7 @@
 Build PyTorch Geometric heterogeneous SV graphs from parsed Severus records.
 
 This module contains no model code.  It converts the canonical DataFrame and
-31-dimensional node-feature matrix produced by data.severus_parser into the
+node-feature matrix produced by data.severus_parser into the
 HeteroData objects consumed by the graph encoder and downstream region proposal.
 
 Every graph always contains the three required edge types, even when an edge
@@ -77,7 +77,7 @@ def build_sample_graph(
         Single-sample Severus DataFrame.  The caller should pass a reset-index
         DataFrame so node ids correspond to row positions.
     feat_matrix:
-        Float array with shape [N, 31] containing node features for df.
+        Float array with shape [N, N_FEAT] containing node features for df.
     proximity_bp:
         Maximum same-chromosome distance for a proximity edge.
 
@@ -91,17 +91,19 @@ def build_sample_graph(
         raise ValueError("proximity_bp must be positive")
 
     feat_matrix = np.asarray(feat_matrix, dtype=np.float32)
+    if not feat_matrix.flags.writeable:
+        feat_matrix = feat_matrix.copy()
     n = len(df)
     if feat_matrix.shape != (n, N_FEAT):
         raise ValueError(f"feat_matrix must have shape ({n}, {N_FEAT}); observed {feat_matrix.shape}")
 
     data = HeteroData()
     data["sv"].x = torch.from_numpy(feat_matrix)
-    data["sv"].pos = torch.as_tensor(df["pos"].to_numpy(dtype=np.int64), dtype=torch.long)
+    data["sv"].pos = torch.as_tensor(df["pos"].to_numpy(dtype=np.int64, copy=True), dtype=torch.long)
     data["sv"].chrom = [str(c) for c in df["chrom"].tolist()]
 
     if "end" in df.columns:
-        data["sv"].end = torch.as_tensor(df["end"].to_numpy(dtype=np.int64), dtype=torch.long)
+        data["sv"].end = torch.as_tensor(df["end"].to_numpy(dtype=np.int64, copy=True), dtype=torch.long)
     if "sv_id" in df.columns:
         data["sv"].sv_id = [str(x) for x in df["sv_id"].tolist()]
     if "sample_id" in df.columns and n:
