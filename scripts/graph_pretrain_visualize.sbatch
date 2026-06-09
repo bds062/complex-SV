@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=7:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=../logs/graph_pretrain_viz-%j.out
 #SBATCH --error=../logs/graph_pretrain_viz-%j.out
 
@@ -22,7 +22,7 @@ set -euo pipefail
 # -------------------------
 PROJECT_DIR="./"
 
-OUTPUT_DIR="../results/pipeline3/sv_pretrain_chrom"
+OUTPUT_DIR="../results/pipeline3/sv_pretrain"
 INPUT_LIST="${OUTPUT_DIR}/severus_list.txt"
 HIGHLIGHT_LIST="${OUTPUT_DIR}/highlight_list.txt"
 CHECKPOINT="${OUTPUT_DIR%/}/graph_encoder.pt"
@@ -30,7 +30,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 # Add optional training arguments here, one argument per line.
 TRAIN_EXTRA_ARGS=(
-    --window_bp_sizes 1000000 2500000 5000000 10000000 25000000 50000000 100000000
+    # --window_bp_sizes 1000000 2500000 5000000 10000000 25000000 50000000 100000000
     # --windows_per_chrom_per_size 10
     # --cluster_windows_per_chrom_per_size 10
     --min_sv_per_window 2
@@ -41,7 +41,7 @@ TRAIN_EXTRA_ARGS=(
 
 # Add optional visualization arguments here, one argument per line.
 VIZ_EXTRA_ARGS=(
-    --window_bp_sizes 1000000 2500000 5000000 10000000 25000000 50000000 100000000
+    # --window_bp_sizes 1000000 2500000 5000000 10000000 25000000 50000000 100000000
     # --windows_per_chrom_per_size 10
     # --cluster_windows_per_chrom_per_size 10
     --min_sv_per_window 1
@@ -80,8 +80,13 @@ echo "[graph_pretrain_visualize] highlight_list=$HIGHLIGHT_LIST"
 echo "[graph_pretrain_visualize] train_extra_args=${TRAIN_EXTRA_ARGS[*]:-}"
 echo "[graph_pretrain_visualize] viz_extra_args=${VIZ_EXTRA_ARGS[*]:-}"
 
-# source ~/.bashrc
-# conda activate env2
+CONDA_SH="/home/srinivasanbd/miniconda3/etc/profile.d/conda.sh"
+if [[ ! -f "$CONDA_SH" ]]; then
+    echo "[graph_pretrain_visualize] ERROR: conda shell hook not found: $CONDA_SH" >&2
+    exit 1
+fi
+source "$CONDA_SH"
+conda activate env2
 
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 PYTHON_BIN="$(which python)"

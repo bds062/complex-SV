@@ -17,7 +17,6 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from sklearn.preprocessing import RobustScaler
 
 import matplotlib
@@ -49,6 +48,7 @@ from utils import get_device, l2_normalize, torch_load_checkpoint
 
 log = logging.getLogger(__name__)
 MAX_REGION_SV_NODES = 500
+DEFAULT_TAU = 0.1
 
 
 @dataclass
@@ -374,7 +374,10 @@ def embed_candidate(
 
     with torch.no_grad():
         _cn_recon, cn_cls, _cn_bins = cn_model(cn_tensor, cn_mask)
-        parts = [l2_normalize(cn_cls.squeeze(0), dim=0)]
+        def normalize_block(x: torch.Tensor) -> torch.Tensor:
+            return l2_normalize(x, dim=0)
+
+        parts = [normalize_block(cn_cls.squeeze(0))]
 
         sv_indices = _sv_indices_in_candidate(bundle, candidate)
         original_n_sv = len(sv_indices)
@@ -403,18 +406,18 @@ def embed_candidate(
             local_indices = list(range(region_graph["sv"].x.shape[0]))
             graph_regional = graph_model.regional_embed(node_h, local_indices)
             graph_global = graph_model.global_embed(node_h)
-            parts.extend([graph_regional, graph_global])
+            parts.extend([normalize_block(graph_regional), normalize_block(graph_global)])
         else:
             embed_dim = int(getattr(getattr(graph_model, "cfg", None), "embed_dim", 64)) if graph_model is not None else 64
             parts.extend(
                 [
-                    torch.zeros(embed_dim, dtype=torch.float32, device=device),
-                    torch.zeros(embed_dim, dtype=torch.float32, device=device),
+                    normalize_block(torch.zeros(embed_dim, dtype=torch.float32, device=device)),
+                    normalize_block(torch.zeros(embed_dim, dtype=torch.float32, device=device)),
                 ]
             )
 
         stats = extract_segment_stats(segs, start_bp, end_bp).to(device)
-        parts.append(F.normalize(stats, p=2, dim=0) if torch.linalg.norm(stats) > 0 else stats)
+        parts.append(normalize_block(stats))
         embedding = l2_normalize(torch.cat(parts, dim=0), dim=0)
 
     metadata = {
@@ -444,6 +447,38 @@ def build_candidates(
     label_candidates = label_rows_to_candidates(labels, wakhan_by_sample) if not labels.empty else []
     if source == "labels":
         return label_candidates
+    if source == "chromosomes":
+        labeled_keys = {
+            (str(cand["sample_id"]), str(cand["chrom"]).removeprefix("chr"))
+            for cand in label_candidates
+        }
+        chromosome_candidates: list[dict[str, Any]] = []
+        for bundle in bundles.values():
+            df = bundle.wakhan_df
+            if df.empty:
+                continue
+            for chrom, grp_raw in df.groupby("chrom", sort=False):
+                chrom_text = str(chrom)
+                key = (bundle.sample_id, chrom_text.removeprefix("chr"))
+                if key in labeled_keys:
+                    continue
+                grp = grp_raw.copy()
+                chromosome_candidates.append(
+                    {
+                        "candidate_id": f"{bundle.sample_id}_{chrom_text}",
+                        "label_id": "",
+                        "sample_id": bundle.sample_id,
+                        "chrom": chrom_text,
+                        "start_bp": int(pd.to_numeric(grp["start"], errors="coerce").min()),
+                        "end_bp": int(pd.to_numeric(grp["end"], errors="coerce").max()),
+                        "evidence": "chromosome_scan",
+                        "sv_node_indices": [],
+                        "df_segments": grp,
+                        "sv_class": "",
+                        "label_scope": "chromosome",
+                    }
+                )
+        return label_candidates + chromosome_candidates
 
     proposal_candidates: list[dict[str, Any]] = []
     bundle_items = list(bundles.values())
@@ -471,7 +506,7 @@ def build_candidates(
         return proposal_candidates
     if source == "all":
         return label_candidates + proposal_candidates
-    raise ValueError("candidate_source must be one of labels, proposals, all")
+    raise ValueError("candidate_source must be one of labels, chromosomes, proposals, all")
 
 
 def write_embedding_outputs(
@@ -510,6 +545,21 @@ def build_prototypes(
     return cache
 
 
+def _prediction_with_none(
+    pred: str,
+    confidence: float,
+    distances: dict[str, float],
+    tau: float,
+) -> tuple[str, float, str, float]:
+    if distances:
+        nearest_class, nearest_distance = min(distances.items(), key=lambda item: item[1])
+    else:
+        nearest_class, nearest_distance = "", float("nan")
+    if pred == "unknown" or not np.isfinite(nearest_distance) or nearest_distance >= float(tau):
+        return "none", 0.0, nearest_class, nearest_distance
+    return pred, confidence, nearest_class, nearest_distance
+
+
 def write_distance_table(
     cache: PrototypeCache,
     embeddings: np.ndarray,
@@ -519,9 +569,17 @@ def write_distance_table(
     rows: list[dict[str, Any]] = []
     for i, result in enumerate(cache.classify_batch(torch.as_tensor(embeddings, dtype=torch.float32))):
         pred, confidence, distances = result
+        pred, confidence, nearest_class, nearest_distance = _prediction_with_none(
+            pred,
+            confidence,
+            distances,
+            tau=cache.tau,
+        )
         row = metadata.iloc[i].to_dict()
         row["predicted_class"] = pred
         row["prototype_confidence"] = confidence
+        row["nearest_prototype_class"] = nearest_class
+        row["nearest_prototype_distance"] = nearest_distance
         for name, dist in distances.items():
             row[f"d_{name}"] = dist
         rows.append(row)
@@ -538,25 +596,41 @@ def write_leave_one_out(
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     labels = metadata["sv_class"].astype(str).to_numpy()
+    known_classes = sorted({label for label in labels if label})
+    row_indices = np.arange(len(labels))
+
     for i, class_name in enumerate(labels):
         if not class_name:
             continue
-        support_idx = np.where((labels == class_name) & (np.arange(len(labels)) != i))[0]
-        if support_idx.size == 0:
-            continue
         cache = PrototypeCache(embed_dim=int(embeddings.shape[1]), tau=tau)
-        cache.add_class(class_name, torch.as_tensor(embeddings[support_idx], dtype=torch.float32))
+        for support_class in known_classes:
+            support_idx = np.where((labels == support_class) & (row_indices != i))[0]
+            if support_idx.size == 0:
+                continue
+            cache.add_class(support_class, torch.as_tensor(embeddings[support_idx], dtype=torch.float32))
+        if class_name not in cache.prototypes:
+            continue
         pred, confidence, distances = cache.classify(torch.as_tensor(embeddings[i], dtype=torch.float32))
+        pred, confidence, nearest_class, nearest_distance = _prediction_with_none(
+            pred,
+            confidence,
+            distances,
+            tau=cache.tau,
+        )
         row = metadata.iloc[i].to_dict()
         row["held_out_class"] = class_name
         row["predicted_class"] = pred
         row["prototype_confidence"] = confidence
+        row["nearest_prototype_class"] = nearest_class
+        row["nearest_prototype_distance"] = nearest_distance
         row["leave_one_out_distance"] = distances.get(class_name, np.nan)
+        row["leave_one_out_correct"] = pred == class_name
+        for name, dist in distances.items():
+            row[f"loo_d_{name}"] = dist
         rows.append(row)
     df = pd.DataFrame(rows)
     df.to_csv(output_path, sep="\t", index=False)
     return df
-
 
 def _reduce_embeddings_2d(embeddings: np.ndarray) -> tuple[np.ndarray, str]:
     """Return a 2D projection for plots, using UMAP when reasonable."""
@@ -591,17 +665,494 @@ def _reduce_embeddings_2d(embeddings: np.ndarray) -> tuple[np.ndarray, str]:
     return xy, "PCA"
 
 
+CLASS_COLOR_OVERRIDES = {
+    "BFB": "#E15759",
+    "chromothripsis": "#4E79A7",
+    "seismic_amplification": "#F28E2B",
+    "none": "#6C6C6C",
+    "unknown": "#9C755F",
+    "unlabeled": "#BAB0AC",
+}
+
+
+def _class_key(value: object) -> str:
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "null"}:
+        return "unlabeled"
+    return text
+
+
+def _display_class(value: object) -> str:
+    return _class_key(value).replace("_", " ")
+
+
 def _label_colors(values: pd.Series) -> tuple[list[str], dict[str, object]]:
-    labels = values.astype(str).replace("", "unlabeled").tolist()
+    labels = [_class_key(value) for value in values.tolist()]
     unique = list(dict.fromkeys(labels))
-    cmap = plt.get_cmap("tab20")
-    colors = {label: cmap(i % 20) for i, label in enumerate(unique)}
+    fallback = plt.get_cmap("tab20")
+    colors: dict[str, object] = {}
+    fallback_i = 0
+    for label in unique:
+        if label in CLASS_COLOR_OVERRIDES:
+            colors[label] = CLASS_COLOR_OVERRIDES[label]
+        else:
+            colors[label] = fallback(fallback_i % 20)
+            fallback_i += 1
     return [colors[label] for label in labels], colors
 
 
-def _short_label(row: pd.Series) -> str:
+def _candidate_label(row: pd.Series, include_class: bool = False, include_prediction: bool = False) -> str:
     value = str(row.get("candidate_id", "")) or str(row.get("label_id", ""))
-    return value[:32]
+    value = value[:36]
+    details: list[str] = []
+    if include_class:
+        cls = str(row.get("sv_class", ""))
+        if cls:
+            details.append(f"gt={_display_class(cls)}")
+    if include_prediction:
+        pred = str(row.get("predicted_class", ""))
+        if pred:
+            details.append(f"pred={_display_class(pred)}")
+    if details:
+        value = f"{value} [{'; '.join(details)}]"
+    return value
+
+
+def _short_label(row: pd.Series) -> str:
+    return _candidate_label(row, include_class=False)[:32]
+
+
+def _prototype_distance_label(row: pd.Series) -> str:
+    return _candidate_label(row, include_class=bool(str(row.get("sv_class", "")).strip()))
+
+
+def _dense_tick_fontsize(n_labels: int, max_size: float = 7.0, min_size: float = 3.0) -> float:
+    if n_labels <= 0:
+        return max_size
+    if n_labels <= 90:
+        return max_size
+    return max(min_size, max_size * float(np.sqrt(90.0 / n_labels)))
+
+
+def _known_anchor_mask(metadata: pd.DataFrame) -> np.ndarray:
+    if "sv_class" not in metadata:
+        return np.zeros(len(metadata), dtype=bool)
+    return (metadata["sv_class"].astype(str) != "").to_numpy()
+
+
+def _plot_embedding_projection(
+    xy: np.ndarray,
+    metadata: pd.DataFrame,
+    color_source: pd.Series,
+    title: str,
+    output_path: Path,
+    method: str,
+) -> None:
+    point_colors, legend_colors = _label_colors(color_source)
+    known_mask = _known_anchor_mask(metadata)
+    sizes = np.where(known_mask, 76, 40)
+    edgecolors = np.where(known_mask, "black", "#777777")
+    linewidths = np.where(known_mask, 0.8, 0.25)
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.5))
+    ax.scatter(
+        xy[:, 0],
+        xy[:, 1],
+        c=point_colors,
+        s=sizes,
+        alpha=0.88,
+        linewidths=linewidths,
+        edgecolors=edgecolors,
+    )
+    if len(metadata) <= 60:
+        for i, row in metadata.reset_index(drop=True).iterrows():
+            ax.annotate(_short_label(row), (xy[i, 0], xy[i, 1]), fontsize=7, xytext=(3, 3), textcoords="offset points")
+
+    handles = [
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            label=_display_class(label),
+            markerfacecolor=color,
+            markeredgecolor="black" if label != "unlabeled" else "#777777",
+            markersize=8,
+        )
+        for label, color in legend_colors.items()
+    ]
+    if handles:
+        ax.legend(handles=handles, title="Class", fontsize=8, title_fontsize=9, loc="best")
+    ax.set_title(f"{title} ({method})")
+    ax.set_xlabel("Dim 1")
+    ax.set_ylabel("Dim 2")
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _distance_columns(distances: pd.DataFrame) -> list[str]:
+    return sorted(
+        [col for col in distances.columns if col.startswith("d_")],
+        key=lambda col: _display_class(col.removeprefix("d_")).lower(),
+    )
+
+
+def _plot_prototype_distances(
+    distances: pd.DataFrame,
+    output_path: Path,
+    tau: float,
+) -> None:
+    distance_cols = _distance_columns(distances)
+    if not distance_cols:
+        return
+
+    plot_df = distances.copy()
+    fallback = plot_df["label_id"].astype(str) if "label_id" in plot_df else pd.Series([""] * len(plot_df))
+    plot_df["_plot_label"] = plot_df["candidate_id"].astype(str).mask(plot_df["candidate_id"].astype(str) == "", fallback)
+    plot_df["_min_distance"] = plot_df[distance_cols].astype(float).min(axis=1)
+    if "sv_class" not in plot_df:
+        plot_df["sv_class"] = ""
+    if "predicted_class" not in plot_df:
+        plot_df["predicted_class"] = ""
+    plot_df["_is_unlabeled"] = plot_df["sv_class"].astype(str) == ""
+    plot_df["_true_sort"] = plot_df["sv_class"].astype(str).replace("", "unlabeled")
+    plot_df["_pred_sort"] = plot_df["predicted_class"].astype(str).replace("", "none")
+    plot_df = plot_df.sort_values(["_is_unlabeled", "_true_sort", "_pred_sort", "_min_distance", "_plot_label"]).reset_index(drop=True)
+
+    if len(distance_cols) == 1:
+        primary_col = distance_cols[0]
+        fig_h = max(4.0, min(18.0, 0.30 * len(plot_df) + 1.5))
+        fig, ax = plt.subplots(figsize=(8, fig_h))
+        bar_colors, _legend = _label_colors(plot_df["sv_class"].astype(str))
+        ax.barh(np.arange(len(plot_df)), plot_df[primary_col].astype(float), color=bar_colors)
+        ax.set_yticks(np.arange(len(plot_df)))
+        ax.set_yticklabels(
+            [_candidate_label(row, include_class=True) for _, row in plot_df.iterrows()],
+            fontsize=_dense_tick_fontsize(len(plot_df), max_size=8.0),
+        )
+        ax.invert_yaxis()
+        ax.axvline(x=tau, color="#E45756", linestyle="--", linewidth=1.2, label=f"tau={tau:g}")
+        ax.set_xlabel("Cosine distance to prototype")
+        ax.set_title(f"Prototype Distance ({_display_class(primary_col.removeprefix('d_'))})")
+        ax.legend()
+        ax.grid(axis="x", alpha=0.2)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=180)
+        plt.close(fig)
+        return
+
+    matrix = plot_df[distance_cols].astype(float).to_numpy()
+    fig_h = max(5.0, min(22.0, 0.24 * len(plot_df) + 2.0))
+    fig_w = max(6.5, 1.2 * len(distance_cols) + 4.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(matrix, aspect="auto", cmap="viridis_r")
+    pred_to_col = {col.removeprefix("d_"): i for i, col in enumerate(distance_cols)}
+    star_x: list[int] = []
+    star_y: list[int] = []
+    for row_i, pred in enumerate(plot_df["predicted_class"].astype(str)):
+        if pred in pred_to_col:
+            star_x.append(pred_to_col[pred])
+            star_y.append(row_i)
+    if star_x:
+        ax.scatter(star_x, star_y, marker="*", s=45, color="white", edgecolors="black", linewidths=0.4)
+    ax.set_xticks(np.arange(len(distance_cols)))
+    ax.set_xticklabels([_display_class(col.removeprefix("d_")) for col in distance_cols], rotation=30, ha="right")
+
+    y_ticks = np.arange(len(plot_df))
+    y_labels = [_prototype_distance_label(row) for _, row in plot_df.iterrows()]
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels(y_labels, fontsize=_dense_tick_fontsize(len(plot_df)))
+    _draw_gt_class_boundaries(ax, plot_df)
+    ax.set_xlabel("Prototype class")
+    ax.set_title(f"Prototype Distances by Class (tau={tau:g}; star = predicted class; no star = none)")
+    fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02, label="Cosine distance")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _draw_gt_class_boundaries(ax, plot_df: pd.DataFrame) -> None:
+    if "sv_class" not in plot_df or plot_df.empty:
+        return
+    classes = plot_df["sv_class"].astype(str).tolist()
+    labeled_positions = [i for i, cls in enumerate(classes) if cls]
+    if not labeled_positions:
+        return
+
+    group_start = labeled_positions[0]
+    prev_cls = classes[group_start]
+    for pos in labeled_positions[1:] + [labeled_positions[-1] + 1]:
+        cls = classes[pos] if pos < len(classes) else None
+        if cls != prev_cls:
+            group_end = pos - 1
+            ax.axhline(group_end + 0.5, color="white", linewidth=2.2)
+            group_start = pos
+            prev_cls = cls
+
+
+def _plot_leave_one_out(
+    leave_one_out: pd.DataFrame,
+    output_path: Path,
+    tau: float,
+) -> None:
+    if leave_one_out.empty or "leave_one_out_distance" not in leave_one_out:
+        return
+    plot_df = leave_one_out.sort_values(["held_out_class", "leave_one_out_distance"], ascending=[True, True]).reset_index(drop=True)
+    labels = [_candidate_label(row, include_class=True) for _, row in plot_df.iterrows()]
+    bar_colors, legend_colors = _label_colors(plot_df["held_out_class"].astype(str))
+    fig_h = max(4.0, 0.32 * len(plot_df) + 1.5)
+    fig, ax = plt.subplots(figsize=(8.5, fig_h))
+    ax.barh(np.arange(len(plot_df)), plot_df["leave_one_out_distance"].astype(float), color=bar_colors)
+    ax.set_yticks(np.arange(len(plot_df)))
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.axvline(x=tau, color="#E45756", linestyle="--", linewidth=1.2, label=f"tau={tau:g}")
+    handles = [
+        plt.Line2D([0], [0], marker="s", color="w", label=_display_class(label), markerfacecolor=color, markersize=8)
+        for label, color in legend_colors.items()
+    ]
+    if handles:
+        ax.legend(handles=handles, title="Held-out class", fontsize=8, title_fontsize=9)
+    ax.set_xlabel("Held-out distance to true-class prototype")
+    ax.set_title("Leave-One-Out Prototype Distances by Class")
+    ax.grid(axis="x", alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_anchor_prediction_summary(
+    distances: pd.DataFrame,
+    output_path: Path,
+    tau: float,
+) -> None:
+    if "sv_class" not in distances or "predicted_class" not in distances:
+        return
+    gt = distances[distances["sv_class"].astype(str) != ""].copy()
+    if gt.empty:
+        return
+
+    gt["correct"] = gt["sv_class"].astype(str) == gt["predicted_class"].astype(str)
+    class_order = sorted(gt["sv_class"].astype(str).unique(), key=lambda value: _display_class(value).lower())
+    correct_counts = [int(gt[(gt["sv_class"] == cls) & gt["correct"]].shape[0]) for cls in class_order]
+    incorrect_counts = [int(gt[(gt["sv_class"] == cls) & ~gt["correct"]].shape[0]) for cls in class_order]
+
+    pred_order = list(class_order)
+    for pred in sorted(gt["predicted_class"].astype(str).unique(), key=lambda value: _display_class(value).lower()):
+        if pred not in pred_order:
+            pred_order.append(pred)
+    confusion = pd.crosstab(gt["sv_class"].astype(str), gt["predicted_class"].astype(str))
+    confusion = confusion.reindex(index=class_order, columns=pred_order, fill_value=0)
+
+    fig_w = max(9.0, 1.25 * max(len(class_order), len(pred_order)) + 6.0)
+    fig, axes = plt.subplots(1, 2, figsize=(fig_w, 4.6), gridspec_kw={"width_ratios": [1.0, 1.25]})
+
+    x = np.arange(len(class_order))
+    axes[0].bar(x, correct_counts, color="#59A14F", label="Correct")
+    axes[0].bar(x, incorrect_counts, bottom=correct_counts, color="#E15759", label="Incorrect")
+    for i, (correct, incorrect) in enumerate(zip(correct_counts, incorrect_counts)):
+        total = correct + incorrect
+        axes[0].text(i, total + 0.05, str(total), ha="center", va="bottom", fontsize=9)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels([_display_class(cls) for cls in class_order], rotation=25, ha="right")
+    axes[0].set_ylabel("GT anchor count")
+    axes[0].set_title(f"GT Anchor Prediction Accuracy (tau={tau:g})")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(axis="y", alpha=0.2)
+
+    matrix = confusion.to_numpy(dtype=int)
+    im = axes[1].imshow(matrix, cmap="Blues", vmin=0)
+    axes[1].set_xticks(np.arange(len(pred_order)))
+    axes[1].set_yticks(np.arange(len(class_order)))
+    axes[1].set_xticklabels([_display_class(cls) for cls in pred_order], rotation=30, ha="right")
+    axes[1].set_yticklabels([_display_class(cls) for cls in class_order])
+    axes[1].set_xlabel("Predicted class")
+    axes[1].set_ylabel("GT class")
+    axes[1].set_title("GT vs Thresholded Predicted Class")
+    for y in range(matrix.shape[0]):
+        for x_i in range(matrix.shape[1]):
+            value = int(matrix[y, x_i])
+            if value:
+                axes[1].text(x_i, y, str(value), ha="center", va="center", color="black", fontsize=9)
+    fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04, label="Count")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _positive_negative_tau_frame(
+    distances: pd.DataFrame,
+    leave_one_out: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+
+    if not leave_one_out.empty and "nearest_prototype_distance" in leave_one_out:
+        for _, row in leave_one_out.iterrows():
+            dist = pd.to_numeric(pd.Series([row.get("nearest_prototype_distance")]), errors="coerce").iloc[0]
+            if np.isfinite(dist):
+                rows.append(
+                    {
+                        "candidate_id": row.get("candidate_id", ""),
+                        "label": 1,
+                        "set": "gt_label_leave_one_out",
+                        "distance": float(dist),
+                    }
+                )
+
+    if not distances.empty and "nearest_prototype_distance" in distances:
+        if "sv_class" in distances:
+            neg = distances[distances["sv_class"].astype(str) == ""].copy()
+        else:
+            neg = distances.copy()
+        if "evidence" in neg and (neg["evidence"].astype(str) == "chromosome_scan").any():
+            neg = neg[neg["evidence"].astype(str) == "chromosome_scan"]
+        for _, row in neg.iterrows():
+            dist = pd.to_numeric(pd.Series([row.get("nearest_prototype_distance")]), errors="coerce").iloc[0]
+            if np.isfinite(dist):
+                rows.append(
+                    {
+                        "candidate_id": row.get("candidate_id", ""),
+                        "label": 0,
+                        "set": "unlabeled_chromosome",
+                        "distance": float(dist),
+                    }
+                )
+
+    return pd.DataFrame(rows)
+
+
+def _tau_precision_recall_table(
+    score_df: pd.DataFrame,
+    extra_thresholds: list[float] | None = None,
+) -> pd.DataFrame:
+    if score_df.empty:
+        return pd.DataFrame()
+    labels = score_df["label"].astype(int).to_numpy()
+    distances = score_df["distance"].astype(float).to_numpy()
+    n_pos = int(labels.sum())
+    n_neg = int((labels == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return pd.DataFrame()
+
+    finite_distances = np.unique(distances[np.isfinite(distances)])
+    if finite_distances.size == 0:
+        return pd.DataFrame()
+
+    thresholds = [0.0, float(finite_distances.max() + 1e-6)]
+    if finite_distances.size == 1:
+        thresholds.append(float(finite_distances[0] + 1e-6))
+    else:
+        mids = (finite_distances[:-1] + finite_distances[1:]) / 2.0
+        thresholds.extend(float(value) for value in mids)
+    if extra_thresholds:
+        thresholds.extend(float(value) for value in extra_thresholds if np.isfinite(value))
+    thresholds = np.asarray(sorted(set(thresholds)), dtype=float)
+    rows: list[dict[str, float | int]] = []
+    for threshold in thresholds:
+        predicted = distances < threshold
+        tp = int(((labels == 1) & predicted).sum())
+        fp = int(((labels == 0) & predicted).sum())
+        fn = int(((labels == 1) & ~predicted).sum())
+        tn = int(((labels == 0) & ~predicted).sum())
+        precision = float(tp / (tp + fp)) if (tp + fp) else 1.0
+        recall = float(tp / (tp + fn)) if (tp + fn) else 0.0
+        f1 = float((2 * precision * recall) / (precision + recall)) if (precision + recall) else 0.0
+        rows.append(
+            {
+                "tau": float(threshold),
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "tn": tn,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _plot_tau_precision_recall(
+    distances: pd.DataFrame,
+    leave_one_out: pd.DataFrame,
+    output_path: Path,
+    tau: float,
+) -> None:
+    score_df = _positive_negative_tau_frame(distances, leave_one_out)
+    pr_df = _tau_precision_recall_table(score_df, extra_thresholds=[tau])
+    if pr_df.empty:
+        return
+
+    table_path = output_path.with_suffix(".tsv")
+    pr_df.to_csv(table_path, sep="\t", index=False)
+
+    best_idx = int(pr_df["f1"].astype(float).idxmax())
+    best = pr_df.loc[best_idx]
+    current_idx = int((pr_df["tau"].astype(float) - float(tau)).abs().idxmin())
+    current = pr_df.loc[current_idx]
+    n_pos = int(score_df["label"].astype(int).sum())
+    n_neg = int((score_df["label"].astype(int) == 0).sum())
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.6))
+
+    scatter = axes[0].scatter(
+        pr_df["recall"],
+        pr_df["precision"],
+        c=pr_df["tau"],
+        cmap="viridis",
+        s=32,
+        edgecolors="none",
+    )
+    axes[0].scatter(
+        [best["recall"]],
+        [best["precision"]],
+        marker="*",
+        s=150,
+        color="#E15759",
+        edgecolors="black",
+        linewidths=0.5,
+        label=f"best F1 tau={best['tau']:.4g}",
+    )
+    axes[0].scatter(
+        [current["recall"]],
+        [current["precision"]],
+        marker="o",
+        s=70,
+        facecolors="none",
+        edgecolors="black",
+        linewidths=1.2,
+        label=f"current tau={tau:g}",
+    )
+    axes[0].set_xlabel("Recall on GT labels")
+    axes[0].set_ylabel("Precision vs unlabeled chromosomes")
+    axes[0].set_xlim(-0.03, 1.03)
+    axes[0].set_ylim(-0.03, 1.03)
+    axes[0].set_title("Tau Precision-Recall")
+    axes[0].grid(alpha=0.2)
+    axes[0].legend(fontsize=8, loc="lower left")
+    fig.colorbar(scatter, ax=axes[0], fraction=0.046, pad=0.04, label="tau")
+
+    axes[1].plot(pr_df["tau"], pr_df["precision"], label="Precision", color="#4E79A7")
+    axes[1].plot(pr_df["tau"], pr_df["recall"], label="Recall", color="#59A14F")
+    axes[1].plot(pr_df["tau"], pr_df["f1"], label="F1", color="#E15759")
+    axes[1].axvline(float(best["tau"]), color="#E15759", linestyle="--", linewidth=1.0)
+    axes[1].axvline(float(tau), color="black", linestyle=":", linewidth=1.0)
+    axes[1].set_xlabel("tau distance threshold")
+    axes[1].set_ylabel("Score")
+    axes[1].set_ylim(-0.03, 1.03)
+    axes[1].set_title(
+        f"Best F1={best['f1']:.2f} "
+        f"(P={best['precision']:.2f}, R={best['recall']:.2f}; {n_pos} GT, {n_neg} other chromosomes)"
+    )
+    axes[1].grid(alpha=0.2)
+    axes[1].legend(fontsize=8, loc="best")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
 
 
 def write_visualizations(
@@ -617,79 +1168,40 @@ def write_visualizations(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     xy, method = _reduce_embeddings_2d(embeddings)
+    true_classes = metadata["sv_class"] if "sv_class" in metadata else pd.Series([""] * len(metadata))
+    _plot_embedding_projection(
+        xy,
+        metadata,
+        true_classes,
+        "Candidate Embedding Projection - True Labels",
+        out_dir / "embedding_projection.png",
+        method,
+    )
     if "predicted_class" in distances:
-        color_source = distances["predicted_class"]
-    elif "sv_class" in metadata:
-        color_source = metadata["sv_class"]
-    else:
-        color_source = pd.Series([""] * len(metadata))
-    point_colors, legend_colors = _label_colors(color_source)
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.scatter(xy[:, 0], xy[:, 1], c=point_colors, s=56, alpha=0.85, linewidths=0.4, edgecolors="black")
-    if len(metadata) <= 40:
-        for i, row in metadata.reset_index(drop=True).iterrows():
-            ax.annotate(_short_label(row), (xy[i, 0], xy[i, 1]), fontsize=7, xytext=(3, 3), textcoords="offset points")
-    handles = [plt.Line2D([0], [0], marker="o", color="w", label=label, markerfacecolor=color, markersize=8) for label, color in legend_colors.items()]
-    if handles:
-        ax.legend(handles=handles, title="Class", fontsize=8, title_fontsize=9)
-    ax.set_title(f"Candidate Embedding Projection ({method})")
-    ax.set_xlabel("Dim 1")
-    ax.set_ylabel("Dim 2")
-    ax.grid(alpha=0.2)
-    fig.tight_layout()
-    fig.savefig(out_dir / "embedding_projection.png", dpi=180)
-    plt.close(fig)
+        _plot_embedding_projection(
+            xy,
+            metadata,
+            distances["predicted_class"],
+            "Candidate Embedding Projection - Predicted Classes",
+            out_dir / "embedding_projection_predicted.png",
+            method,
+        )
 
-    distance_cols = [c for c in distances.columns if c.startswith("d_")]
-    if distance_cols:
-        primary_col = distance_cols[0]
-        plot_df = distances.sort_values(primary_col, ascending=True).reset_index(drop=True)
-        fallback = plot_df["label_id"].astype(str) if "label_id" in plot_df else pd.Series([""] * len(plot_df))
-        labels = plot_df["candidate_id"].astype(str).mask(plot_df["candidate_id"].astype(str) == "", fallback)
-        fig_h = max(4.0, 0.32 * len(plot_df) + 1.5)
-        fig, ax = plt.subplots(figsize=(8, fig_h))
-        ax.barh(np.arange(len(plot_df)), plot_df[primary_col].astype(float), color="#4C78A8")
-        ax.set_yticks(np.arange(len(plot_df)))
-        ax.set_yticklabels(labels, fontsize=8)
-        ax.invert_yaxis()
-        ax.axvline(x=tau, color="#E45756", linestyle="--", linewidth=1.2, label=f"tau={tau:g}")
-        ax.set_xlabel("Cosine distance to prototype")
-        ax.set_title(f"Prototype Distance ({primary_col.removeprefix('d_')})")
-        ax.legend()
-        ax.grid(axis="x", alpha=0.2)
-        fig.tight_layout()
-        fig.savefig(out_dir / "prototype_distances.png", dpi=180)
-        plt.close(fig)
+    _plot_prototype_distances(distances, out_dir / "prototype_distances.png", tau=tau)
+    _plot_leave_one_out(leave_one_out, out_dir / "anchor_leave_one_out.png", tau=tau)
+    _plot_anchor_prediction_summary(distances, out_dir / "anchor_prediction_summary.png", tau=tau)
+    _plot_tau_precision_recall(distances, leave_one_out, out_dir / "tau_precision_recall.png", tau=tau)
 
-    if not leave_one_out.empty and "leave_one_out_distance" in leave_one_out:
-        plot_df = leave_one_out.sort_values("leave_one_out_distance", ascending=True).reset_index(drop=True)
-        fallback = plot_df["label_id"].astype(str) if "label_id" in plot_df else pd.Series([""] * len(plot_df))
-        labels = plot_df["candidate_id"].astype(str).mask(plot_df["candidate_id"].astype(str) == "", fallback)
-        fig_h = max(4.0, 0.32 * len(plot_df) + 1.5)
-        fig, ax = plt.subplots(figsize=(8, fig_h))
-        ax.barh(np.arange(len(plot_df)), plot_df["leave_one_out_distance"].astype(float), color="#59A14F")
-        ax.set_yticks(np.arange(len(plot_df)))
-        ax.set_yticklabels(labels, fontsize=8)
-        ax.invert_yaxis()
-        ax.axvline(x=tau, color="#E45756", linestyle="--", linewidth=1.2, label=f"tau={tau:g}")
-        ax.set_xlabel("Held-out distance")
-        ax.set_title("Leave-One-Out Prototype Distances")
-        ax.legend()
-        ax.grid(axis="x", alpha=0.2)
-        fig.tight_layout()
-        fig.savefig(out_dir / "anchor_leave_one_out.png", dpi=180)
-        plt.close(fig)
-
-    if "sv_class" in metadata:
-        known_mask = metadata["sv_class"].astype(str) != ""
-    else:
-        known_mask = pd.Series([False] * len(metadata))
-    known_idx = np.where(known_mask.to_numpy())[0]
-    if known_idx.size >= 2 and known_idx.size <= 80:
+    known_mask = metadata["sv_class"].astype(str) != "" if "sv_class" in metadata else pd.Series([False] * len(metadata))
+    known_meta = metadata.loc[known_mask].copy()
+    if len(known_meta) >= 2 and len(known_meta) <= 80:
+        known_meta["_orig_idx"] = np.where(known_mask.to_numpy())[0]
+        known_meta = known_meta.sort_values(["sv_class", "candidate_id"]).reset_index(drop=True)
+        known_idx = known_meta["_orig_idx"].astype(int).to_numpy()
         known_emb = embeddings[known_idx]
         known_emb = known_emb / np.clip(np.linalg.norm(known_emb, axis=1, keepdims=True), 1e-12, None)
         sim = known_emb @ known_emb.T
-        labels = metadata.iloc[known_idx]["candidate_id"].astype(str).tolist()
+        labels = [_candidate_label(row, include_class=True) for _, row in known_meta.iterrows()]
         fig_size = max(5.5, min(12.0, 0.45 * len(labels) + 3.0))
         fig, ax = plt.subplots(figsize=(fig_size, fig_size))
         im = ax.imshow(sim, vmin=0.0, vmax=1.0, cmap="viridis")
@@ -697,12 +1209,11 @@ def write_visualizations(
         ax.set_yticks(np.arange(len(labels)))
         ax.set_xticklabels(labels, rotation=90, fontsize=7)
         ax.set_yticklabels(labels, fontsize=7)
-        ax.set_title("Known-Anchor Cosine Similarity")
+        ax.set_title("Known-Anchor Cosine Similarity by Class")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         fig.tight_layout()
         fig.savefig(out_dir / "anchor_similarity_heatmap.png", dpi=180)
         plt.close(fig)
-
 
 def run(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -763,9 +1274,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cn_checkpoint", required=True, help="Pretrained CN checkpoint")
     parser.add_argument("--graph_checkpoint", required=False, help="Pretrained graph checkpoint")
     parser.add_argument("--output_dir", required=True, help="Output directory")
-    parser.add_argument("--candidate_source", choices=["labels", "proposals", "all"], default="labels")
+    parser.add_argument(
+        "--candidate_source",
+        choices=["labels", "chromosomes", "proposals", "all"],
+        default="labels",
+        help=(
+            "Region source: labels uses only labeled intervals; chromosomes uses labeled "
+            "intervals plus one unlabeled whole-chromosome candidate for each unlabeled "
+            "manifest sample/chromosome; proposals uses heuristic CN/SV windows; all uses "
+            "labels plus heuristic proposals."
+        ),
+    )
     parser.add_argument("--prototypes_name", default="prototypes.pt")
-    parser.add_argument("--tau", type=float, default=0.5)
+    parser.add_argument("--tau", type=float, default=DEFAULT_TAU)
     parser.add_argument("--strict", action="store_true", help="Use strict checkpoint loading")
     return parser.parse_args(argv)
 

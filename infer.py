@@ -24,7 +24,7 @@ def _load_embedding_metadata(output_dir: Path) -> tuple[np.ndarray, pd.DataFrame
 def _write_predictions(distances: pd.DataFrame, output_path: Path) -> None:
     rows = []
     for row in distances.to_dict("records"):
-        pred = row.get("predicted_class", row.get("sv_class", "unknown")) or "unknown"
+        pred = row.get("predicted_class", row.get("sv_class", "none")) or "none"
         out = {
             "candidate_id": row.get("candidate_id", ""),
             "sample_id": row["sample_id"],
@@ -84,8 +84,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph_checkpoint", required=False)
     parser.add_argument("--prototypes", required=False, help="Optional existing PrototypeCache .pt")
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--candidate_source", choices=["labels", "proposals", "all"], default="labels")
-    parser.add_argument("--tau", type=float, default=0.5)
+    parser.add_argument(
+        "--candidate_source",
+        choices=["labels", "chromosomes", "proposals", "all"],
+        default="labels",
+        help="Region source to pass through to discovery.embed_corpus.",
+    )
+    parser.add_argument("--tau", type=float, default=embed_corpus.DEFAULT_TAU)
     parser.add_argument("--strict", action="store_true")
     return parser.parse_args(argv)
 

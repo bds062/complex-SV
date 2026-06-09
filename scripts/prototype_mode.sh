@@ -1,39 +1,31 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=complex_sv_proto
-#SBATCH --partition=gpu
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:a100:1
-#SBATCH --mem=48G
-#SBATCH --time=6:00:00
-#SBATCH --output=../logs/complex_sv_proto-%j.out
-#SBATCH --error=../logs/complex_sv_proto-%j.out
-
 set -euo pipefail
 
-# Usage:
-#   1. Edit the values in the block below.
-#   2. Submit with:
-#        sbatch scripts/prototype_mode.sbatch
+# Plain bash launcher for prototype-mode complex-SV inference.
+# Run from anywhere with:
+#   bash complex-SV/scripts/prototype_mode.sh
+# or from the repo with:
+#   bash scripts/prototype_mode.sh
 #
-# This script runs both prototype-mode stages:
-#   A. Build chromothripsis prototypes from labeled anchor regions.
-#   B. Run prototype inference/ranking on anchors + proposed candidates.
+# Common overrides:
+#   OUTPUT_ROOT=../results/pipeline3/prototype_chrom \
+#   INFER_CANDIDATE_SOURCE=chromosomes \
+#   bash scripts/prototype_mode.sh
 
-# -------------------------
-# User-editable parameters
-# -------------------------
-PROJECT_DIR="./"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-MANIFEST="../results/pipeline3/complex_sv_manifest.tsv"
-LABELS="../results/pipeline3/complex_sv_labels.tsv"
-OUTPUT_ROOT="../results/pipeline3/prototype_mode"
+BASE="${BASE:-../results/pipeline2}"
+MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
+LABELS="${LABELS:-$BASE/complex_sv_labels.tsv}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$BASE/prototype_chrom}"
 
-# Global pretrained checkpoint parameters.
-CN_CHECKPOINT="../results/pipeline3/cn_pretrain_chrom/cn_encoder.pt"
-GRAPH_CHECKPOINT="../results/pipeline3/sv_pretrain_chrom/graph_encoder.pt"
+CN_CHECKPOINT="${CN_CHECKPOINT:-$BASE/cn_pretrain_chrom/cn_encoder.pt}"
+# GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-$BASE/sv_pretrain_chrom/graph_encoder.pt}"
+GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-../results/pipeline2/sv_pretrain_chrom/graph_encoder.pt}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-TAU="0.06"
+TAU="${TAU:-0.06819}"
 INFER_CANDIDATE_SOURCE="${INFER_CANDIDATE_SOURCE:-chromosomes}"
 
 PROTOTYPE_DIR="${OUTPUT_ROOT%/}/anchors"
@@ -148,8 +140,7 @@ PLOT_CMD=(
 
 echo "[prototype_mode] Plotting predicted unlabeled chromosomes:"
 printf '  %q' "${PLOT_CMD[@]}"
-printf '
-'
+printf '\n'
 "${PLOT_CMD[@]}"
 
 if [[ ! -f "$PLOT_DIR/selected_predictions.tsv" ]]; then
