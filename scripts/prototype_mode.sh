@@ -8,29 +8,35 @@ set -euo pipefail
 #   bash scripts/prototype_mode.sh
 #
 # Common overrides:
-#   OUTPUT_ROOT=../results/pipeline3/prototype_chrom \
-#   INFER_CANDIDATE_SOURCE=chromosomes \
+#   OUTPUT_ROOT=../results/pipeline6/prototype_chrom_arm_sample_norm \
+#   EMBEDDING_NORMALIZATION=sample_residual \
+#   INFER_CANDIDATE_SOURCE=chromosome-arms \
 #   bash scripts/prototype_mode.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-BASE="${BASE:-../results/pipeline2}"
+BASE="${BASE:-../results/pipeline6}"
 MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
 LABELS="${LABELS:-$BASE/complex_sv_labels.tsv}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$BASE/prototype_chrom}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$BASE/prototype_chrom_arm_sample_norm}"
 
-CN_CHECKPOINT="${CN_CHECKPOINT:-$BASE/cn_pretrain_chrom/cn_encoder.pt}"
+# CN_CHECKPOINT="${CN_CHECKPOINT:-$BASE/cn_pretrain_chrom/cn_encoder.pt}"
 # GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-$BASE/sv_pretrain_chrom/graph_encoder.pt}"
-GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-../results/pipeline2/sv_pretrain_chrom/graph_encoder.pt}"
+CN_CHECKPOINT="${CN_CHECKPOINT:-../results/pipeline3/cn_pretrain_chrom/cn_encoder.pt}"
+GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-../results/pipeline3/sv_pretrain_chrom/graph_encoder.pt}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
-TAU="${TAU:-0.06819}"
-INFER_CANDIDATE_SOURCE="${INFER_CANDIDATE_SOURCE:-chromosomes}"
+TAU="${TAU:-0.5562}"
+EMBEDDING_NORMALIZATION="${EMBEDDING_NORMALIZATION:-sample_residual}"
+SAMPLE_BASELINE_MIN_CANDIDATES="${SAMPLE_BASELINE_MIN_CANDIDATES:-3}"
+PROTOTYPE_CANDIDATE_SOURCE="${PROTOTYPE_CANDIDATE_SOURCE:-chromosome-arms}"
+PROTOTYPE_REPORT_SCOPE="${PROTOTYPE_REPORT_SCOPE:-anchors}"
+INFER_CANDIDATE_SOURCE="${INFER_CANDIDATE_SOURCE:-chromosome-arms}"
 
 PROTOTYPE_DIR="${OUTPUT_ROOT%/}/anchors"
 INFER_DIR="${OUTPUT_ROOT%/}/inference"
-PLOT_DIR="${INFER_DIR%/}/predicted_chromosome_plots"
+PLOT_DIR="${INFER_DIR%/}/predicted_chromosome_arm_plots"
 PROTOTYPES="${PROTOTYPE_DIR%/}/prototypes.pt"
 
 # Add optional prototype-building arguments here, one argument per line.
@@ -44,6 +50,7 @@ INFER_EXTRA_ARGS=(
 )
 
 cd "$PROJECT_DIR"
+rm -rf "$PLOT_DIR"
 
 if [[ "$PYTHON_BIN" == "python" && -x "../envs/env2/bin/python" ]]; then
     PYTHON_BIN="../envs/env2/bin/python"
@@ -55,6 +62,10 @@ if ! "$PYTHON_BIN" -c "import pandas, torch, torch_geometric" >/dev/null 2>&1; t
 fi
 
 mkdir -p "$PROTOTYPE_DIR" "$INFER_DIR" "../logs"
+if [[ "$PROTOTYPE_REPORT_SCOPE" == "anchors" ]]; then
+    rm -f "$PROTOTYPE_DIR/prototype_distances_all.tsv" "$PROTOTYPE_DIR/.prototype_distances_all.tmp.tsv"
+    rm -f "$PROTOTYPE_DIR/tau_precision_recall.png" "$PROTOTYPE_DIR/tau_precision_recall.tsv"
+fi
 
 for required_file in "$MANIFEST" "$LABELS" "$CN_CHECKPOINT" "$GRAPH_CHECKPOINT"; do
     if [[ ! -f "$required_file" ]]; then
@@ -75,6 +86,10 @@ echo "[prototype_mode] plot_dir=$PLOT_DIR"
 echo "[prototype_mode] prototypes=$PROTOTYPES"
 echo "[prototype_mode] python_bin=$PYTHON_BIN"
 echo "[prototype_mode] tau=$TAU"
+echo "[prototype_mode] embedding_normalization=$EMBEDDING_NORMALIZATION"
+echo "[prototype_mode] sample_baseline_min_candidates=$SAMPLE_BASELINE_MIN_CANDIDATES"
+echo "[prototype_mode] prototype_candidate_source=$PROTOTYPE_CANDIDATE_SOURCE"
+echo "[prototype_mode] prototype_report_scope=$PROTOTYPE_REPORT_SCOPE"
 echo "[prototype_mode] infer_candidate_source=$INFER_CANDIDATE_SOURCE"
 echo "[prototype_mode] prototype_extra_args=${PROTOTYPE_EXTRA_ARGS[*]:-}"
 echo "[prototype_mode] infer_extra_args=${INFER_EXTRA_ARGS[*]:-}"
@@ -86,8 +101,11 @@ PROTO_CMD=(
     --cn_checkpoint "$CN_CHECKPOINT"
     --graph_checkpoint "$GRAPH_CHECKPOINT"
     --output_dir "$PROTOTYPE_DIR"
-    --candidate_source labels
+    --candidate_source "$PROTOTYPE_CANDIDATE_SOURCE"
+    --report_scope "$PROTOTYPE_REPORT_SCOPE"
     --tau "$TAU"
+    --embedding_normalization "$EMBEDDING_NORMALIZATION"
+    --sample_baseline_min_candidates "$SAMPLE_BASELINE_MIN_CANDIDATES"
 )
 PROTO_CMD+=("${PROTOTYPE_EXTRA_ARGS[@]}")
 
@@ -111,6 +129,8 @@ INFER_CMD=(
     --output_dir "$INFER_DIR"
     --candidate_source "$INFER_CANDIDATE_SOURCE"
     --tau "$TAU"
+    --embedding_normalization "$EMBEDDING_NORMALIZATION"
+    --sample_baseline_min_candidates "$SAMPLE_BASELINE_MIN_CANDIDATES"
 )
 INFER_CMD+=("${INFER_EXTRA_ARGS[@]}")
 

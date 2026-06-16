@@ -28,12 +28,14 @@ from data.severus_parser import parse_severus
 from data.wakhan_parser import parse_wakhan
 
 log = logging.getLogger(__name__)
+SCAN_EVIDENCE_VALUES = {"chromosome_scan", "chromosome_arm_scan"}
 
 MISSING_VALUES = {"", "none", "nan", "null", "unknown", "unlabeled"}
 CLASS_COLORS = {
     "BFB": "#E15759",
     "chromothripsis": "#4E79A7",
     "seismic_amplification": "#F28E2B",
+    "TIC": "#59A14F",
 }
 SV_TYPE_COLORS = {
     "DEL": "#CF0759",
@@ -54,6 +56,61 @@ def _clean_text(value: object) -> str:
 
 def _is_empty(value: object) -> bool:
     return _clean_text(value).lower() in MISSING_VALUES
+
+
+def _split_class_set(value: object) -> list[str]:
+    text = _clean_text(value)
+    if not text or text.lower() in MISSING_VALUES:
+        return []
+    return [part.strip() for part in text.replace(",", ";").split(";") if part.strip()]
+
+
+def _row_predicted_classes(row: pd.Series) -> list[str]:
+    if "predicted_classes" in row and _clean_text(row.get("predicted_classes", "")):
+        return _split_class_set(row.get("predicted_classes", ""))
+    return _split_class_set(row.get("predicted_class", ""))
+
+
+def _prediction_label(row: pd.Series) -> str:
+    classes = _row_predicted_classes(row)
+    return ";".join(classes) if classes else "none"
+
+
+def _region_label(chrom: object, arm: object) -> str:
+    chrom_text = _clean_text(chrom)
+    arm_text = _clean_text(arm).lower()
+    return f"{chrom_text}{arm_text}" if arm_text in {"p", "q"} else chrom_text
+
+
+def _type_probability_classes(row: pd.Series) -> list[str]:
+    available = [str(col).removeprefix("type_probability_") for col in row.index if str(col).startswith("type_probability_")]
+    preferred = ["BFB", "chromothripsis", "seismic_amplification", "TIC"]
+    ordered = [name for name in preferred if name in available]
+    ordered.extend(sorted(name for name in available if name not in set(ordered)))
+    return ordered
+
+
+def _format_score_text(row: pd.Series, pred_classes: list[str]) -> str:
+    objectness_prob = _numeric(row, "objectness_prob", np.nan)
+    if np.isfinite(objectness_prob):
+        parts = [f"objectness(sigmoid)={objectness_prob:.3g}"]
+        type_parts: list[str] = []
+        for class_name in _type_probability_classes(row):
+            prob = _numeric(row, f"type_probability_{class_name}", np.nan)
+            if np.isfinite(prob):
+                type_parts.append(f"{class_name}={prob:.3g}")
+        if type_parts:
+            parts.append("type_probs(sigmoid): " + "; ".join(type_parts))
+        return " | ".join(parts)
+
+    distance = _numeric(row, "nearest_prototype_distance", np.nan)
+    confidence = _numeric(row, "prototype_confidence", np.nan)
+    legacy_parts: list[str] = []
+    if np.isfinite(distance):
+        legacy_parts.append(f"distance={distance:.4g}")
+    if np.isfinite(confidence):
+        legacy_parts.append(f"confidence={confidence:.3g}")
+    return " | ".join(legacy_parts) if legacy_parts else "scores unavailable"
 
 
 def _safe_name(value: object) -> str:
@@ -95,17 +152,18 @@ def select_predicted_chromosomes(distances: pd.DataFrame) -> pd.DataFrame:
 
     df = distances.copy().fillna("")
     if "evidence" in df.columns:
-        df = df[df["evidence"].astype(str) == "chromosome_scan"].copy()
+        df = df[df["evidence"].astype(str).isin(SCAN_EVIDENCE_VALUES)].copy()
     df = df[df["sv_class"].map(_is_empty)].copy()
-    df = df[~df["predicted_class"].map(_is_empty)].copy()
+    df = df[df.apply(lambda row: bool(_row_predicted_classes(row)), axis=1)].copy()
     if df.empty:
         return df
 
     for col in ["start_bp", "end_bp", "nearest_prototype_distance", "prototype_confidence"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    sort_cols = [col for col in ["predicted_class", "sample_id", "chrom", "nearest_prototype_distance"] if col in df.columns]
-    return df.sort_values(sort_cols).reset_index(drop=True)
+    df["_pred_sort"] = df.apply(_prediction_label, axis=1)
+    sort_cols = [col for col in ["_pred_sort", "sample_id", "chrom", "arm", "nearest_prototype_distance"] if col in df.columns]
+    return df.sort_values(sort_cols).drop(columns=["_pred_sort"], errors="ignore").reset_index(drop=True)
 
 
 def _subset_segments(wakhan_df: pd.DataFrame, chrom: str, start_bp: int, end_bp: int) -> pd.DataFrame:
@@ -196,7 +254,15 @@ def _plot_cn_panel(ax, segs: pd.DataFrame, start_bp: int, end_bp: int) -> None:
     ax.grid(axis="y", alpha=0.2)
 
 
-def _plot_breakpoint_panel(ax, segs: pd.DataFrame, sv_chr: pd.DataFrame, start_bp: int, end_bp: int) -> None:
+def _plot_breakpoint_panel(
+    ax,
+    segs: pd.DataFrame,
+    severus_df: pd.DataFrame,
+    sv_chr: pd.DataFrame,
+    chrom: str,
+    start_bp: int,
+    end_bp: int,
+) -> None:
     ax.set_ylabel("Breakpoints")
     max_bp = 1.0
     if not segs.empty and "breakpoint_count" in segs:
@@ -220,7 +286,21 @@ def _plot_breakpoint_panel(ax, segs: pd.DataFrame, sv_chr: pd.DataFrame, start_b
                 ax.vlines(xs, 0, y_top, colors=color, linewidth=0.55, alpha=0.45)
         max_bp = max(max_bp, y_top)
 
-    ax.set_ylim(0, max_bp * 1.25 + 0.05)
+    arcs, _markers = _same_chrom_arcs(severus_df, sv_chr, chrom, start_bp, end_bp)
+    if arcs:
+        region_mb = max((end_bp - start_bp) / 1e6, 1e-4)
+        arc_base = max_bp * 1.10
+        arc_height = max(max_bp * 0.55, 0.8)
+        for arc in arcs:
+            x0 = float(arc["x0"]) / 1e6
+            x1 = float(arc["x1"]) / 1e6
+            color = SV_TYPE_COLORS.get(str(arc["type"]), "#6C6C6C")
+            xs, unit_y = _arc_points(x0, x1, region_mb)
+            is_offscreen = str(arc.get("kind", "")).startswith("offscreen") or str(arc.get("kind", "")) == "interchrom_mate"
+            ax.plot(xs, arc_base + unit_y * arc_height, color=color, linewidth=0.85 if is_offscreen else 0.7, alpha=0.55 if is_offscreen else 0.42)
+        max_bp = max(max_bp, arc_base + arc_height * 1.12)
+
+    ax.set_ylim(0, max_bp * 1.08 + 0.05)
     ax.grid(axis="y", alpha=0.2)
 
 
@@ -232,6 +312,28 @@ def _arc_points(x0: float, x1: float, region_mb: float) -> tuple[np.ndarray, np.
     height = 0.12 + 0.86 * min(1.0, np.sqrt(span / max(region_mb, 1e-4)))
     ys = 0.05 + height * np.sin(np.pi * (xs - x0) / span)
     return xs, ys
+
+
+def _offscreen_endpoint(anchor_bp: int, target_bp: int | None, start_bp: int, end_bp: int) -> int:
+    """Return an endpoint just outside the plotted interval for clipped arcs."""
+    span = max(int(end_bp) - int(start_bp), 1)
+    margin = max(int(span * 0.08), 1)
+    if target_bp is not None:
+        if int(target_bp) < int(start_bp):
+            return int(start_bp) - margin
+        if int(target_bp) > int(end_bp):
+            return int(end_bp) + margin
+        return int(target_bp)
+    midpoint = (int(start_bp) + int(end_bp)) / 2.0
+    return int(end_bp) + margin if int(anchor_bp) <= midpoint else int(start_bp) - margin
+
+
+def _visible_anchor_bp(x0: int, x1: int, start_bp: int, end_bp: int) -> int:
+    if start_bp <= int(x0) <= end_bp:
+        return int(x0)
+    if start_bp <= int(x1) <= end_bp:
+        return int(x1)
+    return int(np.clip(int(x0), start_bp, end_bp))
 
 
 def _same_chrom_arcs(severus_df: pd.DataFrame, sv_chr: pd.DataFrame, chrom: str, start_bp: int, end_bp: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -256,14 +358,22 @@ def _same_chrom_arcs(severus_df: pd.DataFrame, sv_chr: pd.DataFrame, chrom: str,
             seen_pairs.add(pair)
             mate_chrom = str(mate.get("chrom", ""))
             mate_pos = int(_numeric(mate, "pos", pos))
-            if _chrom_equal(mate_chrom, chrom) and start_bp <= mate_pos <= end_bp:
-                arcs.append({"x0": pos, "x1": mate_pos, "type": sv_type, "kind": "mate"})
+            if _chrom_equal(mate_chrom, chrom):
+                x1 = mate_pos if start_bp <= mate_pos <= end_bp else _offscreen_endpoint(pos, mate_pos, start_bp, end_bp)
+                kind = "mate" if start_bp <= mate_pos <= end_bp else "offscreen_mate"
+                label = "" if kind == "mate" else f"to {mate_chrom}"
             else:
-                markers.append({"x": pos, "type": sv_type, "label": f"to {mate_chrom}" if mate_chrom else "BND"})
+                x1 = _offscreen_endpoint(pos, None, start_bp, end_bp)
+                kind = "interchrom_mate"
+                label = f"to {mate_chrom}" if mate_chrom else "BND"
+            arcs.append({"x0": pos, "x1": x1, "type": sv_type, "kind": kind, "label": label, "anchor": pos})
             continue
 
-        if sv_type in {"DEL", "DUP", "INV", "BND"} and end > pos + 1 and start_bp <= end <= end_bp:
-            arcs.append({"x0": pos, "x1": end, "type": sv_type, "kind": "interval"})
+        if sv_type in {"DEL", "DUP", "INV", "BND"} and end > pos + 1:
+            x0 = pos
+            x1 = end if start_bp <= end <= end_bp else _offscreen_endpoint(pos, end, start_bp, end_bp)
+            kind = "interval" if start_bp <= end <= end_bp and start_bp <= pos <= end_bp else "offscreen_interval"
+            arcs.append({"x0": x0, "x1": x1, "type": sv_type, "kind": kind, "label": sv_type if kind != "interval" else "", "anchor": _visible_anchor_bp(x0, x1, start_bp, end_bp)})
         else:
             markers.append({"x": pos, "type": sv_type, "label": sv_type})
     return arcs, markers
@@ -273,13 +383,30 @@ def _plot_sv_panel(ax, severus_df: pd.DataFrame, sv_chr: pd.DataFrame, chrom: st
     region_mb = max((end_bp - start_bp) / 1e6, 1e-4)
     arcs, markers = _same_chrom_arcs(severus_df, sv_chr, chrom, start_bp, end_bp)
 
+    offscreen_arcs: list[dict[str, Any]] = []
     for arc in arcs:
         x0 = float(arc["x0"]) / 1e6
         x1 = float(arc["x1"]) / 1e6
         color = SV_TYPE_COLORS.get(str(arc["type"]), "#6C6C6C")
         xs, ys = _arc_points(x0, x1, region_mb)
-        ax.plot(xs, ys, color=color, linewidth=0.9, alpha=0.62)
-        ax.scatter([x0, x1], [0.035, 0.035], s=8, color=color, alpha=0.75)
+        is_offscreen = str(arc.get("kind", "")).startswith("offscreen") or str(arc.get("kind", "")) == "interchrom_mate"
+        ax.plot(xs, ys, color=color, linewidth=1.05 if is_offscreen else 0.9, alpha=0.72 if is_offscreen else 0.62)
+        ax.scatter([x0, x1], [0.035, 0.035], s=9 if is_offscreen else 8, color=color, alpha=0.78 if is_offscreen else 0.75)
+        if is_offscreen and str(arc.get("label", "")):
+            offscreen_arcs.append(arc)
+
+    if offscreen_arcs and len(offscreen_arcs) <= 18:
+        for arc in offscreen_arcs:
+            anchor_x = float(arc.get("anchor", arc["x0"])) / 1e6
+            ax.annotate(
+                str(arc.get("label", ""))[:14],
+                (anchor_x, 0.075),
+                fontsize=6,
+                rotation=90,
+                ha="center",
+                va="bottom",
+                color=SV_TYPE_COLORS.get(str(arc["type"]), "#6C6C6C"),
+            )
 
     if markers:
         by_type: dict[str, list[dict[str, Any]]] = {}
@@ -318,7 +445,11 @@ def plot_chromosome_prediction(
 ) -> None:
     sample_id = _clean_text(row.get("sample_id", "sample"))
     chrom = _clean_text(row.get("chrom", "chrom"))
-    pred = _clean_text(row.get("predicted_class", "predicted"))
+    arm = _clean_text(row.get("arm", ""))
+    region = _region_label(chrom, arm)
+    pred_classes = _row_predicted_classes(row)
+    pred = ";".join(pred_classes) if pred_classes else _clean_text(row.get("predicted_class", "predicted"))
+    top_pred = pred_classes[0] if pred_classes else pred
     start_bp = int(_numeric(row, "start_bp", 0))
     end_bp = int(_numeric(row, "end_bp", start_bp + 1))
 
@@ -340,13 +471,11 @@ def plot_chromosome_prediction(
         sharex=True,
         gridspec_kw={"height_ratios": [1.55, 2.05, 1.15], "hspace": 0.08},
     )
-    class_color = CLASS_COLORS.get(pred, "#4E79A7")
-    distance = _numeric(row, "nearest_prototype_distance", np.nan)
-    confidence = _numeric(row, "prototype_confidence", np.nan)
+    class_color = CLASS_COLORS.get(top_pred, "#4E79A7")
+    score_text = _format_score_text(row, pred_classes)
     title = (
-        f"{sample_id} {chrom}: predicted {pred}"
-        f" | distance={distance:.4g} confidence={confidence:.3g}"
-        f" | {len(segs)} CN segments, {len(sv_chr)} SV records"
+        f"{sample_id} {region}: predicted {pred}"
+        f"\n{score_text} | {len(segs)} CN segments, {len(sv_chr)} SV records"
     )
     fig.suptitle(title, x=0.5, y=0.985, fontsize=12, color="black")
     fig.patch.set_facecolor("white")
@@ -357,7 +486,7 @@ def plot_chromosome_prediction(
 
     _plot_sv_panel(axes[0], severus_df, sv_chr, chrom, start_bp, end_bp)
     _plot_cn_panel(axes[1], segs, start_bp, end_bp)
-    _plot_breakpoint_panel(axes[2], segs, sv_chr, start_bp, end_bp)
+    _plot_breakpoint_panel(axes[2], segs, severus_df, sv_chr, chrom, start_bp, end_bp)
 
     axes[-1].set_xlim(start_bp / 1e6, end_bp / 1e6)
     axes[-1].set_xlabel(f"{chrom} position (Mb)")
@@ -410,12 +539,15 @@ def run(args: argparse.Namespace) -> None:
                 severus_df = pd.DataFrame()
             data_cache[sample_id] = (wakhan_df, severus_df)
 
-        pred = _clean_text(row["predicted_class"])
+        pred = _prediction_label(row)
         class_dir = output_dir / _safe_name(pred)
         chrom = _clean_text(row["chrom"])
+        arm = _clean_text(row.get("arm", ""))
+        region = _region_label(chrom, arm)
+        objectness_prob = _numeric(row, "objectness_prob", np.nan)
         distance = _numeric(row, "nearest_prototype_distance", np.nan)
-        suffix = f"d{distance:.4g}" if np.isfinite(distance) else "dNA"
-        plot_name = f"{_safe_name(sample_id)}_{_safe_name(chrom)}_{_safe_name(pred)}_{suffix}.png"
+        suffix = f"obj{objectness_prob:.4g}" if np.isfinite(objectness_prob) else (f"d{distance:.4g}" if np.isfinite(distance) else "scoreNA")
+        plot_name = f"{_safe_name(sample_id)}_{_safe_name(region)}_{_safe_name(pred)}_{suffix}.png"
         plot_path = class_dir / plot_name
 
         out_row = row.to_dict()
@@ -428,7 +560,7 @@ def run(args: argparse.Namespace) -> None:
         except Exception as exc:  # pragma: no cover - keeps batch plotting moving
             out_row["plot_status"] = f"error: {exc}"
             out_row["plot_path"] = str(plot_path)
-            log.exception("Failed plotting %s %s", sample_id, chrom)
+            log.exception("Failed plotting %s %s", sample_id, region)
         summary_rows.append(out_row)
 
     summary = pd.DataFrame(summary_rows)

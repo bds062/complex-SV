@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover
 
 from config import CNEncoderConfig, GraphEncoderConfig
 from data.anchor_manifest import canonical_sample_id
-from data.cn_resampler import CN_CHANNELS, region_to_tensor
+from data.cn_resampler import CN_CHANNELS, get_arm_bounds, region_to_tensor
 from data.graph_builder import build_sample_graph
 from data.region_proposal import (
     candidates_to_frame,
@@ -49,6 +49,10 @@ from utils import get_device, l2_normalize, torch_load_checkpoint
 log = logging.getLogger(__name__)
 MAX_REGION_SV_NODES = 500
 DEFAULT_TAU = 0.1
+EMBEDDING_NORMALIZATION_CHOICES = ("none", "sample_residual")
+REPORT_SCOPE_CHOICES = ("all", "anchors")
+CANDIDATE_SOURCE_CHOICES = ("labels", "chromosomes", "chromosome-arms", "proposals", "all")
+SCAN_EVIDENCE_VALUES = {"chromosome_scan", "chromosome_arm_scan"}
 
 
 @dataclass
@@ -155,6 +159,30 @@ def load_graph_encoder(
 
 def _chrom_equal(a: object, b: object) -> bool:
     return str(a).removeprefix("chr") == str(b).removeprefix("chr")
+
+
+def _clean_arm(value: object) -> str:
+    text = str(value).strip().lower()
+    return text if text in {"p", "q"} else ""
+
+
+def _chrom_key(chrom: object) -> str:
+    return str(chrom).removeprefix("chr")
+
+
+def _scan_evidence_mask(evidence: pd.Series) -> np.ndarray:
+    return evidence.astype(str).isin(SCAN_EVIDENCE_VALUES).to_numpy()
+
+
+def _chromosome_arm_bounds(grp: pd.DataFrame) -> list[tuple[str, int, int]]:
+    bounds: list[tuple[str, int, int]] = []
+    for arm_name, start_bp, end_bp in get_arm_bounds(grp):
+        arm_name_text = str(arm_name)
+        arm = _clean_arm(arm_name_text[-1:])
+        if not arm:
+            arm = ""
+        bounds.append((arm, int(start_bp), int(end_bp)))
+    return bounds
 
 
 def _candidate_segments(bundle: SampleBundle, candidate: dict[str, Any]) -> pd.DataFrame:
@@ -425,11 +453,13 @@ def embed_candidate(
         "label_id": candidate.get("label_id", ""),
         "sample_id": bundle.sample_id,
         "chrom": chrom,
+        "arm": candidate.get("arm", ""),
         "start_bp": start_bp,
         "end_bp": end_bp,
         "evidence": candidate.get("evidence", ""),
         "sv_class": candidate.get("sv_class", ""),
         "label_scope": candidate.get("label_scope", ""),
+        "candidate_scope": candidate.get("candidate_scope", candidate.get("label_scope", "")),
         "n_segments": int(len(segs)),
         "n_sv_nodes": int(original_n_sv),
         "encoded_sv_nodes": int(len(sv_indices)),
@@ -443,13 +473,14 @@ def build_candidates(
     labels: pd.DataFrame,
     bundles: dict[str, SampleBundle],
 ) -> list[dict[str, Any]]:
+    source = str(source).strip().replace("_", "-")
     wakhan_by_sample = {sample_id: bundle.wakhan_df for sample_id, bundle in bundles.items()}
     label_candidates = label_rows_to_candidates(labels, wakhan_by_sample) if not labels.empty else []
     if source == "labels":
         return label_candidates
     if source == "chromosomes":
         labeled_keys = {
-            (str(cand["sample_id"]), str(cand["chrom"]).removeprefix("chr"))
+            (str(cand["sample_id"]), _chrom_key(cand["chrom"]))
             for cand in label_candidates
         }
         chromosome_candidates: list[dict[str, Any]] = []
@@ -459,7 +490,7 @@ def build_candidates(
                 continue
             for chrom, grp_raw in df.groupby("chrom", sort=False):
                 chrom_text = str(chrom)
-                key = (bundle.sample_id, chrom_text.removeprefix("chr"))
+                key = (bundle.sample_id, _chrom_key(chrom_text))
                 if key in labeled_keys:
                     continue
                 grp = grp_raw.copy()
@@ -469,6 +500,7 @@ def build_candidates(
                         "label_id": "",
                         "sample_id": bundle.sample_id,
                         "chrom": chrom_text,
+                        "arm": "",
                         "start_bp": int(pd.to_numeric(grp["start"], errors="coerce").min()),
                         "end_bp": int(pd.to_numeric(grp["end"], errors="coerce").max()),
                         "evidence": "chromosome_scan",
@@ -476,9 +508,64 @@ def build_candidates(
                         "df_segments": grp,
                         "sv_class": "",
                         "label_scope": "chromosome",
+                        "candidate_scope": "chromosome",
                     }
                 )
         return label_candidates + chromosome_candidates
+
+    if source == "chromosome-arms":
+        labeled_whole_keys: set[tuple[str, str]] = set()
+        labeled_arm_keys: set[tuple[str, str, str]] = set()
+        for cand in label_candidates:
+            sample_id = str(cand["sample_id"])
+            chrom_key = _chrom_key(cand["chrom"])
+            arm = _clean_arm(cand.get("arm", ""))
+            if arm:
+                labeled_arm_keys.add((sample_id, chrom_key, arm))
+            else:
+                labeled_whole_keys.add((sample_id, chrom_key))
+
+        arm_candidates: list[dict[str, Any]] = []
+        for bundle in bundles.values():
+            df = bundle.wakhan_df
+            if df.empty:
+                continue
+            for chrom, grp_raw in df.groupby("chrom", sort=False):
+                chrom_text = str(chrom)
+                chrom_key = (bundle.sample_id, _chrom_key(chrom_text))
+                if chrom_key in labeled_whole_keys:
+                    continue
+                grp = grp_raw.copy()
+                for arm, start_bp, end_bp in _chromosome_arm_bounds(grp):
+                    if arm and (bundle.sample_id, _chrom_key(chrom_text), arm) in labeled_arm_keys:
+                        continue
+                    segs = grp[
+                        (pd.to_numeric(grp["end"], errors="coerce") > start_bp)
+                        & (pd.to_numeric(grp["start"], errors="coerce") < end_bp)
+                    ].copy()
+                    if segs.empty:
+                        continue
+                    suffix = f"_{arm}" if arm else ""
+                    scope = "chromosome_arm" if arm else "chromosome"
+                    evidence = "chromosome_arm_scan" if arm else "chromosome_scan"
+                    arm_candidates.append(
+                        {
+                            "candidate_id": f"{bundle.sample_id}_{chrom_text}{suffix}",
+                            "label_id": "",
+                            "sample_id": bundle.sample_id,
+                            "chrom": chrom_text,
+                            "arm": arm,
+                            "start_bp": int(start_bp),
+                            "end_bp": int(end_bp),
+                            "evidence": evidence,
+                            "sv_node_indices": [],
+                            "df_segments": segs,
+                            "sv_class": "",
+                            "label_scope": scope,
+                            "candidate_scope": scope,
+                        }
+                    )
+        return label_candidates + arm_candidates
 
     proposal_candidates: list[dict[str, Any]] = []
     bundle_items = list(bundles.values())
@@ -506,7 +593,47 @@ def build_candidates(
         return proposal_candidates
     if source == "all":
         return label_candidates + proposal_candidates
-    raise ValueError("candidate_source must be one of labels, chromosomes, proposals, all")
+    raise ValueError(f"candidate_source must be one of {', '.join(CANDIDATE_SOURCE_CHOICES)}")
+
+
+def validate_candidate_resolution(candidates: list[dict[str, Any]], source: str) -> None:
+    """Fail fast if arm-mode candidates fell back to whole-chromosome rows."""
+    source = str(source or "").strip().replace("_", "-")
+    if source != "chromosome-arms":
+        return
+
+    bad_rows: list[str] = []
+    for cand in candidates:
+        arm = _clean_arm(cand.get("arm", ""))
+        evidence = str(cand.get("evidence", ""))
+        sv_class = str(cand.get("sv_class", ""))
+        scope = str(cand.get("candidate_scope", cand.get("label_scope", "")))
+        label_scope = str(cand.get("label_scope", ""))
+        is_labeled = bool(sv_class) or evidence == "label_anchor"
+        is_scan = evidence in SCAN_EVIDENCE_VALUES and not sv_class
+
+        if is_labeled and (scope == "chromosome_arm" or label_scope == "chromosome_arm") and arm not in {"p", "q"}:
+            bad_rows.append(str(cand.get("candidate_id", cand.get("label_id", "label_anchor"))))
+        if is_scan and (evidence != "chromosome_arm_scan" or scope != "chromosome_arm" or arm not in {"p", "q"}):
+            bad_rows.append(str(cand.get("candidate_id", "scan_candidate")))
+
+    if bad_rows:
+        preview = ", ".join(bad_rows[:8])
+        more = "" if len(bad_rows) <= 8 else f" (+{len(bad_rows) - 8} more)"
+        raise ValueError(
+            "candidate_source=chromosome-arms produced non-arm candidate rows. "
+            f"Examples: {preview}{more}. Check label arm values and Wakhan chromosome spans."
+        )
+
+
+def _metadata_npz_arrays(metadata: pd.DataFrame) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {}
+    for col in metadata.columns:
+        if metadata[col].dtype == object:
+            arrays[col] = metadata[col].astype(str).to_numpy()
+        else:
+            arrays[col] = metadata[col].to_numpy()
+    return arrays
 
 
 def write_embedding_outputs(
@@ -519,14 +646,121 @@ def write_embedding_outputs(
     tsv_path = out_dir / "candidate_embeddings.tsv"
     npz_path = out_dir / "embeddings.npz"
     metadata.to_csv(tsv_path, sep="\t", index=False)
-    arrays = {}
-    for col in metadata.columns:
-        if metadata[col].dtype == object:
-            arrays[col] = metadata[col].astype(str).to_numpy()
-        else:
-            arrays[col] = metadata[col].to_numpy()
-    np.savez(npz_path, embeddings=embeddings, **arrays)
+    np.savez(npz_path, embeddings=embeddings, **_metadata_npz_arrays(metadata))
     return tsv_path, npz_path
+
+
+def write_raw_embedding_outputs(
+    embeddings: np.ndarray,
+    metadata: pd.DataFrame,
+    output_dir: str | Path,
+) -> Path:
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = out_dir / "embeddings_raw.npz"
+    np.savez(npz_path, embeddings=embeddings, **_metadata_npz_arrays(metadata))
+    return npz_path
+
+
+def _l2_normalize_array(values: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    return arr / np.clip(norms, eps, None)
+
+
+def sample_residualize_embeddings(
+    embeddings: np.ndarray,
+    metadata: pd.DataFrame,
+    min_background: int = 3,
+) -> tuple[np.ndarray, pd.DataFrame, np.ndarray]:
+    if metadata.empty:
+        return np.asarray(embeddings, dtype=np.float32), pd.DataFrame(), np.zeros((0, embeddings.shape[1]), dtype=np.float32)
+    required = {"sample_id"}
+    missing = sorted(required.difference(metadata.columns))
+    if missing:
+        raise ValueError(f"Cannot sample-normalize embeddings; metadata missing columns: {missing}")
+
+    raw = np.asarray(embeddings, dtype=np.float32)
+    residual = raw.copy()
+    labels = metadata["sv_class"].astype(str) if "sv_class" in metadata else pd.Series([""] * len(metadata))
+    evidence = metadata["evidence"].astype(str) if "evidence" in metadata else pd.Series([""] * len(metadata))
+    scan_mask = _scan_evidence_mask(evidence)
+    samples = metadata["sample_id"].astype(str)
+    rows: list[dict[str, Any]] = []
+    baselines: list[np.ndarray] = []
+
+    for sample_id in sorted(samples.unique()):
+        sample_mask = (samples == sample_id).to_numpy()
+        background_mask = (
+            sample_mask
+            & scan_mask
+            & (labels.to_numpy() == "")
+        )
+        source = "unlabeled_scan"
+        if int(background_mask.sum()) < int(min_background):
+            background_mask = sample_mask & scan_mask
+            source = "all_scan"
+        if int(background_mask.sum()) < int(min_background):
+            background_mask = sample_mask
+            source = "all_sample_candidates"
+
+        baseline = np.median(raw[background_mask], axis=0).astype(np.float32)
+        sample_residual = raw[sample_mask] - baseline
+        zero = np.linalg.norm(sample_residual, axis=1) < 1e-12
+        if np.any(zero):
+            sample_residual[zero] = raw[sample_mask][zero]
+        residual[sample_mask] = sample_residual
+        baselines.append(baseline)
+        rows.append(
+            {
+                "sample_id": sample_id,
+                "baseline_source": source,
+                "n_baseline_candidates": int(background_mask.sum()),
+                "n_sample_candidates": int(sample_mask.sum()),
+                "baseline_norm": float(np.linalg.norm(baseline)),
+            }
+        )
+
+    residual = _l2_normalize_array(residual)
+    baseline_df = pd.DataFrame(rows)
+    baseline_array = np.stack(baselines, axis=0).astype(np.float32) if baselines else np.zeros((0, raw.shape[1]), dtype=np.float32)
+    return residual, baseline_df, baseline_array
+
+
+def apply_embedding_normalization(
+    embeddings: np.ndarray,
+    metadata: pd.DataFrame,
+    mode: str,
+    output_dir: str | Path,
+    min_background: int = 3,
+) -> np.ndarray:
+    mode = str(mode or "none")
+    if mode not in EMBEDDING_NORMALIZATION_CHOICES:
+        choices = ", ".join(EMBEDDING_NORMALIZATION_CHOICES)
+        raise ValueError(f"embedding_normalization must be one of: {choices}")
+    if mode == "none":
+        return np.asarray(embeddings, dtype=np.float32)
+
+    if mode == "sample_residual":
+        residual, baseline_df, baseline_array = sample_residualize_embeddings(
+            embeddings,
+            metadata,
+            min_background=min_background,
+        )
+        out_dir = Path(output_dir)
+        baseline_df.to_csv(out_dir / "sample_embedding_baselines.tsv", sep="\t", index=False)
+        np.savez(
+            out_dir / "sample_embedding_baselines.npz",
+            sample_ids=baseline_df["sample_id"].astype(str).to_numpy(),
+            baselines=baseline_array,
+        )
+        log.info(
+            "Applied sample_residual embedding normalization using per-sample baselines: %s",
+            out_dir / "sample_embedding_baselines.tsv",
+        )
+        return residual
+
+    raise AssertionError(f"Unhandled embedding normalization mode: {mode}")
 
 
 def build_prototypes(
@@ -587,6 +821,26 @@ def write_distance_table(
     df.to_csv(output_path, sep="\t", index=False)
     return df
 
+
+
+
+def filter_report_scope(
+    embeddings: np.ndarray,
+    metadata: pd.DataFrame,
+    distances: pd.DataFrame,
+    scope: str,
+) -> tuple[np.ndarray, pd.DataFrame, pd.DataFrame]:
+    """Filter report-only outputs without changing prototype construction."""
+    scope = str(scope or "all")
+    if scope not in REPORT_SCOPE_CHOICES:
+        choices = ", ".join(REPORT_SCOPE_CHOICES)
+        raise ValueError(f"report_scope must be one of: {choices}")
+    if scope == "all":
+        return embeddings, metadata.reset_index(drop=True), distances.reset_index(drop=True)
+    if "sv_class" not in metadata:
+        return embeddings[:0], metadata.iloc[:0].copy(), distances.iloc[:0].copy()
+    mask = metadata["sv_class"].astype(str).str.strip().to_numpy() != ""
+    return embeddings[mask], metadata.loc[mask].reset_index(drop=True), distances.loc[mask].reset_index(drop=True)
 
 def write_leave_one_out(
     embeddings: np.ndarray,
@@ -686,6 +940,24 @@ def _display_class(value: object) -> str:
     return _class_key(value).replace("_", " ")
 
 
+def _split_class_set(value: object) -> list[str]:
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "null", "none"}:
+        return []
+    return [part.strip() for part in text.replace(",", ";").split(";") if part.strip()]
+
+
+def _row_predicted_classes(row: pd.Series) -> list[str]:
+    if "predicted_classes" in row and str(row.get("predicted_classes", "")).strip():
+        return _split_class_set(row.get("predicted_classes", ""))
+    return _split_class_set(row.get("predicted_class", ""))
+
+
+def _prediction_label(row: pd.Series) -> str:
+    classes = _row_predicted_classes(row)
+    return ";".join(classes) if classes else "none"
+
+
 def _label_colors(values: pd.Series) -> tuple[list[str], dict[str, object]]:
     labels = [_class_key(value) for value in values.tolist()]
     unique = list(dict.fromkeys(labels))
@@ -710,8 +982,8 @@ def _candidate_label(row: pd.Series, include_class: bool = False, include_predic
         if cls:
             details.append(f"gt={_display_class(cls)}")
     if include_prediction:
-        pred = str(row.get("predicted_class", ""))
-        if pred:
+        pred = _prediction_label(row)
+        if pred != "none":
             details.append(f"pred={_display_class(pred)}")
     if details:
         value = f"{value} [{'; '.join(details)}]"
@@ -816,9 +1088,11 @@ def _plot_prototype_distances(
         plot_df["sv_class"] = ""
     if "predicted_class" not in plot_df:
         plot_df["predicted_class"] = ""
+    if "predicted_classes" not in plot_df:
+        plot_df["predicted_classes"] = plot_df["predicted_class"].astype(str)
     plot_df["_is_unlabeled"] = plot_df["sv_class"].astype(str) == ""
     plot_df["_true_sort"] = plot_df["sv_class"].astype(str).replace("", "unlabeled")
-    plot_df["_pred_sort"] = plot_df["predicted_class"].astype(str).replace("", "none")
+    plot_df["_pred_sort"] = plot_df.apply(_prediction_label, axis=1)
     plot_df = plot_df.sort_values(["_is_unlabeled", "_true_sort", "_pred_sort", "_min_distance", "_plot_label"]).reset_index(drop=True)
 
     if len(distance_cols) == 1:
@@ -851,10 +1125,11 @@ def _plot_prototype_distances(
     pred_to_col = {col.removeprefix("d_"): i for i, col in enumerate(distance_cols)}
     star_x: list[int] = []
     star_y: list[int] = []
-    for row_i, pred in enumerate(plot_df["predicted_class"].astype(str)):
-        if pred in pred_to_col:
-            star_x.append(pred_to_col[pred])
-            star_y.append(row_i)
+    for row_i, row in plot_df.iterrows():
+        for pred in _row_predicted_classes(row):
+            if pred in pred_to_col:
+                star_x.append(pred_to_col[pred])
+                star_y.append(int(row_i))
     if star_x:
         ax.scatter(star_x, star_y, marker="*", s=45, color="white", edgecolors="black", linewidths=0.4)
     ax.set_xticks(np.arange(len(distance_cols)))
@@ -866,7 +1141,7 @@ def _plot_prototype_distances(
     ax.set_yticklabels(y_labels, fontsize=_dense_tick_fontsize(len(plot_df)))
     _draw_gt_class_boundaries(ax, plot_df)
     ax.set_xlabel("Prototype class")
-    ax.set_title(f"Prototype Distances by Class (tau={tau:g}; star = predicted class; no star = none)")
+    ax.set_title(f"Prototype Distances by Class (tau={tau:g}; stars = predicted classes; no star = none)")
     fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02, label="Cosine distance")
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
@@ -1007,8 +1282,10 @@ def _positive_negative_tau_frame(
             neg = distances[distances["sv_class"].astype(str) == ""].copy()
         else:
             neg = distances.copy()
-        if "evidence" in neg and (neg["evidence"].astype(str) == "chromosome_scan").any():
-            neg = neg[neg["evidence"].astype(str) == "chromosome_scan"]
+        if "evidence" in neg:
+            scan = neg["evidence"].astype(str).isin(SCAN_EVIDENCE_VALUES)
+            if scan.any():
+                neg = neg[scan]
         for _, row in neg.iterrows():
             dist = pd.to_numeric(pd.Series([row.get("nearest_prototype_distance")]), errors="coerce").iloc[0]
             if np.isfinite(dist):
@@ -1016,7 +1293,7 @@ def _positive_negative_tau_frame(
                     {
                         "candidate_id": row.get("candidate_id", ""),
                         "label": 0,
-                        "set": "unlabeled_chromosome",
+                        "set": "unlabeled_scan_candidate",
                         "distance": float(dist),
                     }
                 )
@@ -1127,7 +1404,7 @@ def _plot_tau_precision_recall(
         label=f"current tau={tau:g}",
     )
     axes[0].set_xlabel("Recall on GT labels")
-    axes[0].set_ylabel("Precision vs unlabeled chromosomes")
+    axes[0].set_ylabel("Precision vs unlabeled scan candidates")
     axes[0].set_xlim(-0.03, 1.03)
     axes[0].set_ylim(-0.03, 1.03)
     axes[0].set_title("Tau Precision-Recall")
@@ -1145,7 +1422,7 @@ def _plot_tau_precision_recall(
     axes[1].set_ylim(-0.03, 1.03)
     axes[1].set_title(
         f"Best F1={best['f1']:.2f} "
-        f"(P={best['precision']:.2f}, R={best['recall']:.2f}; {n_pos} GT, {n_neg} other chromosomes)"
+        f"(P={best['precision']:.2f}, R={best['recall']:.2f}; {n_pos} GT, {n_neg} other scan candidates)"
     )
     axes[1].grid(alpha=0.2)
     axes[1].legend(fontsize=8, loc="best")
@@ -1178,10 +1455,11 @@ def write_visualizations(
         method,
     )
     if "predicted_class" in distances:
+        predicted_color_source = distances["predicted_classes"] if "predicted_classes" in distances else distances["predicted_class"]
         _plot_embedding_projection(
             xy,
             metadata,
-            distances["predicted_class"],
+            predicted_color_source,
             "Candidate Embedding Projection - Predicted Classes",
             out_dir / "embedding_projection_predicted.png",
             method,
@@ -1231,6 +1509,7 @@ def run(args: argparse.Namespace) -> None:
     encode_graph_bundles(bundles, graph_model, device)
 
     candidates = build_candidates(args.candidate_source, labels, bundles)
+    validate_candidate_resolution(candidates, args.candidate_source)
     log.info("Embedding %d candidate(s) from source=%s", len(candidates), args.candidate_source)
     if not candidates:
         raise RuntimeError("No candidates were available to embed")
@@ -1253,18 +1532,46 @@ def run(args: argparse.Namespace) -> None:
 
     if not embeddings:
         raise RuntimeError("No candidate embeddings were produced")
-    emb_array = np.stack(embeddings, axis=0).astype(np.float32)
+    raw_emb_array = np.stack(embeddings, axis=0).astype(np.float32)
     meta_df = pd.DataFrame(meta_rows)
+    normalization_mode = getattr(args, "embedding_normalization", "none")
+    meta_df["embedding_normalization"] = normalization_mode
+    log.info("Writing raw embedding table and applying embedding_normalization=%s", normalization_mode)
+    write_raw_embedding_outputs(raw_emb_array, meta_df, output_dir)
+    emb_array = apply_embedding_normalization(
+        raw_emb_array,
+        meta_df,
+        mode=normalization_mode,
+        output_dir=output_dir,
+        min_background=int(getattr(args, "sample_baseline_min_candidates", 3)),
+    )
     log.info("Writing embedding tables and prototype outputs")
     write_embedding_outputs(emb_array, meta_df, output_dir)
 
     proto_path = output_dir / args.prototypes_name
     cache = build_prototypes(emb_array, meta_df, tau=args.tau, output_path=proto_path)
-    distances = write_distance_table(cache, emb_array, meta_df, output_dir / "prototype_distances.tsv")
+    tmp_distances_path = output_dir / ".prototype_distances_all.tmp.tsv"
+    distances_all = write_distance_table(cache, emb_array, meta_df, tmp_distances_path)
+    report_emb, report_meta, report_distances = filter_report_scope(
+        emb_array,
+        meta_df,
+        distances_all,
+        scope=getattr(args, "report_scope", "all"),
+    )
+    report_distances.to_csv(output_dir / "prototype_distances.tsv", sep="\t", index=False)
+    try:
+        tmp_distances_path.unlink()
+    except FileNotFoundError:
+        pass
     leave_one_out = write_leave_one_out(emb_array, meta_df, tau=args.tau, output_path=output_dir / "anchor_leave_one_out.tsv")
-    log.info("Writing visualization PNGs")
-    write_visualizations(emb_array, meta_df, distances, leave_one_out, output_dir, tau=args.tau)
-    log.info("Wrote %d embedding(s), %d prototype class(es)", len(meta_df), cache.n_classes())
+    log.info(
+        "Writing visualization PNGs with report_scope=%s (%d/%d rows)",
+        getattr(args, "report_scope", "all"),
+        len(report_meta),
+        len(meta_df),
+    )
+    write_visualizations(report_emb, report_meta, report_distances, leave_one_out, output_dir, tau=args.tau)
+    log.info("Wrote %d embedding(s), %d report row(s), %d prototype class(es)", len(meta_df), len(report_meta), cache.n_classes())
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1276,17 +1583,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output_dir", required=True, help="Output directory")
     parser.add_argument(
         "--candidate_source",
-        choices=["labels", "chromosomes", "proposals", "all"],
+        choices=CANDIDATE_SOURCE_CHOICES,
         default="labels",
         help=(
             "Region source: labels uses only labeled intervals; chromosomes uses labeled "
             "intervals plus one unlabeled whole-chromosome candidate for each unlabeled "
-            "manifest sample/chromosome; proposals uses heuristic CN/SV windows; all uses "
-            "labels plus heuristic proposals."
+            "manifest sample/chromosome; chromosome-arms uses labeled intervals plus "
+            "unlabeled p/q arm candidates; proposals uses heuristic CN/SV windows; all "
+            "uses labels plus heuristic proposals."
         ),
     )
     parser.add_argument("--prototypes_name", default="prototypes.pt")
     parser.add_argument("--tau", type=float, default=DEFAULT_TAU)
+    parser.add_argument(
+        "--embedding_normalization",
+        choices=EMBEDDING_NORMALIZATION_CHOICES,
+        default="none",
+        help="Optional post-encoder normalization before prototype building/scoring.",
+    )
+    parser.add_argument(
+        "--report_scope",
+        choices=REPORT_SCOPE_CHOICES,
+        default="all",
+        help=(
+            "Rows to include in report tables/plots. Use anchors when candidate_source=chromosomes "
+            "is only needed for sample-residual baselines but anchor-stage reports should stay label-only."
+        ),
+    )
+    parser.add_argument(
+        "--sample_baseline_min_candidates",
+        type=int,
+        default=3,
+        help="Minimum same-sample background candidates for sample_residual baselines before falling back.",
+    )
     parser.add_argument("--strict", action="store_true", help="Use strict checkpoint loading")
     return parser.parse_args(argv)
 

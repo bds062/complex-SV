@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
     from ..config import RegionProposalConfig  # type: ignore
     from ..utils import reciprocal_overlap  # type: ignore
 
+from .cn_resampler import get_arm_bounds
 from .graph_builder import EDGE_MATE, EDGE_PHASE, EDGE_PROXIMITY
 
 
@@ -35,6 +36,41 @@ def _chrom_equal(a: object, b: object) -> bool:
     aa = str(a).removeprefix("chr")
     bb = str(b).removeprefix("chr")
     return aa == bb
+
+
+def _clean_arm(value: object) -> str:
+    text = str(value).strip().lower()
+    return text if text in {"p", "q"} else ""
+
+
+def _arm_interval(
+    df_wakhan_sample: pd.DataFrame,
+    chrom: str,
+    arm: str,
+    start_bp: int,
+    end_bp: int,
+    label_id: str,
+) -> tuple[int, int]:
+    if not arm or df_wakhan_sample.empty:
+        return int(start_bp), int(end_bp)
+
+    chrom_segs = df_wakhan_sample[
+        df_wakhan_sample["chrom"].astype(str).map(lambda value: _chrom_equal(value, chrom))
+    ].copy()
+    for arm_name, arm_start, arm_end in get_arm_bounds(chrom_segs):
+        arm_name_text = str(arm_name)
+        if not arm_name_text.endswith(arm):
+            continue
+        resolved_start = max(int(start_bp), int(arm_start))
+        resolved_end = min(int(end_bp), int(arm_end))
+        if resolved_end <= resolved_start:
+            raise ValueError(
+                f"Label {label_id!r} has arm={arm!r} but interval "
+                f"{start_bp}-{end_bp} does not overlap {arm_name_text}:{arm_start}-{arm_end}"
+            )
+        return resolved_start, resolved_end
+
+    raise ValueError(f"Label {label_id!r} has arm={arm!r}, but no {chrom}{arm} bounds were available")
 
 
 def _cn_state_count(values: pd.Series, tolerance: float) -> int:
@@ -300,7 +336,11 @@ def label_rows_to_candidates(labels: pd.DataFrame, wakhan_by_sample: dict[str, p
         chrom = str(row["chrom"])
         start_bp = int(row["start_bp"])
         end_bp = int(row["end_bp"])
+        arm = _clean_arm(row.get("arm", ""))
+        label_id = str(row.get("label_id", ""))
         df_w = wakhan_by_sample.get(sample_id, pd.DataFrame())
+        if arm:
+            start_bp, end_bp = _arm_interval(df_w, chrom, arm, start_bp, end_bp, label_id)
         if not df_w.empty:
             mask = (
                 df_w["chrom"].astype(str).map(lambda c: _chrom_equal(c, chrom))
@@ -312,10 +352,11 @@ def label_rows_to_candidates(labels: pd.DataFrame, wakhan_by_sample: dict[str, p
             segs = pd.DataFrame()
         candidates.append(
             {
-                "candidate_id": str(row.get("label_id", "")),
-                "label_id": str(row.get("label_id", "")),
+                "candidate_id": label_id,
+                "label_id": label_id,
                 "sample_id": sample_id,
                 "chrom": chrom,
+                "arm": arm,
                 "start_bp": start_bp,
                 "end_bp": end_bp,
                 "evidence": "label_anchor",
@@ -323,6 +364,7 @@ def label_rows_to_candidates(labels: pd.DataFrame, wakhan_by_sample: dict[str, p
                 "df_segments": segs,
                 "sv_class": str(row.get("sv_class", "")),
                 "label_scope": str(row.get("label_scope", "")),
+                "candidate_scope": "chromosome_arm" if arm else str(row.get("label_scope", "")),
             }
         )
     return candidates
@@ -381,6 +423,7 @@ def candidates_to_frame(candidates: list[dict[str, Any]]) -> pd.DataFrame:
                 "label_id": cand.get("label_id", ""),
                 "sample_id": cand["sample_id"],
                 "chrom": cand["chrom"],
+                "arm": cand.get("arm", ""),
                 "start_bp": int(cand["start_bp"]),
                 "end_bp": int(cand["end_bp"]),
                 "evidence": cand.get("evidence", ""),
@@ -388,6 +431,7 @@ def candidates_to_frame(candidates: list[dict[str, Any]]) -> pd.DataFrame:
                 "n_segments": len(cand.get("df_segments", [])),
                 "sv_class": cand.get("sv_class", ""),
                 "label_scope": cand.get("label_scope", ""),
+                "candidate_scope": cand.get("candidate_scope", cand.get("label_scope", "")),
             }
         )
     return pd.DataFrame(rows)
