@@ -1,0 +1,774 @@
+"""Train a few-shot prototypical classifier on frozen complex-SV embeddings."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+from discovery import embed_corpus
+from model.heads import MetricProjection
+from training.train_classifier_head import DEFAULT_CLASS_NAMES, enforce_candidate_resolution, load_embedding_table
+from utils import set_seed
+
+log = logging.getLogger(__name__)
+
+SCAN_EVIDENCE_VALUES = {"chromosome_scan", "chromosome_arm_scan"}
+
+
+def _label_masks(metadata: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    labels = metadata["sv_class"].astype(str) if "sv_class" in metadata else pd.Series([""] * len(metadata))
+    evidence = metadata["evidence"].astype(str) if "evidence" in metadata else pd.Series([""] * len(metadata))
+    labeled = labels.to_numpy() != ""
+    background = (labels.to_numpy() == "") & evidence.isin(SCAN_EVIDENCE_VALUES).to_numpy()
+    return labeled, background
+
+
+def _parse_class_names(raw: str | None, metadata: pd.DataFrame, labeled_mask: np.ndarray) -> list[str]:
+    observed = sorted(pd.unique(metadata.loc[labeled_mask, "sv_class"].astype(str)).tolist()) if labeled_mask.any() else []
+    names = [part.strip() for part in str(raw or "").split(",") if part.strip()] or list(DEFAULT_CLASS_NAMES)
+    unknown = sorted(set(observed).difference(names))
+    if unknown:
+        raise ValueError(f"Observed labels not present in --class_names: {unknown}; class_names={names}")
+    return names
+
+
+def _sample_ids(metadata: pd.DataFrame) -> np.ndarray:
+    if "sample_id" in metadata:
+        return metadata["sample_id"].astype(str).to_numpy()
+    return np.asarray(["sample"] * len(metadata), dtype=object)
+
+
+def _type_targets(metadata: pd.DataFrame, class_names: list[str]) -> np.ndarray:
+    class_to_idx = {name: i for i, name in enumerate(class_names)}
+    labels = metadata["sv_class"].astype(str).to_numpy() if "sv_class" in metadata else np.asarray([""] * len(metadata), dtype=object)
+    targets = np.full(len(metadata), -1, dtype=np.int64)
+    for i, label in enumerate(labels):
+        if label:
+            targets[i] = class_to_idx[label]
+    return targets
+
+
+def _class_counts(metadata: pd.DataFrame, labeled_mask: np.ndarray, class_names: list[str]) -> dict[str, int]:
+    labels = metadata.loc[labeled_mask, "sv_class"].astype(str) if "sv_class" in metadata else pd.Series(dtype=str)
+    counts = labels.value_counts().to_dict()
+    return {name: int(counts.get(name, 0)) for name in class_names}
+
+
+def _parameter_count(model: torch.nn.Module) -> int:
+    return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+
+def make_model(input_dim: int, projection_dim: int, hidden_dim: int, dropout: float, device: torch.device) -> MetricProjection:
+    return MetricProjection(
+        in_dim=int(input_dim),
+        embed_dim=int(projection_dim),
+        hidden_dim=int(hidden_dim),
+        dropout=float(dropout),
+    ).to(device)
+
+
+def _class_weights(targets: np.ndarray, n_classes: int, mode: str) -> torch.Tensor | None:
+    if mode == "none":
+        return None
+    counts = np.bincount(targets[targets >= 0], minlength=int(n_classes)).astype(np.float32)
+    present = counts > 0
+    weights = np.ones(int(n_classes), dtype=np.float32)
+    if mode == "inverse":
+        weights[present] = float(counts[present].sum()) / np.maximum(counts[present], 1.0)
+    elif mode == "inverse_sqrt":
+        weights[present] = np.sqrt(float(counts[present].sum()) / np.maximum(counts[present], 1.0))
+    else:
+        raise ValueError(f"Unknown class weighting mode: {mode}")
+    if present.any():
+        weights[present] = weights[present] / np.mean(weights[present])
+    return torch.as_tensor(weights, dtype=torch.float32)
+
+
+def _loo_prototype_logits(
+    projected: torch.Tensor,
+    targets: torch.Tensor,
+    n_classes: int,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dim = int(projected.shape[1])
+    sums = torch.zeros((int(n_classes), dim), dtype=projected.dtype, device=projected.device)
+    sums.index_add_(0, targets, projected)
+    counts = torch.bincount(targets, minlength=int(n_classes)).to(projected.device)
+    logits = torch.full((projected.shape[0], int(n_classes)), -1.0e9, dtype=projected.dtype, device=projected.device)
+    usable = torch.zeros(projected.shape[0], dtype=torch.bool, device=projected.device)
+
+    for i in range(projected.shape[0]):
+        query_class = int(targets[i].detach().cpu().item())
+        for class_idx in range(int(n_classes)):
+            count = int(counts[class_idx].detach().cpu().item())
+            if count <= 0:
+                continue
+            if class_idx == query_class:
+                if count <= 1:
+                    continue
+                proto = (sums[class_idx] - projected[i]) / float(count - 1)
+            else:
+                proto = sums[class_idx] / float(count)
+            logits[i, class_idx] = -torch.sum((projected[i] - proto) ** 2) / float(temperature)
+        usable[i] = logits[i, query_class] > -1.0e8
+    return logits, usable
+
+
+def train_projection(
+    embeddings: np.ndarray,
+    metadata: pd.DataFrame,
+    class_names: list[str],
+    train_mask: np.ndarray,
+    args: argparse.Namespace,
+    device: torch.device,
+    epochs: int,
+    patience: int,
+    seed_offset: int = 0,
+    log_prefix: str = "train",
+) -> tuple[MetricProjection, pd.DataFrame]:
+    set_seed(int(args.seed) + int(seed_offset))
+    labeled_mask, _ = _label_masks(metadata)
+    targets_all = _type_targets(metadata, class_names)
+    train_idx = np.where(train_mask & labeled_mask)[0]
+    if train_idx.size == 0:
+        raise RuntimeError(f"No labeled rows available for {log_prefix}")
+    train_targets_np = targets_all[train_idx]
+    counts = np.bincount(train_targets_np[train_targets_np >= 0], minlength=len(class_names))
+    if int((counts >= 2).sum()) < 2:
+        raise RuntimeError(f"Need at least two classes with two labels each for {log_prefix}; counts={counts.tolist()}")
+
+    model = make_model(embeddings.shape[1], int(args.projection_dim), int(args.hidden_dim), float(args.dropout), device)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    x_train = torch.as_tensor(embeddings[train_idx], dtype=torch.float32, device=device)
+    y_train = torch.as_tensor(train_targets_np, dtype=torch.long, device=device)
+    class_weight_t = _class_weights(train_targets_np, len(class_names), str(args.class_weighting))
+    if class_weight_t is not None:
+        class_weight_t = class_weight_t.to(device)
+
+    best_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    patience_left = int(patience)
+    rows: list[dict[str, Any]] = []
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        opt.zero_grad(set_to_none=True)
+        projected = model(x_train)
+        logits, usable = _loo_prototype_logits(projected, y_train, len(class_names), float(args.temperature))
+        if not bool(usable.any()):
+            raise RuntimeError(f"No usable leave-one-out prototype queries for {log_prefix}")
+        loss = F.cross_entropy(
+            logits[usable],
+            y_train[usable],
+            weight=class_weight_t,
+            label_smoothing=float(args.label_smoothing),
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+        opt.step()
+
+        with torch.no_grad():
+            pred = torch.argmax(logits[usable], dim=1)
+            acc = float((pred == y_train[usable]).float().mean().item())
+        loss_value = float(loss.detach().cpu().item())
+        improved = loss_value < best_loss - 1e-6
+        if improved:
+            best_loss = loss_value
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            patience_left = int(patience)
+        else:
+            patience_left -= 1
+
+        rows.append(
+            {
+                "epoch": int(epoch),
+                "loss": loss_value,
+                "loo_type_acc": acc,
+                "n_train_labeled": int(train_idx.size),
+                "n_usable_queries": int(usable.detach().cpu().numpy().sum()),
+                "is_best": bool(improved),
+                "split": log_prefix,
+            }
+        )
+        if log_prefix == "final" and (epoch == 1 or epoch % int(args.log_every) == 0 or epoch == int(epochs)):
+            log.info("epoch=%d loss=%.4f loo_acc=%.3f usable=%d", epoch, loss_value, acc, int(usable.sum().item()))
+        if int(patience) > 0 and patience_left <= 0:
+            if log_prefix == "final":
+                log.info("Early stopping final few-shot projection at epoch %d; best loss %.4f", epoch, best_loss)
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, pd.DataFrame(rows)
+
+
+def project_embeddings(
+    model: MetricProjection,
+    embeddings: np.ndarray,
+    device: torch.device,
+    batch_size: int = 512,
+) -> np.ndarray:
+    model.eval()
+    rows: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, embeddings.shape[0], int(batch_size)):
+            batch = torch.as_tensor(embeddings[start : start + int(batch_size)], dtype=torch.float32, device=device)
+            rows.append(model(batch).detach().cpu().numpy().astype(np.float32))
+    return np.concatenate(rows, axis=0)
+
+
+def compute_prototypes(projected: np.ndarray, targets: np.ndarray, n_classes: int) -> tuple[np.ndarray, np.ndarray]:
+    dim = int(projected.shape[1])
+    prototypes = np.zeros((int(n_classes), dim), dtype=np.float32)
+    counts = np.bincount(targets[targets >= 0], minlength=int(n_classes)).astype(np.int64)
+    for class_idx in range(int(n_classes)):
+        mask = targets == class_idx
+        if bool(mask.any()):
+            proto = projected[mask].mean(axis=0)
+            norm = float(np.linalg.norm(proto))
+            prototypes[class_idx] = proto / norm if norm > 0 else proto
+    return prototypes, counts
+
+
+def _softmax_logits(logits: np.ndarray) -> np.ndarray:
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    exp = np.exp(shifted)
+    exp[~np.isfinite(exp)] = 0.0
+    denom = exp.sum(axis=1, keepdims=True)
+    denom[denom <= 0] = 1.0
+    return exp / denom
+
+
+def predict_with_prototypes(
+    model: MetricProjection,
+    embeddings: np.ndarray,
+    metadata: pd.DataFrame,
+    class_names: list[str],
+    prototypes: np.ndarray,
+    prototype_counts: np.ndarray,
+    distance_tau: float,
+    objectness_scale: float,
+    temperature: float,
+    device: torch.device,
+    batch_size: int = 512,
+) -> pd.DataFrame:
+    projected = project_embeddings(model, embeddings, device=device, batch_size=batch_size)
+    distances = np.sum((projected[:, None, :] - prototypes[None, :, :]) ** 2, axis=2).astype(np.float32)
+    absent = np.asarray(prototype_counts) <= 0
+    if absent.any():
+        distances[:, absent] = np.inf
+    logits = -distances / float(temperature)
+    logits[:, absent] = -1.0e9
+    type_probs = _softmax_logits(logits)
+    nearest_idx = np.argmin(distances, axis=1)
+    nearest_distance = distances[np.arange(distances.shape[0]), nearest_idx].astype(np.float32)
+    nearest_distance[~np.isfinite(nearest_distance)] = np.inf
+    objectness_prob = 1.0 / (1.0 + np.exp(-float(objectness_scale) * (float(distance_tau) - nearest_distance)))
+    objectness_prob[~np.isfinite(objectness_prob)] = 0.0
+    type_idx = np.argmax(type_probs, axis=1)
+    labeled_mask, background_mask = _label_masks(metadata)
+
+    out = metadata.copy()
+    out["is_labeled"] = labeled_mask.astype(int)
+    out["is_background_chromosome"] = background_mask.astype(int)
+    out["true_class"] = out["sv_class"].astype(str) if "sv_class" in out else ""
+    out["nearest_prototype_class"] = [class_names[int(i)] for i in nearest_idx]
+    out["nearest_prototype_distance"] = nearest_distance.astype(float)
+    out["objectness_logit"] = (float(objectness_scale) * (float(distance_tau) - nearest_distance)).astype(float)
+    out["objectness_prob"] = objectness_prob.astype(float)
+    out["type_predicted_class"] = [class_names[int(i)] for i in type_idx]
+    out["max_type_probability"] = type_probs.max(axis=1).astype(float)
+    for i, class_name in enumerate(class_names):
+        out[f"type_probability_{class_name}"] = type_probs[:, i].astype(float)
+        out[f"prototype_distance_{class_name}"] = distances[:, i].astype(float)
+    return out
+
+
+def annotate_predictions(
+    predictions: pd.DataFrame,
+    distance_tau: float,
+    objectness_scale: float,
+    objectness_tau: float = 0.5,
+) -> pd.DataFrame:
+    out = predictions.copy()
+    nearest = out["nearest_prototype_distance"].astype(float).to_numpy()
+    objectness_logit = float(objectness_scale) * (float(distance_tau) - nearest)
+    objectness_prob = 1.0 / (1.0 + np.exp(-objectness_logit))
+    objectness_prob[~np.isfinite(objectness_prob)] = 0.0
+    out["selected_distance_tau"] = float(distance_tau)
+    out["objectness_tau"] = float(objectness_tau)
+    out["objectness_logit"] = objectness_logit.astype(float)
+    out["objectness_prob"] = objectness_prob.astype(float)
+    out["called_complex_sv"] = out["objectness_prob"].astype(float) >= float(objectness_tau)
+    out["predicted_class"] = out["type_predicted_class"].where(out["called_complex_sv"], "none")
+    out["objectness_correct"] = (out["called_complex_sv"] == out["is_labeled"].astype(bool)) | (
+        (~out["called_complex_sv"]) & out["is_background_chromosome"].astype(bool)
+    )
+    out["class_correct"] = (
+        out["is_labeled"].astype(bool)
+        & out["called_complex_sv"].astype(bool)
+        & (out["true_class"].astype(str) == out["predicted_class"].astype(str))
+    )
+    return out
+
+
+def fewshot_predictions_to_distance_table(predictions: pd.DataFrame, class_names: list[str]) -> pd.DataFrame:
+    out = predictions.copy()
+    objectness = out["objectness_prob"].astype(float).to_numpy()
+    max_type = out["max_type_probability"].astype(float).to_numpy()
+    called = out["predicted_class"].astype(str).to_numpy() != "none"
+    out["distance_source"] = "fewshot_prototype"
+    out["prototype_confidence"] = np.where(called, objectness * max_type, 0.0)
+    for class_name in class_names:
+        src = f"prototype_distance_{class_name}"
+        if src in out:
+            out[f"d_{class_name}"] = out[src].astype(float)
+    return out
+
+
+def sweep_distance_tau(score_df: pd.DataFrame, tau_grid: np.ndarray) -> pd.DataFrame:
+    if score_df.empty:
+        return pd.DataFrame()
+    eligible = (score_df["is_labeled"].astype(bool) | score_df["is_background_chromosome"].astype(bool)).to_numpy()
+    df = score_df.loc[eligible].copy()
+    if df.empty:
+        return pd.DataFrame()
+    y = df["is_labeled"].astype(bool).to_numpy()
+    distance = df["nearest_prototype_distance"].astype(float).to_numpy()
+    true_cls = df["true_class"].astype(str).to_numpy()
+    type_cls = df["type_predicted_class"].astype(str).to_numpy()
+    rows: list[dict[str, Any]] = []
+    for tau in tau_grid:
+        called = distance <= float(tau)
+        tp = int((y & called).sum())
+        fp = int(((~y) & called).sum())
+        fn = int((y & (~called)).sum())
+        tn = int(((~y) & (~called)).sum())
+        precision = tp / (tp + fp) if tp + fp else 1.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
+        correct_type = y & called & (true_cls == type_cls)
+        typed_tp = int(correct_type.sum())
+        typed_precision = typed_tp / (tp + fp) if tp + fp else 1.0
+        typed_recall = typed_tp / int(y.sum()) if int(y.sum()) else 0.0
+        typed_f1 = (2 * typed_precision * typed_recall / (typed_precision + typed_recall)) if typed_precision + typed_recall else 0.0
+        type_accuracy_called_positives = typed_tp / tp if tp else 0.0
+        rows.append(
+            {
+                "distance_tau": float(tau),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1": float(f1),
+                "typed_precision": float(typed_precision),
+                "typed_recall": float(typed_recall),
+                "typed_f1": float(typed_f1),
+                "type_accuracy_called_positives": float(type_accuracy_called_positives),
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "tn": tn,
+                "typed_tp": typed_tp,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def choose_distance_tau(tau_df: pd.DataFrame, metric: str = "typed_f1") -> float:
+    if tau_df.empty:
+        return 0.5
+    metric = metric if metric in tau_df.columns else "f1"
+    ranked = tau_df.sort_values(
+        [metric, "precision", "recall", "distance_tau"],
+        ascending=[False, False, False, True],
+    )
+    return float(ranked.iloc[0]["distance_tau"])
+
+
+def run_leave_one_sample_out(
+    embeddings: np.ndarray,
+    metadata: pd.DataFrame,
+    class_names: list[str],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    labeled_mask, background_mask = _label_masks(metadata)
+    samples = _sample_ids(metadata)
+    targets = _type_targets(metadata, class_names)
+    held_samples = sorted(pd.unique(samples[labeled_mask]).tolist())
+    rows: list[pd.DataFrame] = []
+    train_metrics: list[pd.DataFrame] = []
+    cv_epochs = int(args.cv_epochs) if args.cv_epochs is not None else int(args.epochs)
+    cv_patience = int(args.cv_patience) if args.cv_patience is not None else int(args.patience)
+
+    for fold_i, held_sample in enumerate(held_samples):
+        train_mask = samples != held_sample
+        train_labels = labeled_mask & train_mask
+        if int(train_labels.sum()) == 0:
+            log.warning("Skipping LOSO fold for %s; no labels remain in training fold", held_sample)
+            continue
+        try:
+            model, metrics = train_projection(
+                embeddings,
+                metadata,
+                class_names,
+                train_mask=train_mask,
+                args=args,
+                device=device,
+                epochs=cv_epochs,
+                patience=cv_patience,
+                seed_offset=1000 + fold_i,
+                log_prefix=f"loso:{held_sample}",
+            )
+        except RuntimeError as exc:
+            log.warning("Skipping LOSO fold for %s: %s", held_sample, exc)
+            continue
+        metrics["held_out_sample"] = held_sample
+        train_metrics.append(metrics)
+
+        projected_train = project_embeddings(model, embeddings[train_labels], device=device, batch_size=int(args.batch_size))
+        prototypes, counts = compute_prototypes(projected_train, targets[train_labels], len(class_names))
+        pred = predict_with_prototypes(
+            model,
+            embeddings,
+            metadata,
+            class_names,
+            prototypes,
+            counts,
+            distance_tau=0.5,
+            objectness_scale=float(args.objectness_scale),
+            temperature=float(args.temperature),
+            device=device,
+            batch_size=int(args.batch_size),
+        )
+        eval_mask = (samples == held_sample) & (labeled_mask | background_mask)
+        fold = pred.loc[eval_mask].copy()
+        fold["held_out_sample"] = held_sample
+        fold["train_n_labeled"] = int(train_labels.sum())
+        fold["train_class_counts"] = json.dumps(_class_counts(metadata.loc[train_mask].reset_index(drop=True), _label_masks(metadata.loc[train_mask].reset_index(drop=True))[0], class_names), sort_keys=True)
+        rows.append(fold)
+
+    cv_predictions = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    cv_metrics = pd.concat(train_metrics, ignore_index=True) if train_metrics else pd.DataFrame()
+    return cv_predictions, cv_metrics
+
+
+def _plot_training(metrics: pd.DataFrame, output_path: Path) -> None:
+    if metrics.empty:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+    axes[0].plot(metrics["epoch"], metrics["loss"], label="loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title("Few-Shot Projection Loss")
+    axes[0].grid(alpha=0.2)
+    axes[0].legend(fontsize=8)
+    axes[1].plot(metrics["epoch"], metrics["loo_type_acc"], label="LOO type acc")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylim(-0.03, 1.03)
+    axes[1].set_title("Training Leave-One-Out Accuracy")
+    axes[1].grid(alpha=0.2)
+    axes[1].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_tau(tau_df: pd.DataFrame, output_path: Path, selected_tau: float) -> None:
+    if tau_df.empty:
+        return
+    fig, ax = plt.subplots(figsize=(7.0, 4.6))
+    ax.plot(tau_df["distance_tau"], tau_df["precision"], label="precision")
+    ax.plot(tau_df["distance_tau"], tau_df["recall"], label="recall")
+    ax.plot(tau_df["distance_tau"], tau_df["f1"], label="F1")
+    if "typed_f1" in tau_df:
+        ax.plot(tau_df["distance_tau"], tau_df["typed_f1"], label="typed F1")
+    ax.axvline(float(selected_tau), color="black", linestyle=":", linewidth=1.2, label=f"selected distance={selected_tau:.3g}")
+    ax.set_xlabel("Nearest-prototype distance threshold")
+    ax.set_ylabel("Score")
+    ax.set_ylim(-0.03, 1.03)
+    ax.set_title("Leave-One-Sample-Out Distance Sweep")
+    ax.grid(alpha=0.2)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_validation_confusion(predictions: pd.DataFrame, class_names: list[str], output_path: Path) -> None:
+    if predictions.empty:
+        return
+    labeled = predictions[predictions["is_labeled"].astype(bool)].copy()
+    if labeled.empty:
+        return
+    cols = class_names + ["none"]
+    table = pd.crosstab(labeled["true_class"], labeled["predicted_class"]).reindex(index=class_names, columns=cols, fill_value=0)
+    fig, ax = plt.subplots(figsize=(7.2, max(3.2, 0.55 * len(class_names) + 2.0)))
+    im = ax.imshow(table.to_numpy(dtype=float), cmap="viridis")
+    ax.set_xticks(np.arange(len(cols)))
+    ax.set_xticklabels(cols, rotation=35, ha="right", fontsize=8)
+    ax.set_yticks(np.arange(len(class_names)))
+    ax.set_yticklabels(class_names, fontsize=8)
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("GT class")
+    ax.set_title("Held-Out Few-Shot Predictions")
+    max_value = max(float(table.to_numpy().max()), 1.0)
+    for i in range(table.shape[0]):
+        for j in range(table.shape[1]):
+            ax.text(j, i, str(int(table.iat[i, j])), ha="center", va="center", color="white" if table.iat[i, j] > max_value * 0.45 else "black", fontsize=9)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Count")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_objectness_scores(predictions: pd.DataFrame, output_path: Path, selected_tau: float) -> None:
+    if predictions.empty:
+        return
+    eligible = predictions[predictions["is_labeled"].astype(bool) | predictions["is_background_chromosome"].astype(bool)].copy()
+    if eligible.empty:
+        return
+    eligible = eligible.sort_values("nearest_prototype_distance", ascending=True).reset_index(drop=True)
+    colors = np.where(eligible["is_labeled"].astype(bool), "#c43b3b", "#4a78b8")
+    fig, ax = plt.subplots(figsize=(8.5, 4.4))
+    ax.scatter(np.arange(len(eligible)), eligible["nearest_prototype_distance"].astype(float), c=colors, s=18, alpha=0.85, linewidths=0)
+    ax.axhline(float(selected_tau), color="black", linestyle=":", linewidth=1.2, label=f"distance={selected_tau:.3g}")
+    ax.set_xlabel("Held-out rows sorted by nearest-prototype distance")
+    ax.set_ylabel("Nearest-prototype distance")
+    ax.set_title("Held-Out Few-Shot Distances")
+    ax.grid(axis="y", alpha=0.2)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def _write_prediction_view(predictions: pd.DataFrame, class_names: list[str], output_path: Path) -> None:
+    rows: list[dict[str, Any]] = []
+    for row in predictions.to_dict("records"):
+        out = {
+            "candidate_id": row.get("candidate_id", ""),
+            "sample_id": row.get("sample_id", ""),
+            "chrom": row.get("chrom", ""),
+            "arm": row.get("arm", ""),
+            "start_bp": int(row.get("start_bp", 0)),
+            "end_bp": int(row.get("end_bp", 0)),
+            "predicted_class": row.get("predicted_class", "none"),
+            "called_complex_sv": bool(row.get("called_complex_sv", False)),
+            "objectness_prob": float(row.get("objectness_prob", 0.0)),
+            "nearest_prototype_distance": float(row.get("nearest_prototype_distance", np.inf)),
+            "type_predicted_class": row.get("type_predicted_class", ""),
+            "max_type_probability": float(row.get("max_type_probability", 0.0)),
+            "evidence": row.get("evidence", ""),
+            "candidate_scope": row.get("candidate_scope", row.get("label_scope", "")),
+            "true_class": row.get("true_class", ""),
+        }
+        for class_name in class_names:
+            out[f"type_probability_{class_name}"] = float(row.get(f"type_probability_{class_name}", 0.0))
+        rows.append(out)
+    pd.DataFrame(rows).to_csv(output_path, sep="\t", index=False)
+
+
+def run(args: argparse.Namespace) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    set_seed(int(args.seed))
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    embeddings, metadata = load_embedding_table(args.embeddings_npz, args.metadata_tsv)
+    embeddings, metadata = enforce_candidate_resolution(embeddings, metadata, args.candidate_resolution)
+    labeled_mask, background_mask = _label_masks(metadata)
+    if int(labeled_mask.sum()) < 4:
+        raise RuntimeError("Need at least four labeled embeddings for few-shot prototype training")
+    class_names = _parse_class_names(args.class_names, metadata, labeled_mask)
+    class_counts = _class_counts(metadata, labeled_mask, class_names)
+    observed_classes = [name for name, count in class_counts.items() if count > 0]
+    if len(observed_classes) < 2:
+        raise RuntimeError(f"Need at least two observed classes; observed {class_counts}")
+
+    log.info("Using device=%s; input embeddings=%s labels=%s background=%s", device, embeddings.shape, class_counts, int(background_mask.sum()))
+    all_train_mask = np.ones(len(metadata), dtype=bool)
+    final_model, training_metrics = train_projection(
+        embeddings,
+        metadata,
+        class_names,
+        train_mask=all_train_mask,
+        args=args,
+        device=device,
+        epochs=int(args.epochs),
+        patience=int(args.patience),
+        seed_offset=0,
+        log_prefix="final",
+    )
+    training_metrics.to_csv(out_dir / "training_metrics.tsv", sep="\t", index=False)
+    _plot_training(training_metrics, out_dir / "training_curves.png")
+
+    tau_grid = np.linspace(float(args.distance_tau_min), float(args.distance_tau_max), int(args.distance_tau_steps), dtype=np.float32)
+    cv_annotated = pd.DataFrame()
+    if bool(args.skip_loso):
+        cv_predictions = pd.DataFrame()
+        cv_training_metrics = pd.DataFrame()
+        tau_df = pd.DataFrame()
+        selected_distance_tau = float(args.distance_tau) if args.distance_tau is not None else 0.5
+    else:
+        cv_predictions, cv_training_metrics = run_leave_one_sample_out(embeddings, metadata, class_names, args, device)
+        cv_training_metrics.to_csv(out_dir / "loso_training_metrics.tsv", sep="\t", index=False)
+        tau_df = sweep_distance_tau(cv_predictions, tau_grid)
+        selected_distance_tau = float(args.distance_tau) if args.distance_tau is not None else choose_distance_tau(tau_df, metric=str(args.tau_selection_metric))
+        cv_annotated = annotate_predictions(cv_predictions, selected_distance_tau, float(args.objectness_scale), objectness_tau=0.5) if not cv_predictions.empty else cv_predictions
+        cv_predictions.to_csv(out_dir / "leave_one_sample_out_raw.tsv", sep="\t", index=False)
+        cv_annotated.to_csv(out_dir / "leave_one_sample_out.tsv", sep="\t", index=False)
+        tau_df.to_csv(out_dir / "distance_tau_sweep.tsv", sep="\t", index=False)
+        _plot_tau(tau_df, out_dir / "distance_tau_sweep.png", selected_distance_tau)
+        _plot_validation_confusion(cv_annotated, class_names, out_dir / "held_out_prediction_summary.png")
+        _plot_objectness_scores(cv_annotated, out_dir / "held_out_distance_scores.png", selected_distance_tau)
+
+    targets = _type_targets(metadata, class_names)
+    projected_labeled = project_embeddings(final_model, embeddings[labeled_mask], device=device, batch_size=int(args.batch_size))
+    prototypes, prototype_counts = compute_prototypes(projected_labeled, targets[labeled_mask], len(class_names))
+    predictions = predict_with_prototypes(
+        final_model,
+        embeddings,
+        metadata,
+        class_names,
+        prototypes,
+        prototype_counts,
+        distance_tau=selected_distance_tau,
+        objectness_scale=float(args.objectness_scale),
+        temperature=float(args.temperature),
+        device=device,
+        batch_size=int(args.batch_size),
+    )
+    predictions = annotate_predictions(predictions, selected_distance_tau, float(args.objectness_scale), objectness_tau=0.5)
+    predictions.to_csv(out_dir / "classification_predictions.tsv", sep="\t", index=False)
+    called = predictions[predictions["called_complex_sv"].astype(bool)].copy()
+    called.to_csv(out_dir / "predicted_complex_sv.tsv", sep="\t", index=False)
+    _write_prediction_view(predictions, class_names, out_dir / "predictions.tsv")
+
+    compatibility_distances = fewshot_predictions_to_distance_table(predictions, class_names)
+    compatibility_distances.to_csv(out_dir / "prototype_distances.tsv", sep="\t", index=False)
+    compatibility_loo = fewshot_predictions_to_distance_table(cv_annotated, class_names) if not cv_annotated.empty else pd.DataFrame()
+    compatibility_loo.to_csv(out_dir / "anchor_leave_one_out.tsv", sep="\t", index=False)
+    embed_corpus.write_visualizations(
+        embeddings,
+        metadata,
+        compatibility_distances,
+        compatibility_loo,
+        out_dir,
+        tau=float(selected_distance_tau),
+    )
+
+    parameter_count = _parameter_count(final_model)
+    architecture = {
+        "model": "MetricProjection + nearest class prototypes",
+        "input_dim": int(embeddings.shape[1]),
+        "hidden_dim": int(args.hidden_dim),
+        "projection_dim": int(args.projection_dim),
+        "dropout": float(args.dropout),
+        "normalization": "L2-normalized projected embeddings and prototypes",
+        "distance": "squared Euclidean",
+        "type_probabilities": f"softmax(-distance / {float(args.temperature):.6g})",
+        "objectness": f"sigmoid({float(args.objectness_scale):.6g} * (selected_distance_tau - nearest_distance))",
+    }
+    torch.save(
+        {
+            "model_state_dict": final_model.state_dict(),
+            "input_dim": int(embeddings.shape[1]),
+            "hidden_dim": int(args.hidden_dim),
+            "projection_dim": int(args.projection_dim),
+            "dropout": float(args.dropout),
+            "class_names": class_names,
+            "class_counts": class_counts,
+            "prototype_vectors": torch.as_tensor(prototypes, dtype=torch.float32),
+            "prototype_counts": torch.as_tensor(prototype_counts, dtype=torch.long),
+            "selected_distance_tau": float(selected_distance_tau),
+            "objectness_tau": 0.5,
+            "objectness_scale": float(args.objectness_scale),
+            "temperature": float(args.temperature),
+            "parameter_count": int(parameter_count),
+            "architecture": architecture,
+            "config": vars(args),
+        },
+        out_dir / "fewshot_classification_head.pt",
+    )
+    summary: dict[str, Any] = {
+        "architecture": architecture,
+        "parameter_count": int(parameter_count),
+        "class_names": class_names,
+        "class_counts": class_counts,
+        "prototype_counts": {name: int(prototype_counts[i]) for i, name in enumerate(class_names)},
+        "selected_distance_tau": float(selected_distance_tau),
+        "objectness_tau": 0.5,
+        "objectness_scale": float(args.objectness_scale),
+        "temperature": float(args.temperature),
+        "tau_selection_metric": str(args.tau_selection_metric),
+        "n_labeled": int(labeled_mask.sum()),
+        "n_background": int(background_mask.sum()),
+        "n_called_complex_sv": int(called.shape[0]),
+    }
+    if not tau_df.empty:
+        best_row = tau_df.loc[(tau_df["distance_tau"] - float(selected_distance_tau)).abs().idxmin()].to_dict()
+        summary["selected_tau_metrics"] = {k: (float(v) if isinstance(v, (int, float, np.integer, np.floating)) else v) for k, v in best_row.items()}
+    with (out_dir / "training_summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
+    log.info("Wrote few-shot classifier outputs to %s; called=%d/%d", out_dir, int(called.shape[0]), len(predictions))
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--embeddings_npz", required=True, help="Input embeddings.npz from prototype-mode inference/anchors.")
+    parser.add_argument("--metadata_tsv", default=None, help="Optional candidate_embeddings.tsv; otherwise metadata is read from NPZ arrays.")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--candidate_resolution", choices=("auto", "chromosome-arm", "any"), default="chromosome-arm")
+    parser.add_argument("--class_names", default=",".join(DEFAULT_CLASS_NAMES), help="Comma-separated output class order.")
+    parser.add_argument("--projection_dim", type=int, default=64)
+    parser.add_argument("--hidden_dim", type=int, default=128, help="Set to 0 for a linear projection.")
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--objectness_scale", type=float, default=12.0)
+    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--patience", type=int, default=80)
+    parser.add_argument("--cv_epochs", type=int, default=220)
+    parser.add_argument("--cv_patience", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+    parser.add_argument("--label_smoothing", type=float, default=0.02)
+    parser.add_argument("--class_weighting", choices=("none", "inverse", "inverse_sqrt"), default="inverse_sqrt")
+    parser.add_argument("--grad_clip", type=float, default=5.0)
+    parser.add_argument("--distance_tau_min", type=float, default=0.0)
+    parser.add_argument("--distance_tau_max", type=float, default=4.0)
+    parser.add_argument("--distance_tau_steps", type=int, default=161)
+    parser.add_argument("--distance_tau", type=float, default=None, help="Override calibrated nearest-prototype distance threshold.")
+    parser.add_argument("--tau_selection_metric", choices=("f1", "typed_f1", "precision", "recall"), default="typed_f1")
+    parser.add_argument("--skip_loso", action="store_true", help="Skip leave-one-sample-out calibration and use --distance_tau or 0.5.")
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--log_every", type=int, default=25)
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    run(parse_args(argv))
+
+
+if __name__ == "__main__":
+    main()
