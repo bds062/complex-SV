@@ -22,6 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.collections import LineCollection  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Rectangle  # noqa: E402
 
 from data.anchor_manifest import canonical_sample_id
 from data.severus_parser import parse_severus
@@ -91,6 +92,10 @@ def _type_probability_classes(row: pd.Series) -> list[str]:
 
 
 def _format_score_text(row: pd.Series, pred_classes: list[str]) -> str:
+    explicit = _clean_text(row.get("score_text", ""))
+    if explicit:
+        return explicit
+
     objectness_prob = _numeric(row, "objectness_prob", np.nan)
     if np.isfinite(objectness_prob):
         parts = [f"objectness(sigmoid)={objectness_prob:.3g}"]
@@ -130,6 +135,25 @@ def _chrom_equal(a: object, b: object) -> bool:
 def _numeric(row: pd.Series, key: str, default: float = 0.0) -> float:
     value = pd.to_numeric(pd.Series([row.get(key, default)]), errors="coerce").iloc[0]
     return float(default if pd.isna(value) else value)
+
+
+def _format_bp(value: int | float) -> str:
+    try:
+        return f"{int(round(float(value))):,}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _highlight_interval(row: pd.Series, start_bp: int, end_bp: int) -> tuple[int, int]:
+    highlight_start = int(_numeric(row, "highlight_start_bp", start_bp))
+    highlight_end = int(_numeric(row, "highlight_end_bp", end_bp))
+    if highlight_end < highlight_start:
+        highlight_start, highlight_end = highlight_end, highlight_start
+    highlight_start = max(start_bp, min(highlight_start, end_bp))
+    highlight_end = max(start_bp, min(highlight_end, end_bp))
+    if highlight_end <= highlight_start:
+        highlight_start, highlight_end = start_bp, end_bp
+    return highlight_start, highlight_end
 
 
 def read_manifest(path: str | Path) -> pd.DataFrame:
@@ -461,6 +485,12 @@ def plot_chromosome_prediction(
         else:
             end_bp = start_bp + 1
 
+    highlight_start_bp, highlight_end_bp = _highlight_interval(row, start_bp, end_bp)
+    confidence = _clean_text(row.get("confidence", ""))
+    highlight_label = _clean_text(row.get("highlight_label", ""))
+    if not highlight_label and ("highlight_start_bp" in row or "highlight_end_bp" in row):
+        highlight_label = f"{chrom}:{_format_bp(highlight_start_bp)}-{_format_bp(highlight_end_bp)}"
+
     segs = _subset_segments(wakhan_df, chrom, start_bp, end_bp)
     sv_chr = _subset_sv_on_chrom(severus_df, chrom, start_bp, end_bp)
 
@@ -472,17 +502,32 @@ def plot_chromosome_prediction(
         gridspec_kw={"height_ratios": [1.55, 2.05, 1.15], "hspace": 0.08},
     )
     class_color = CLASS_COLORS.get(top_pred, "#4E79A7")
+    highlight_color = {"HIGH": "#C83232", "LOW": "#D89021"}.get(confidence.upper(), class_color)
     score_text = _format_score_text(row, pred_classes)
-    title = (
-        f"{sample_id} {region}: predicted {pred}"
-        f"\n{score_text} | {len(segs)} CN segments, {len(sv_chr)} SV records"
-    )
+    title_lines = [f"{sample_id} {region}: predicted {pred}"]
+    if highlight_label:
+        shatterseek_label = "ShatterSeek" + (f" {confidence}" if confidence else "")
+        title_lines.append(f"{shatterseek_label}: {highlight_label}")
+    title_lines.append(f"{score_text} | {len(segs)} CN segments, {len(sv_chr)} SV records")
+    title = "\n".join(title_lines)
     fig.suptitle(title, x=0.5, y=0.985, fontsize=12, color="black")
     fig.patch.set_facecolor("white")
     for ax in axes:
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-        ax.axvspan(start_bp / 1e6, end_bp / 1e6, color=class_color, alpha=0.025, linewidth=0)
+        interval_box = Rectangle(
+            (highlight_start_bp / 1e6, 0),
+            (highlight_end_bp - highlight_start_bp) / 1e6,
+            1,
+            transform=ax.get_xaxis_transform(),
+            fill=False,
+            edgecolor=highlight_color,
+            linewidth=1.5,
+            alpha=0.95,
+            zorder=20,
+            clip_on=False,
+        )
+        ax.add_patch(interval_box)
 
     _plot_sv_panel(axes[0], severus_df, sv_chr, chrom, start_bp, end_bp)
     _plot_cn_panel(axes[1], segs, start_bp, end_bp)
