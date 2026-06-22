@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
@@ -36,8 +37,8 @@ except ImportError as exc:  # pragma: no cover - dependency message only
 
 try:
     from config import GraphEncoderConfig
-    from data.severus_parser import CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
-    from data.sv_region_sampler import build_region_graphs, build_sv_bp_windows, window_metadata_frame
+    from data.severus_parser import BINARY_COLS, CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
+    from data.sv_region_sampler import GRAPH_AUX_TARGET_NAMES, build_region_graphs, build_sv_bp_windows, window_metadata_frame
     from pretrain.graph_encoder import SVGraphMAE
     from utils import get_device, l2_normalize, save_checkpoint, set_seed, setup_logging
 except ImportError:
@@ -46,8 +47,8 @@ except ImportError:
         sys.path.insert(0, str(ROOT))
 
     from config import GraphEncoderConfig
-    from data.severus_parser import CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
-    from data.sv_region_sampler import build_region_graphs, build_sv_bp_windows, window_metadata_frame
+    from data.severus_parser import BINARY_COLS, CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
+    from data.sv_region_sampler import GRAPH_AUX_TARGET_NAMES, build_region_graphs, build_sv_bp_windows, window_metadata_frame
     from pretrain.graph_encoder import SVGraphMAE
     from utils import get_device, l2_normalize, save_checkpoint, set_seed, setup_logging
 
@@ -131,6 +132,25 @@ def _masked_node_mse(recon: torch.Tensor, target: torch.Tensor, mask: torch.Tens
     return ((recon - target) ** 2 * mask_f).sum() / (mask_f.sum() * target.shape[-1] + 1e-9)
 
 
+def _aux_targets(data) -> torch.Tensor:
+    if not hasattr(data, "graph_targets"):
+        raise KeyError("Regional graphs are missing graph_targets; rebuild them with sv_region_sampler.")
+    target = data.graph_targets
+    if target.ndim == 1:
+        target = target.view(-1, len(GRAPH_AUX_TARGET_NAMES))
+    return target.to(dtype=torch.float32)
+
+
+def _graph_aux_losses(pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+    return {
+        "density": F.mse_loss(pred[:, 0:2], target[:, 0:2]),
+        "foldback": F.binary_cross_entropy_with_logits(pred[:, 2], target[:, 2])
+        + F.mse_loss(torch.sigmoid(pred[:, 3]), target[:, 3]),
+        "interchrom": F.binary_cross_entropy_with_logits(pred[:, 4], target[:, 4])
+        + F.mse_loss(torch.sigmoid(pred[:, 5]), target[:, 5]),
+    }
+
+
 class WarmupCosineScheduler:
     """Epoch-level warmup followed by cosine decay."""
 
@@ -164,10 +184,13 @@ class WarmupCosineScheduler:
 
 
 def _run_epoch(
-    model: nn.Module,
+    model: SVGraphMAE,
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
+    density_loss_weight: float = 1.0,
+    foldback_loss_weight: float = 0.5,
+    interchrom_loss_weight: float = 0.5,
 ) -> float:
     training = optimizer is not None
     model.train(training)
@@ -182,8 +205,16 @@ def _run_epoch(
         if training:
             optimizer.zero_grad(set_to_none=True)
 
-        recon, _node_h = model(batch_graph, mask)
-        loss = _masked_node_mse(recon, target, mask)
+        recon, node_h = model(batch_graph, mask)
+        recon_loss = _masked_node_mse(recon, target, mask)
+        aux_pred = model.graph_aux(node_h, batch_graph["sv"].batch)
+        aux_loss = _graph_aux_losses(aux_pred, _aux_targets(batch_graph).to(device=device))
+        loss = (
+            recon_loss
+            + float(density_loss_weight) * aux_loss["density"]
+            + float(foldback_loss_weight) * aux_loss["foldback"]
+            + float(interchrom_loss_weight) * aux_loss["interchrom"]
+        )
 
         if training:
             loss.backward()
@@ -237,6 +268,8 @@ def _build_training_graphs(
     min_sv_per_window: int,
     max_windows: int | None,
     seed: int,
+    include_mate_context: bool,
+    max_mate_context_nodes: int | None,
 ) -> tuple[list, object, object, object]:
     _status(f"Parsing {len(input_paths):,} Severus VCF file(s)")
     df = parse_all_severus(input_paths)
@@ -276,7 +309,15 @@ def _build_training_graphs(
         )
     _status(f"Built {len(windows):,} accepted SV bp window(s)")
 
-    graphs = build_region_graphs(df, feat_matrix, windows, proximity_bp=cfg.proximity_bp, progress=True)
+    graphs = build_region_graphs(
+        df,
+        feat_matrix,
+        windows,
+        proximity_bp=cfg.proximity_bp,
+        progress=True,
+        include_mate_context=include_mate_context,
+        max_mate_context_nodes=max_mate_context_nodes,
+    )
     if not graphs:
         raise RuntimeError("No regional graph objects were built")
     _status(f"Built {len(graphs):,} regional graph object(s)")
@@ -314,6 +355,8 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
         min_sv_per_window=args.min_sv_per_window,
         max_windows=args.max_windows,
         seed=args.seed,
+        include_mate_context=not args.no_mate_context,
+        max_mate_context_nodes=args.max_mate_context_nodes,
     )
 
     dataset = SVRegionGraphDataset(graphs, mask_prob=cfg.mask_prob)
@@ -366,9 +409,25 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
 
     for epoch in range(1, args.epochs + 1):
         lr = scheduler.step(epoch)
-        train_loss = _run_epoch(model, train_loader, device, optimizer=optimizer)
+        train_loss = _run_epoch(
+            model,
+            train_loader,
+            device,
+            optimizer=optimizer,
+            density_loss_weight=args.density_loss_weight,
+            foldback_loss_weight=args.foldback_loss_weight,
+            interchrom_loss_weight=args.interchrom_loss_weight,
+        )
         with torch.no_grad():
-            val_loss = _run_epoch(model, val_loader, device, optimizer=None)
+            val_loss = _run_epoch(
+                model,
+                val_loader,
+                device,
+                optimizer=None,
+                density_loss_weight=args.density_loss_weight,
+                foldback_loss_weight=args.foldback_loss_weight,
+                interchrom_loss_weight=args.interchrom_loss_weight,
+            )
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -406,9 +465,16 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
             "cluster_windows_per_chrom_per_size": args.cluster_windows_per_chrom_per_size,
             "min_sv_per_window": args.min_sv_per_window,
             "max_windows": args.max_windows,
+            "include_mate_context": not args.no_mate_context,
+            "max_mate_context_nodes": args.max_mate_context_nodes,
+            "density_loss_weight": args.density_loss_weight,
+            "foldback_loss_weight": args.foldback_loss_weight,
+            "interchrom_loss_weight": args.interchrom_loss_weight,
+            "graph_aux_target_names": list(GRAPH_AUX_TARGET_NAMES),
         },
         "input_vcfs": input_paths,
         "severus_continuous_cols": list(CONTINUOUS_COLS),
+        "severus_binary_cols": list(BINARY_COLS),
         "n_feat": N_FEAT,
     }
 
@@ -462,7 +528,7 @@ def train(args: argparse.Namespace) -> tuple[list[float], list[float]]:
     ax.plot(range(1, len(train_losses) + 1), train_losses, label="train")
     ax.plot(range(1, len(val_losses) + 1), val_losses, label="val")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Masked node MSE")
+    ax.set_ylabel("Total pretraining loss")
     ax.set_title("Graph encoder pretraining")
     ax.legend()
     ax.grid(alpha=0.3)
@@ -497,6 +563,9 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument("--val_fraction", type=float, default=0.10)
     parser.add_argument("--mask_prob", type=float, default=defaults.mask_prob)
+    parser.add_argument("--density_loss_weight", type=float, default=1.0)
+    parser.add_argument("--foldback_loss_weight", type=float, default=0.5)
+    parser.add_argument("--interchrom_loss_weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--save_embeddings",
@@ -542,8 +611,22 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional cap on accepted graph windows before training.",
     )
+    parser.add_argument(
+        "--no_mate_context",
+        action="store_true",
+        help="Do not add explicit mate records outside the anchor bp window to regional graphs.",
+    )
+    parser.add_argument(
+        "--max_mate_context_nodes",
+        type=int,
+        default=512,
+        help="Maximum explicit mate nodes added outside each anchor bp window; use -1 for no cap.",
+    )
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.max_mate_context_nodes is not None and args.max_mate_context_nodes < 0:
+        args.max_mate_context_nodes = None
+    return args
 
 
 if __name__ == "__main__":

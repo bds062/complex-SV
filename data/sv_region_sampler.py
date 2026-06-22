@@ -29,6 +29,35 @@ from .graph_builder import build_sample_graph
 from .severus_parser import N_FEAT
 
 
+GRAPH_AUX_TARGET_NAMES = (
+    "log_n_sv",
+    "log_breakpoint_density",
+    "has_foldback",
+    "foldback_fraction",
+    "has_interchrom",
+    "interchrom_fraction",
+)
+
+
+def graph_aux_target_vector(window: dict[str, Any]) -> np.ndarray:
+    n_sv = max(float(window.get("n_sv", 0.0)), 0.0)
+    density = max(float(window.get("breakpoint_density_per_mb", 0.0)), 0.0)
+    n_foldback = max(float(window.get("n_foldback", 0.0)), 0.0)
+    n_interchrom = max(float(window.get("n_interchrom_mate", 0.0)), 0.0)
+    denom = max(n_sv, 1.0)
+    return np.asarray(
+        [
+            np.log1p(n_sv),
+            np.log1p(density),
+            1.0 if n_foldback > 0 else 0.0,
+            n_foldback / denom,
+            1.0 if n_interchrom > 0 else 0.0,
+            n_interchrom / denom,
+        ],
+        dtype=np.float32,
+    )
+
+
 def _validate_window_args(
     window_bp_sizes: Sequence[int],
     windows_per_chrom_per_size: int,
@@ -80,6 +109,9 @@ def _window_record(
     idx = overlap.index.astype(int).tolist()
     span_bp = max(int(end_bp) - int(start_bp), 1)
     density = float(len(idx) / (span_bp / 1_000_000.0))
+    n_foldback = int((df.loc[idx, "is_foldback"] > 0).sum()) if "is_foldback" in df.columns else 0
+    n_inv_like = int((df.loc[idx, "is_inv_like_bnd"] > 0).sum()) if "is_inv_like_bnd" in df.columns else 0
+    n_interchrom = int((df.loc[idx, "has_interchrom_mate"] > 0).sum()) if "has_interchrom_mate" in df.columns else 0
 
     return {
         "sample_id": str(sample_id),
@@ -92,6 +124,11 @@ def _window_record(
         "n_sv": int(len(idx)),
         "breakpoint_density_per_mb": density,
         "n_bnd": int((df.loc[idx, "is_bnd"] > 0).sum()),
+        "n_inv_like_bnd": n_inv_like,
+        "n_foldback": n_foldback,
+        "n_interchrom_mate": n_interchrom,
+        "foldback_fraction": float(n_foldback / max(len(idx), 1)),
+        "interchrom_fraction": float(n_interchrom / max(len(idx), 1)),
         "n_phased": int((df.loc[idx, "has_phase"] > 0).sum()),
         "dom_sv_type": _mode_or_empty(df.loc[idx, "sv_type_str"]),
         "mean_vaf": float(pd.to_numeric(df.loc[idx, "vaf_mean"], errors="coerce").fillna(0.0).mean()),
@@ -146,7 +183,19 @@ def build_sv_bp_windows(
     if rng is None:
         rng = np.random.default_rng()
 
-    required = {"sample_id", "chrom", "pos", "end", "is_bnd", "has_phase", "sv_type_str", "vaf_mean"}
+    required = {
+        "sample_id",
+        "chrom",
+        "pos",
+        "end",
+        "is_bnd",
+        "has_phase",
+        "sv_type_str",
+        "vaf_mean",
+        "is_foldback",
+        "is_inv_like_bnd",
+        "has_interchrom_mate",
+    }
     missing = sorted(required.difference(df.columns))
     if missing:
         raise ValueError(f"Cannot sample SV bp windows; missing columns: {missing}")
@@ -237,7 +286,10 @@ def build_sv_bp_windows(
             if int(cluster_windows_per_chrom_per_size) <= 0:
                 continue
 
-            dense_candidates: list[tuple[int, int, int]] = []
+            dense_by_interval: dict[tuple[int, int], tuple[float, int]] = {}
+            foldback_values = pd.to_numeric(grp.get("is_foldback", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+            inv_like_values = pd.to_numeric(grp.get("is_inv_like_bnd", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+            interchrom_values = pd.to_numeric(grp.get("has_interchrom_mate", 0.0), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
             for pos in positions:
                 start_bp = _clip_start(
                     int(pos) - effective_bp // 2,
@@ -246,11 +298,20 @@ def build_sv_bp_windows(
                     effective_bp,
                 )
                 end_bp = int(start_bp + effective_bp)
-                count = int(((positions >= start_bp) & (positions < end_bp)).sum())
-                dense_candidates.append((-count, start_bp, end_bp))
+                in_window = (positions >= start_bp) & (positions < end_bp)
+                count = int(in_window.sum())
+                foldback_count = float(foldback_values[in_window].sum())
+                inv_like_count = float(inv_like_values[in_window].sum())
+                interchrom_count = float(interchrom_values[in_window].sum())
+                score = float(count) + 3.0 * foldback_count + 1.0 * inv_like_count + 2.0 * interchrom_count
+                key = (start_bp, end_bp)
+                if key not in dense_by_interval or score > dense_by_interval[key][0]:
+                    dense_by_interval[key] = (score, count)
 
-            dense_candidates = sorted(set(dense_candidates))
-            for _neg_count, start_bp, end_bp in dense_candidates[: int(cluster_windows_per_chrom_per_size)]:
+            dense_candidates = sorted(
+                [(-score, -count, start_bp, end_bp) for (start_bp, end_bp), (score, count) in dense_by_interval.items()]
+            )
+            for _neg_score, _neg_count, start_bp, end_bp in dense_candidates[: int(cluster_windows_per_chrom_per_size)]:
                 if max_windows is not None and len(windows) >= max_windows:
                     break
                 add_record(
@@ -280,7 +341,19 @@ def build_sv_interval_windows(
     if int(min_sv_per_window) <= 0:
         raise ValueError("min_sv_per_window must be positive")
 
-    required = {"sample_id", "chrom", "pos", "end", "is_bnd", "has_phase", "sv_type_str", "vaf_mean"}
+    required = {
+        "sample_id",
+        "chrom",
+        "pos",
+        "end",
+        "is_bnd",
+        "has_phase",
+        "sv_type_str",
+        "vaf_mean",
+        "is_foldback",
+        "is_inv_like_bnd",
+        "has_interchrom_mate",
+    }
     missing = sorted(required.difference(df.columns))
     if missing:
         raise ValueError(f"Cannot build interval SV windows; missing columns: {missing}")
@@ -339,11 +412,41 @@ def window_metadata_frame(
     return pd.DataFrame(records)
 
 
+def _augment_indices_with_mates(
+    df: pd.DataFrame,
+    idx: list[int],
+    sample_id: str,
+    max_extra_nodes: int | None,
+) -> list[int]:
+    if not idx or "mate_id" not in df.columns or "sv_id" not in df.columns:
+        return idx
+
+    sample_mask = df["sample_id"].astype(str) == str(sample_id)
+    sample_df = df.loc[sample_mask]
+    id_to_global = {str(sv_id): int(i) for i, sv_id in zip(sample_df.index, sample_df["sv_id"].astype(str))}
+    selected = list(dict.fromkeys(int(i) for i in idx))
+    selected_set = set(selected)
+    extras: list[int] = []
+    for mate_id in df.loc[selected, "mate_id"].astype(str).tolist():
+        if mate_id in {"", ".", "nan", "None"}:
+            continue
+        mate_idx = id_to_global.get(mate_id)
+        if mate_idx is None or mate_idx in selected_set:
+            continue
+        extras.append(mate_idx)
+        selected_set.add(mate_idx)
+        if max_extra_nodes is not None and len(extras) >= int(max_extra_nodes):
+            break
+    return selected + extras
+
+
 def build_region_graph(
     df: pd.DataFrame,
     feat_matrix: np.ndarray,
     window: dict[str, Any],
     proximity_bp: int = 1_000_000,
+    include_mate_context: bool = True,
+    max_mate_context_nodes: int | None = 512,
 ) -> HeteroData:
     """Build one regional HeteroData graph for a sampled window."""
     feat_matrix = np.asarray(feat_matrix, dtype=np.float32)
@@ -352,9 +455,21 @@ def build_region_graph(
     if len(df) != feat_matrix.shape[0]:
         raise ValueError(f"df length ({len(df)}) and feature rows ({feat_matrix.shape[0]}) do not match")
 
-    idx = [int(i) for i in window.get("global_node_indices", [])]
-    if not idx:
+    anchor_idx = [int(i) for i in window.get("global_node_indices", [])]
+    if not anchor_idx:
         raise ValueError("Window has no global_node_indices")
+
+    idx = (
+        _augment_indices_with_mates(
+            df,
+            anchor_idx,
+            sample_id=str(window["sample_id"]),
+            max_extra_nodes=max_mate_context_nodes,
+        )
+        if include_mate_context
+        else anchor_idx
+    )
+    anchor_set = set(anchor_idx)
 
     sub_df = df.loc[idx].copy().reset_index(drop=True)
     graph = build_sample_graph(sub_df, feat_matrix[idx], proximity_bp=proximity_bp)
@@ -364,7 +479,9 @@ def build_region_graph(
     graph.region_end_bp = int(window["end_bp"])
     graph.requested_window_bp_size = int(window["requested_window_bp_size"])
     graph.window_source = str(window["window_source"])
+    graph.graph_targets = torch.as_tensor(graph_aux_target_vector(window), dtype=torch.float32).unsqueeze(0)
     graph["sv"].global_index = torch.as_tensor(idx, dtype=torch.long)
+    graph["sv"].in_window = torch.as_tensor([int(i in anchor_set) for i in idx], dtype=torch.bool)
     return graph
 
 
@@ -374,7 +491,19 @@ def build_region_graphs(
     windows: Sequence[dict[str, Any]],
     proximity_bp: int = 1_000_000,
     progress: bool = False,
+    include_mate_context: bool = True,
+    max_mate_context_nodes: int | None = 512,
 ) -> list[HeteroData]:
     """Build regional graphs for all sampled windows."""
     iterable = tqdm(windows, desc="build region graphs", unit="window", leave=False) if progress else windows
-    return [build_region_graph(df, feat_matrix, win, proximity_bp=proximity_bp) for win in iterable]
+    return [
+        build_region_graph(
+            df,
+            feat_matrix,
+            win,
+            proximity_bp=proximity_bp,
+            include_mate_context=include_mate_context,
+            max_mate_context_nodes=max_mate_context_nodes,
+        )
+        for win in iterable
+    ]

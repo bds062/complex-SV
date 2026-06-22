@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-BASE="${BASE:-../results/pipeline5}"
+BASE="${BASE:-../results/pipeline7}"
 MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
 LABELS="${LABELS:-$BASE/complex_sv_labels.tsv}"
 USE_LABELS="${USE_LABELS:-1}"
@@ -18,7 +18,7 @@ EMBEDDINGS_NPZ="${EMBEDDINGS_NPZ:-$EMBEDDING_DIR/embeddings.npz}"
 METADATA_TSV="${METADATA_TSV:-$EMBEDDING_DIR/candidate_embeddings.tsv}"
 
 CN_CHECKPOINT="${CN_CHECKPOINT:-../results/pipeline3/cn_pretrain_chrom/cn_encoder.pt}"
-GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-../results/pipeline3/sv_pretrain_chrom/graph_encoder.pt}"
+GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-../data/KolmogorovLab/srinivasanbd/results/pipeline3/sv3/graph_encoder.pt}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CANDIDATE_SOURCE="${CANDIDATE_SOURCE:-chromosome-arms}"
 CANDIDATE_RESOLUTION="${CANDIDATE_RESOLUTION:-chromosome-arm}"

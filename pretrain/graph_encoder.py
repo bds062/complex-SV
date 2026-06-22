@@ -24,19 +24,23 @@ except ImportError as exc:  # pragma: no cover - dependency message only
 
 try:
     from config import GraphEncoderConfig
-    from data.graph_builder import EDGE_MATE, EDGE_PHASE, EDGE_PROXIMITY
+    from data.graph_builder import EDGE_ATTR_DIM, EDGE_TYPES
     from data.severus_parser import N_FEAT
 except ImportError:  # Allows direct local imports during early development.
     GraphEncoderConfig = Any  # type: ignore[misc,assignment]
     EDGE_PROXIMITY = ("sv", "proximal_to", "sv")
     EDGE_MATE = ("sv", "mate_of", "sv")
+    EDGE_INTERCHROM = ("sv", "interchrom_mate_of", "sv")
+    EDGE_CLUSTER = ("sv", "cluster_linked", "sv")
     EDGE_PHASE = ("sv", "phase_linked", "sv")
-    N_FEAT = 35
+    EDGE_TYPES = (EDGE_PROXIMITY, EDGE_MATE, EDGE_INTERCHROM, EDGE_CLUSTER, EDGE_PHASE)
+    EDGE_ATTR_DIM = 3
+    N_FEAT = 46
 
 
 D_MODEL_GRAPH = 128
 EMBED_DIM = 64
-EDGE_TYPES = (EDGE_PROXIMITY, EDGE_MATE, EDGE_PHASE)
+GRAPH_AUX_TARGET_DIM = 6
 
 
 def _edge_key(edge_type: tuple[str, str, str]) -> str:
@@ -60,6 +64,7 @@ class HeteroGraphTransformerEncoder(nn.Module):
         self.n_heads = int(getattr(cfg, "n_heads", 8))
         self.n_layers = int(getattr(cfg, "n_layers", 4))
         self.dropout_p = float(getattr(cfg, "dropout", 0.1))
+        self.edge_attr_dim = int(getattr(cfg, "edge_attr_dim", EDGE_ATTR_DIM))
 
         if self.d_model % self.n_heads != 0:
             raise ValueError(
@@ -76,7 +81,7 @@ class HeteroGraphTransformerEncoder(nn.Module):
                     out_channels=self.d_model // self.n_heads,
                     heads=self.n_heads,
                     dropout=self.dropout_p,
-                    edge_dim=1,
+                    edge_dim=self.edge_attr_dim,
                     concat=True,
                 )
             self.layers.append(layer)
@@ -103,20 +108,36 @@ class HeteroGraphTransformerEncoder(nn.Module):
             for edge_idx, edge_type in enumerate(EDGE_TYPES):
                 edge_index = edge_index_dict.get(edge_type)
                 if edge_index is None:
-                    raise KeyError(f"Missing required edge type: {edge_type}")
+                    edge_index = torch.zeros((2, 0), dtype=torch.long, device=h.device)
+                else:
+                    edge_index = edge_index.to(device=h.device)
                 edge_attr = edge_attr_dict.get(edge_type)
                 if edge_attr is None:
-                    edge_attr = torch.ones(
+                    edge_attr = torch.zeros(
                         edge_index.shape[1],
-                        1,
+                        self.edge_attr_dim,
                         dtype=h.dtype,
                         device=h.device,
                     )
+                    if edge_attr.numel() > 0:
+                        edge_attr[:, 0] = 1.0
                 else:
                     edge_attr = edge_attr.to(device=h.device, dtype=h.dtype)
+                    if edge_attr.ndim == 1:
+                        edge_attr = edge_attr.unsqueeze(-1)
+                    if edge_attr.shape[1] < self.edge_attr_dim:
+                        pad = torch.zeros(
+                            edge_attr.shape[0],
+                            self.edge_attr_dim - edge_attr.shape[1],
+                            dtype=edge_attr.dtype,
+                            device=edge_attr.device,
+                        )
+                        edge_attr = torch.cat([edge_attr, pad], dim=1)
+                    elif edge_attr.shape[1] > self.edge_attr_dim:
+                        edge_attr = edge_attr[:, : self.edge_attr_dim]
 
                 conv = layer[_edge_key(edge_type)]
-                msg = conv(h, edge_index.to(device=h.device), edge_attr=edge_attr)
+                msg = conv(h, edge_index, edge_attr=edge_attr)
                 gated_messages.append(gates[edge_idx] * msg)
 
             msg_sum = torch.stack(gated_messages, dim=0).sum(dim=0)
@@ -205,12 +226,18 @@ class SVGraphMAE(nn.Module):
             nn.Linear(self.d_model, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
         )
+        self.aux_head = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, GRAPH_AUX_TARGET_DIM),
+        )
 
     def _edge_attr_dict(self, data: HeteroData) -> dict[tuple[str, str, str], torch.Tensor]:
         return {
             edge_type: data[edge_type].edge_attr
             for edge_type in EDGE_TYPES
-            if hasattr(data[edge_type], "edge_attr")
+            if edge_type in data.edge_types and hasattr(data[edge_type], "edge_attr")
         }
 
     def encode(self, data: HeteroData) -> torch.Tensor:
@@ -225,6 +252,23 @@ class SVGraphMAE(nn.Module):
         recon = self.recon_head(node_h)
         data["sv"].x = x_orig
         return recon, node_h
+
+    def graph_aux(self, node_h: torch.Tensor, batch: torch.Tensor | None = None) -> torch.Tensor:
+        if batch is None:
+            pooled = self.readout(node_h).unsqueeze(0)
+            return self.aux_head(pooled)
+
+        batch = batch.to(device=node_h.device, dtype=torch.long)
+        pooled: list[torch.Tensor] = []
+        n_graphs = int(batch.max().item()) + 1 if batch.numel() else 0
+        for graph_idx in range(n_graphs):
+            idx = torch.nonzero(batch == graph_idx, as_tuple=False).flatten()
+            if idx.numel() == 0:
+                continue
+            pooled.append(self.readout(node_h[idx]))
+        if not pooled:
+            raise ValueError("graph_aux requires at least one graph with SV nodes")
+        return self.aux_head(torch.stack(pooled, dim=0))
 
     def regional_embed(self, node_h: torch.Tensor, node_indices: Iterable[int]) -> torch.Tensor:
         idx = torch.as_tensor(list(node_indices), dtype=torch.long, device=node_h.device)

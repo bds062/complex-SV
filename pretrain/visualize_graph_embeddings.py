@@ -224,6 +224,7 @@ def _cfg_from_checkpoint(ckpt: dict) -> GraphEncoderConfig:
         dropout=raw.get("dropout", 0.1),
         proximity_bp=raw.get("proximity_bp", 1_000_000),
         mask_prob=raw.get("mask_prob", 0.15),
+        edge_attr_dim=raw.get("edge_attr_dim", 3),
     )
 
 
@@ -643,6 +644,9 @@ def run(args: argparse.Namespace) -> None:
         ("breakpoint_density_per_mb", "Breakpoint density", "numeric"),
         ("n_sv", "SV count", "numeric"),
         ("n_bnd", "BND count", "numeric"),
+        ("n_inv_like_bnd", "INV-like BND count", "numeric"),
+        ("n_foldback", "Foldback count", "numeric"),
+        ("n_interchrom_mate", "Interchrom mate count", "numeric"),
         ("n_phased", "Phased SV count", "numeric"),
     ]
     association_scores = _embedding_association_scores(
@@ -740,16 +744,18 @@ def run(args: argparse.Namespace) -> None:
     fig.savefig(out_dir / "graph_embedding_facets.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-    fig = plt.figure(figsize=(16, 12))
-    gs = GridSpec(2, 2, figure=fig, hspace=0.32, wspace=0.25)
+    fig = plt.figure(figsize=(20, 12))
+    gs = GridSpec(2, 3, figure=fig, hspace=0.32, wspace=0.25)
     continuous_specs = [
         ("breakpoint_density_per_mb", _title_with_score("Breakpoint density", score_by_facet, "breakpoint_density_per_mb"), "SVs per Mb"),
         ("n_sv", _title_with_score("SV count", score_by_facet, "n_sv"), "SV count"),
         ("n_bnd", _title_with_score("BND count", score_by_facet, "n_bnd"), "BND count"),
-        ("n_phased", _title_with_score("Phased SV count", score_by_facet, "n_phased"), "Phased SV count"),
+        ("n_inv_like_bnd", _title_with_score("INV-like BND count", score_by_facet, "n_inv_like_bnd"), "INV-like BND count"),
+        ("n_foldback", _title_with_score("Foldback count", score_by_facet, "n_foldback"), "Foldback count"),
+        ("n_interchrom_mate", _title_with_score("Interchrom mate count", score_by_facet, "n_interchrom_mate"), "Interchrom mate count"),
     ]
     for i, (col, title, label) in enumerate(continuous_specs):
-        ax = fig.add_subplot(gs[i // 2, i % 2])
+        ax = fig.add_subplot(gs[i // 3, i % 3])
         _scatter_continuous(ax, xy, meta[col].values, title, label)
         _overlay_highlights(ax, highlight_xy, highlight_labels)
     fig.suptitle("SV graph encoder bp-window continuous QC", fontsize=13, fontweight="bold")

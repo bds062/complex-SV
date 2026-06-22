@@ -120,6 +120,7 @@ def _graph_cfg_from_checkpoint(ckpt: dict) -> GraphEncoderConfig:
         dropout=raw.get("dropout", 0.1),
         proximity_bp=raw.get("proximity_bp", 1_000_000),
         mask_prob=raw.get("mask_prob", 0.15),
+        edge_attr_dim=raw.get("edge_attr_dim", 3),
     )
 
 

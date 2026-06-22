@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
     from ..utils import reciprocal_overlap  # type: ignore
 
 from .cn_resampler import get_arm_bounds
-from .graph_builder import EDGE_MATE, EDGE_PHASE, EDGE_PROXIMITY
+from .graph_builder import EDGE_CLUSTER, EDGE_MATE, EDGE_PHASE, EDGE_PROXIMITY
 
 
 def _chrom_equal(a: object, b: object) -> bool:
@@ -226,7 +226,7 @@ def propose_graph_candidates(
         g = nx.Graph()
         g.add_nodes_from(node_ids)
 
-        for edge_type in (EDGE_PROXIMITY, EDGE_MATE, EDGE_PHASE):
+        for edge_type in (EDGE_PROXIMITY, EDGE_MATE, EDGE_CLUSTER, EDGE_PHASE):
             for src, dst in _edge_pairs(graph, edge_type):
                 if src == dst or src not in node_set or dst not in node_set:
                     continue

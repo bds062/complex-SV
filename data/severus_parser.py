@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +40,11 @@ CONTINUOUS_COLS = [
     "ref_total",
     "phase_balance",
     "n_samples_gt",
+    "log_bnd_span",
+    "local_sv_density_100kb",
+    "local_sv_density_1mb",
+    "cluster_size",
+    "phase_set_size",
 ]
 BINARY_COLS = [
     "is_precise",
@@ -50,6 +56,12 @@ BINARY_COLS = [
     "strand_1_minus",
     "strand_2_plus",
     "strand_2_minus",
+    "strand_same_orientation",
+    "is_inv_like_bnd",
+    "is_foldback",
+    "is_foldback_like",
+    "has_interchrom_mate",
+    "has_samechrom_mate",
 ]
 SV_TYPE_MAP = {"DEL": 0, "INS": 1, "DUP": 2, "BND": 3, "sBND": 4, "INV": 5}
 GT_MAP = {"0/0": 0, "0/1": 1, "1/1": 2, "./.": 3}
@@ -68,17 +80,24 @@ REQUIRED_COLUMNS = [
     "sample_id",
     "sv_id",
     "mate_id",
+    "mate_chrom",
+    "mate_pos",
     "cluster_id",
     "phase_set",
     "chrom",
     "pos",
     "end",
+    "bnd_type",
+    "detailed_type",
+    "bnd_span",
     "sv_type_str",
     "sv_type",
     "maj_gt",
     *CONTINUOUS_COLS,
     *BINARY_COLS,
 ]
+
+BND_ALT_RE = re.compile(r"[\[\]]([^:\[\]]+):([0-9]+)[\[\]]")
 
 
 def _parse_info(info_str: str) -> dict[str, str | bool]:
@@ -94,6 +113,28 @@ def _parse_info(info_str: str) -> dict[str, str | bool]:
         else:
             info[field] = True
     return info
+
+
+def _clean_info_text(value: object) -> str:
+    if value is None or value is True:
+        return ""
+    text = str(value).strip()
+    return "" if text in {"", "."} else text
+
+
+def _chrom_key(chrom: object) -> str:
+    return str(chrom).strip().removeprefix("chr")
+
+
+def _parse_bnd_alt(alt: object) -> tuple[str, int]:
+    """Return mate chrom and 0-based mate position from a VCF BND ALT string."""
+    text = "" if alt is None else str(alt)
+    match = BND_ALT_RE.search(text)
+    if not match:
+        return "", -1
+    chrom = match.group(1)
+    pos = max(_as_int(match.group(2), default=0) - 1, 0)
+    return chrom, pos
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -213,6 +254,54 @@ def _parse_strands(value: object) -> tuple[float, float, float, float]:
     )
 
 
+def _same_orientation(strands: object) -> bool:
+    signs = [ch for ch in str(strands or "") if ch in {"+", "-"}]
+    return len(signs) >= 2 and signs[0] == signs[1]
+
+
+def _add_context_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add cohort-local density and group-size features after sorting."""
+    df = df.copy()
+
+    for span_bp, col in [(100_000, "local_sv_density_100kb"), (1_000_000, "local_sv_density_1mb")]:
+        df[col] = 0.0
+        half_span = int(span_bp) // 2
+        for (_sample_id, _chrom), grp in df.groupby(["sample_id", "chrom"], sort=False):
+            positions = pd.to_numeric(grp["pos"], errors="coerce").fillna(-1).to_numpy(dtype=np.int64)
+            order = np.argsort(positions)
+            sorted_pos = positions[order]
+            left = np.searchsorted(sorted_pos, sorted_pos - half_span, side="left")
+            right = np.searchsorted(sorted_pos, sorted_pos + half_span, side="right")
+            density = (right - left).astype(np.float32) / (float(span_bp) / 1_000_000.0)
+            df.loc[grp.index.to_numpy()[order], col] = density
+
+    df["cluster_size"] = 0.0
+    cluster_text = df["cluster_id"].astype(str)
+    valid_cluster = ~cluster_text.isin(["", ".", "nan", "None"])
+    if valid_cluster.any():
+        df.loc[valid_cluster, "cluster_size"] = (
+            df.loc[valid_cluster]
+            .groupby(["sample_id", "cluster_id"], sort=False)["sv_id"]
+            .transform("size")
+            .astype(float)
+        )
+
+    df["phase_set_size"] = 0.0
+    phase_numeric = pd.to_numeric(df["phase_set"], errors="coerce").fillna(0).astype(int)
+    valid_phase = phase_numeric != 0
+    if valid_phase.any():
+        tmp = df.loc[valid_phase, ["sample_id", "sv_id"]].copy()
+        tmp["phase_set"] = phase_numeric.loc[valid_phase].to_numpy(dtype=np.int64)
+        df.loc[valid_phase, "phase_set_size"] = (
+            tmp.groupby(["sample_id", "phase_set"], sort=False)["sv_id"]
+            .transform("size")
+            .astype(float)
+            .to_numpy()
+        )
+
+    return df
+
+
 def _chrom_sort_key(chrom: object) -> int:
     text = str(chrom)
     return CHROM_ORDER.get(text, CHROM_ORDER.get(text.removeprefix("chr"), 99))
@@ -297,6 +386,9 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
             sample_cols = parts[9:]
 
             sv_type_raw = str(info.get("SVTYPE", "DEL"))
+            alt = parts[4] if len(parts) > 4 else ""
+            bnd_type = _clean_info_text(info.get("BND_TYPE", ""))
+            detailed_type = _clean_info_text(info.get("DETAILED_TYPE", ""))
             svlen = abs(_as_float(info.get("SVLEN", 0.0), default=0.0))
             end = _as_int(info.get("END"), default=pos + max(1, int(svlen) if svlen else 1))
             # INFO/END is 1-based inclusive in VCF; as a half-open BED end it is
@@ -304,6 +396,15 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
             end = max(end, pos + 1)
             mapq = _as_float(info.get("MAPQ", 0.0), default=0.0)
             is_bnd = 1.0 if sv_type_raw in {"BND", "sBND"} else 0.0
+            mate_chrom, mate_pos = _parse_bnd_alt(alt) if is_bnd else ("", -1)
+            has_samechrom_mate = bool(mate_chrom) and _chrom_key(mate_chrom) == _chrom_key(chrom)
+            has_interchrom_mate = bool(mate_chrom) and _chrom_key(mate_chrom) != _chrom_key(chrom)
+            if has_samechrom_mate and mate_pos >= 0:
+                bnd_span = abs(int(mate_pos) - int(pos))
+            elif is_bnd and svlen > 0:
+                bnd_span = int(svlen)
+            else:
+                bnd_span = 0
 
             mate_id = str(info.get("MATE_ID", "") or "")
             cluster_id = str(info.get("CLUSTERID", "") or "")
@@ -312,9 +413,18 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
             supp_total, supp_hp1, supp_hp2 = _parse_supp(info.get("SUPP_READS", "0"))
             ref_total = _parse_ref_reads(info.get("REF_READS", "0"))
             has_phase_hp, hp_concordant = _parse_hp(info.get("HP", "0|0"))
+            strands_raw = info.get("STRANDS", "")
             strand_1_plus, strand_1_minus, strand_2_plus, strand_2_minus = _parse_strands(
-                info.get("STRANDS", "")
+                strands_raw
             )
+            strand_same_orientation = _same_orientation(strands_raw)
+            is_inv_like_bnd = bool(is_bnd) and (
+                bnd_type == "INV_LIKE" or (strand_same_orientation and has_samechrom_mate)
+            )
+            detailed_lower = detailed_type.lower()
+            is_foldback_exact = detailed_lower == "foldback"
+            is_foldback_like = bool(is_inv_like_bnd and has_samechrom_mate and 0 < bnd_span <= 50_000)
+            is_foldback = bool(is_foldback_exact or is_foldback_like)
 
             vafs: list[float] = []
             drs: list[float] = []
@@ -353,16 +463,21 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
                     "sample_id": str(sample_id),
                     "sv_id": sv_id,
                     "mate_id": mate_id if mate_id != "." else "",
+                    "mate_chrom": mate_chrom,
+                    "mate_pos": int(mate_pos),
                     "cluster_id": cluster_id if cluster_id != "." else "",
                     "phase_set": int(phase_set),
                     "chrom": chrom,
                     "pos": int(pos),
                     "end": int(end),
+                    "bnd_type": bnd_type,
+                    "detailed_type": detailed_type,
+                    "bnd_span": int(bnd_span),
                     "sv_type_str": sv_type_raw,
                     "sv_type": SV_TYPE_MAP.get(sv_type_raw, 0),
                     "maj_gt": _majority_gt(gts),
                     "qual": float(qual),
-                    "log_svlen": math.log1p(svlen) if not is_bnd else 0.0,
+                    "log_svlen": math.log1p(svlen),
                     "mapq": float(mapq),
                     "vaf_mean": mean(vafs),
                     "vaf_std": std(vafs),
@@ -377,6 +492,7 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
                     "ref_total": float(ref_total),
                     "phase_balance": float(abs(supp_hp1 - supp_hp2) / (supp_hp1 + supp_hp2 + 1.0)),
                     "n_samples_gt": float(n_valid),
+                    "log_bnd_span": math.log1p(float(bnd_span)) if is_bnd and bnd_span > 0 else 0.0,
                     "is_precise": 1.0 if "PRECISE" in info else 0.0,
                     "is_vntr": 1.0 if str(info.get("INSIDE_VNTR", "")).upper() == "TRUE" else 0.0,
                     "is_bnd": float(is_bnd),
@@ -386,6 +502,12 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
                     "strand_1_minus": strand_1_minus,
                     "strand_2_plus": strand_2_plus,
                     "strand_2_minus": strand_2_minus,
+                    "strand_same_orientation": 1.0 if strand_same_orientation else 0.0,
+                    "is_inv_like_bnd": 1.0 if is_inv_like_bnd else 0.0,
+                    "is_foldback": 1.0 if is_foldback else 0.0,
+                    "is_foldback_like": 1.0 if is_foldback_like else 0.0,
+                    "has_interchrom_mate": 1.0 if has_interchrom_mate else 0.0,
+                    "has_samechrom_mate": 1.0 if has_samechrom_mate else 0.0,
                 }
             )
 
@@ -397,13 +519,16 @@ def parse_severus(path: str | Path, sample_id: Optional[str] = None) -> pd.DataF
     df["_chrom_order"] = df["chrom"].map(_chrom_sort_key)
     df = df.sort_values(["_chrom_order", "pos", "end"]).drop(columns="_chrom_order")
     df = df.reset_index(drop=True)
+    df = _add_context_features(df)
 
     log.info(
-        "  %s: %d SVs, %d chroms, %d BND mates, %d phased",
+        "  %s: %d SVs, %d chroms, %d BND mates, %d foldback, %d interchrom, %d phased",
         sample_id,
         len(df),
         df["chrom"].nunique(),
         int((df["mate_id"] != "").sum()),
+        int((df["is_foldback"] > 0).sum()),
+        int((df["has_interchrom_mate"] > 0).sum()),
         int((df["phase_set"] != 0).sum()),
     )
     return df[REQUIRED_COLUMNS]
@@ -440,7 +565,7 @@ def build_node_features(
     Build the graph-node feature matrix.
 
     Column order:
-      16 continuous features after percentile clipping and RobustScaler,
+      continuous features after percentile clipping and RobustScaler,
       binary features, including ordered STRANDS orientation flags,
       6 SVTYPE one-hot features,
       4 genotype one-hot features.

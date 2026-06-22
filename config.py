@@ -39,6 +39,7 @@ class GraphEncoderConfig:
     dropout: float = 0.1
     proximity_bp: int = 1_000_000
     mask_prob: float = 0.15
+    edge_attr_dim: int = 3
 
 
 @dataclass(slots=True)

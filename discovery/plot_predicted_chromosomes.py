@@ -46,6 +46,18 @@ SV_TYPE_COLORS = {
     "sBND": "#9C755F",
     "DUP": "#178117",
 }
+STRAND_ORIENTATION_COLORS = {
+    "+-": "#0072B2",
+    "-+": "#009E73",
+    "++": "#D55E00",
+    "--": "#CC79A7",
+    "+?": "#56B4E9",
+    "-?": "#E69F00",
+    "?+": "#8A63D2",
+    "?-": "#A6761D",
+    "unknown": "#6C6C6C",
+}
+FOLDBACK_HIGHLIGHT_COLOR = "#C51B29"
 
 
 def _clean_text(value: object) -> str:
@@ -154,6 +166,44 @@ def _highlight_interval(row: pd.Series, start_bp: int, end_bp: int) -> tuple[int
     if highlight_end <= highlight_start:
         highlight_start, highlight_end = start_bp, end_bp
     return highlight_start, highlight_end
+
+
+def _bool_numeric(row: pd.Series, key: str) -> bool:
+    return _numeric(row, key, 0.0) > 0
+
+
+def _strand_orientation(row: pd.Series) -> str:
+    if _bool_numeric(row, "strand_1_plus"):
+        first = "+"
+    elif _bool_numeric(row, "strand_1_minus"):
+        first = "-"
+    else:
+        first = "?"
+
+    if _bool_numeric(row, "strand_2_plus"):
+        second = "+"
+    elif _bool_numeric(row, "strand_2_minus"):
+        second = "-"
+    else:
+        second = "?"
+
+    orientation = f"{first}{second}"
+    return "unknown" if orientation == "??" else orientation
+
+
+def _orientation_color(orientation: object) -> str:
+    return STRAND_ORIENTATION_COLORS.get(str(orientation), STRAND_ORIENTATION_COLORS["unknown"])
+
+
+def _orientation_sort_key(orientation: object) -> tuple[int, str]:
+    text = str(orientation)
+    ordered = list(STRAND_ORIENTATION_COLORS)
+    rank = ordered.index(text) if text in STRAND_ORIENTATION_COLORS else len(ordered)
+    return rank, text
+
+
+def _is_foldback_sv(row: pd.Series) -> bool:
+    return _bool_numeric(row, "is_foldback") or _bool_numeric(row, "is_foldback_like")
 
 
 def read_manifest(path: str | Path) -> pd.DataFrame:
@@ -302,12 +352,17 @@ def _plot_breakpoint_panel(
 
     if not sv_chr.empty:
         y_top = max_bp * 1.12
-        for sv_type, grp in sv_chr.groupby(sv_chr["sv_type_str"].astype(str)):
-            color = SV_TYPE_COLORS.get(sv_type, "#6C6C6C")
-            xs = pd.to_numeric(grp["pos"], errors="coerce").dropna().to_numpy(float) / 1e6
-            xs = xs[(xs >= start_bp / 1e6) & (xs <= end_bp / 1e6)]
-            if xs.size:
-                ax.vlines(xs, 0, y_top, colors=color, linewidth=0.55, alpha=0.45)
+        for _, sv in sv_chr.iterrows():
+            x_bp = _numeric(sv, "pos", np.nan)
+            if not np.isfinite(x_bp) or x_bp < start_bp or x_bp > end_bp:
+                continue
+            color = _orientation_color(_strand_orientation(sv))
+            x_mb = x_bp / 1e6
+            if _is_foldback_sv(sv):
+                ax.vlines([x_mb], 0, y_top, colors=FOLDBACK_HIGHLIGHT_COLOR, linewidth=1.9, alpha=0.82)
+                ax.vlines([x_mb], 0, y_top, colors=color, linewidth=0.85, alpha=0.96)
+            else:
+                ax.vlines([x_mb], 0, y_top, colors=color, linewidth=0.65, alpha=0.52)
         max_bp = max(max_bp, y_top)
 
     arcs, _markers = _same_chrom_arcs(severus_df, sv_chr, chrom, start_bp, end_bp)
@@ -318,10 +373,20 @@ def _plot_breakpoint_panel(
         for arc in arcs:
             x0 = float(arc["x0"]) / 1e6
             x1 = float(arc["x1"]) / 1e6
-            color = SV_TYPE_COLORS.get(str(arc["type"]), "#6C6C6C")
+            color = _orientation_color(arc.get("orientation", "unknown"))
             xs, unit_y = _arc_points(x0, x1, region_mb)
             is_offscreen = str(arc.get("kind", "")).startswith("offscreen") or str(arc.get("kind", "")) == "interchrom_mate"
-            ax.plot(xs, arc_base + unit_y * arc_height, color=color, linewidth=0.85 if is_offscreen else 0.7, alpha=0.55 if is_offscreen else 0.42)
+            is_foldback = bool(arc.get("is_foldback", False))
+            y = arc_base + unit_y * arc_height
+            if is_foldback:
+                ax.plot(xs, y, color=FOLDBACK_HIGHLIGHT_COLOR, linewidth=2.0, alpha=0.72)
+            ax.plot(
+                xs,
+                y,
+                color=color,
+                linewidth=1.05 if is_foldback else (0.85 if is_offscreen else 0.7),
+                alpha=0.90 if is_foldback else (0.55 if is_offscreen else 0.42),
+            )
         max_bp = max(max_bp, arc_base + arc_height * 1.12)
 
     ax.set_ylim(0, max_bp * 1.08 + 0.05)
@@ -372,6 +437,8 @@ def _same_chrom_arcs(severus_df: pd.DataFrame, sv_chr: pd.DataFrame, chrom: str,
         sv_id = str(row.get("sv_id", ""))
         mate_id = str(row.get("mate_id", ""))
         sv_type = str(row.get("sv_type_str", "SV"))
+        orientation = _strand_orientation(row)
+        is_foldback = _is_foldback_sv(row)
         pos = int(_numeric(row, "pos", start_bp))
         end = int(_numeric(row, "end", pos + 1))
         if mate_id and mate_id in by_id:
@@ -390,16 +457,34 @@ def _same_chrom_arcs(severus_df: pd.DataFrame, sv_chr: pd.DataFrame, chrom: str,
                 x1 = _offscreen_endpoint(pos, None, start_bp, end_bp)
                 kind = "interchrom_mate"
                 label = f"to {mate_chrom}" if mate_chrom else "BND"
-            arcs.append({"x0": pos, "x1": x1, "type": sv_type, "kind": kind, "label": label, "anchor": pos})
+            arcs.append({
+                "x0": pos,
+                "x1": x1,
+                "type": sv_type,
+                "orientation": orientation,
+                "is_foldback": is_foldback,
+                "kind": kind,
+                "label": label,
+                "anchor": pos,
+            })
             continue
 
         if sv_type in {"DEL", "DUP", "INV", "BND"} and end > pos + 1:
             x0 = pos
             x1 = end if start_bp <= end <= end_bp else _offscreen_endpoint(pos, end, start_bp, end_bp)
             kind = "interval" if start_bp <= end <= end_bp and start_bp <= pos <= end_bp else "offscreen_interval"
-            arcs.append({"x0": x0, "x1": x1, "type": sv_type, "kind": kind, "label": sv_type if kind != "interval" else "", "anchor": _visible_anchor_bp(x0, x1, start_bp, end_bp)})
+            arcs.append({
+                "x0": x0,
+                "x1": x1,
+                "type": sv_type,
+                "orientation": orientation,
+                "is_foldback": is_foldback,
+                "kind": kind,
+                "label": sv_type if kind != "interval" else "",
+                "anchor": _visible_anchor_bp(x0, x1, start_bp, end_bp),
+            })
         else:
-            markers.append({"x": pos, "type": sv_type, "label": sv_type})
+            markers.append({"x": pos, "type": sv_type, "orientation": orientation, "is_foldback": is_foldback, "label": sv_type})
     return arcs, markers
 
 
@@ -411,11 +496,34 @@ def _plot_sv_panel(ax, severus_df: pd.DataFrame, sv_chr: pd.DataFrame, chrom: st
     for arc in arcs:
         x0 = float(arc["x0"]) / 1e6
         x1 = float(arc["x1"]) / 1e6
-        color = SV_TYPE_COLORS.get(str(arc["type"]), "#6C6C6C")
+        color = _orientation_color(arc.get("orientation", "unknown"))
         xs, ys = _arc_points(x0, x1, region_mb)
         is_offscreen = str(arc.get("kind", "")).startswith("offscreen") or str(arc.get("kind", "")) == "interchrom_mate"
-        ax.plot(xs, ys, color=color, linewidth=1.05 if is_offscreen else 0.9, alpha=0.72 if is_offscreen else 0.62)
-        ax.scatter([x0, x1], [0.035, 0.035], s=9 if is_offscreen else 8, color=color, alpha=0.78 if is_offscreen else 0.75)
+        is_foldback = bool(arc.get("is_foldback", False))
+        if is_foldback:
+            ax.plot(xs, ys, color=FOLDBACK_HIGHLIGHT_COLOR, linewidth=3.0, alpha=0.78, zorder=3)
+        ax.plot(
+            xs,
+            ys,
+            color=color,
+            linewidth=1.55 if is_foldback else (1.05 if is_offscreen else 0.9),
+            alpha=0.96 if is_foldback else (0.72 if is_offscreen else 0.62),
+            zorder=4 if is_foldback else 2,
+        )
+        if is_foldback:
+            ax.scatter(
+                [x0, x1],
+                [0.035, 0.035],
+                marker="*",
+                s=56,
+                color=FOLDBACK_HIGHLIGHT_COLOR,
+                edgecolors="white",
+                linewidths=0.35,
+                alpha=0.98,
+                zorder=5,
+            )
+        else:
+            ax.scatter([x0, x1], [0.035, 0.035], s=9 if is_offscreen else 8, color=color, alpha=0.78 if is_offscreen else 0.75)
         if is_offscreen and str(arc.get("label", "")):
             offscreen_arcs.append(arc)
 
@@ -429,31 +537,54 @@ def _plot_sv_panel(ax, severus_df: pd.DataFrame, sv_chr: pd.DataFrame, chrom: st
                 rotation=90,
                 ha="center",
                 va="bottom",
-                color=SV_TYPE_COLORS.get(str(arc["type"]), "#6C6C6C"),
+                color=_orientation_color(arc.get("orientation", "unknown")),
             )
 
     if markers:
-        by_type: dict[str, list[dict[str, Any]]] = {}
         for marker in markers:
-            by_type.setdefault(str(marker["type"]), []).append(marker)
-        for sv_type, group in by_type.items():
-            color = SV_TYPE_COLORS.get(sv_type, "#6C6C6C")
-            xs = [float(marker["x"]) / 1e6 for marker in group]
-            ax.scatter(xs, [0.03] * len(xs), marker="v", s=18, color=color, alpha=0.78)
+            x = float(marker["x"]) / 1e6
+            color = _orientation_color(marker.get("orientation", "unknown"))
+            if bool(marker.get("is_foldback", False)):
+                ax.scatter([x], [0.03], marker="*", s=54, color=FOLDBACK_HIGHLIGHT_COLOR, edgecolors="white", linewidths=0.35, alpha=0.98, zorder=5)
+            else:
+                ax.scatter([x], [0.03], marker="v", s=18, color=color, alpha=0.78)
         if len(markers) <= 18:
             for marker in markers:
-                ax.annotate(str(marker.get("label", ""))[:14], (float(marker["x"]) / 1e6, 0.055), fontsize=6, rotation=90, ha="center", va="bottom")
+                ax.annotate(
+                    str(marker.get("label", ""))[:14],
+                    (float(marker["x"]) / 1e6, 0.055),
+                    fontsize=6,
+                    rotation=90,
+                    ha="center",
+                    va="bottom",
+                    color=_orientation_color(marker.get("orientation", "unknown")),
+                )
 
     if not arcs and not markers:
         ax.text(0.5, 0.5, "No Severus SVs on chromosome", transform=ax.transAxes, ha="center", va="center", fontsize=10)
 
-    present_types = sorted(set(sv_chr["sv_type_str"].astype(str))) if not sv_chr.empty and "sv_type_str" in sv_chr else []
+    present_orientations = sorted(
+        {_strand_orientation(row) for _, row in sv_chr.iterrows()} if not sv_chr.empty else [],
+        key=_orientation_sort_key,
+    )
     handles = [
-        Line2D([0], [0], color=SV_TYPE_COLORS.get(sv_type, "#6C6C6C"), lw=2, label=sv_type)
-        for sv_type in present_types
+        Line2D([0], [0], color=_orientation_color(orientation), lw=2, label=f"STRANDS {orientation}")
+        for orientation in present_orientations
     ]
+    if not sv_chr.empty and any(_is_foldback_sv(row) for _, row in sv_chr.iterrows()):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=FOLDBACK_HIGHLIGHT_COLOR,
+                marker="*",
+                markersize=8,
+                lw=2.4,
+                label="foldback / foldback-like",
+            )
+        )
     if handles:
-        ax.legend(handles=handles, loc="upper right", fontsize=8, ncol=min(6, len(handles)), frameon=False)
+        ax.legend(handles=handles, loc="upper right", fontsize=8, ncol=min(5, len(handles)), frameon=False)
     ax.set_ylabel("SV arcs")
     ax.set_yticks([])
     ax.set_ylim(0, 1.12)
@@ -592,7 +723,12 @@ def run(args: argparse.Namespace) -> None:
         objectness_prob = _numeric(row, "objectness_prob", np.nan)
         distance = _numeric(row, "nearest_prototype_distance", np.nan)
         suffix = f"obj{objectness_prob:.4g}" if np.isfinite(objectness_prob) else (f"d{distance:.4g}" if np.isfinite(distance) else "scoreNA")
-        plot_name = f"{_safe_name(sample_id)}_{_safe_name(region)}_{_safe_name(pred)}_{suffix}.png"
+        highlight_start = _numeric(row, "highlight_start_bp", np.nan)
+        highlight_end = _numeric(row, "highlight_end_bp", np.nan)
+        highlight_tag = ""
+        if np.isfinite(highlight_start) and np.isfinite(highlight_end):
+            highlight_tag = f"_{int(round(highlight_start))}_{int(round(highlight_end))}"
+        plot_name = f"{_safe_name(sample_id)}_{_safe_name(region)}_{_safe_name(pred)}_{suffix}{highlight_tag}.png"
         plot_path = class_dir / plot_name
 
         out_row = row.to_dict()

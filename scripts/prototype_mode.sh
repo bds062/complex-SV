@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-BASE="${BASE:-../results/pipeline6}"
+BASE="${BASE:-../results/pipeline8}"
 MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
 LABELS="${LABELS:-$BASE/complex_sv_labels.tsv}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$BASE/prototype_chrom_arm_sample_norm}"
@@ -24,7 +24,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-$BASE/prototype_chrom_arm_sample_norm}"
 # CN_CHECKPOINT="${CN_CHECKPOINT:-$BASE/cn_pretrain_chrom/cn_encoder.pt}"
 # GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-$BASE/sv_pretrain_chrom/graph_encoder.pt}"
 CN_CHECKPOINT="${CN_CHECKPOINT:-../results/pipeline3/cn_pretrain_chrom/cn_encoder.pt}"
-GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-../results/pipeline3/sv_pretrain_chrom/graph_encoder.pt}"
+GRAPH_CHECKPOINT="${GRAPH_CHECKPOINT:-/data/KolmogorovLab/srinivasanbd/results/pipeline3/sv3/graph_encoder.pt}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TAU="${TAU:-0.5562}"

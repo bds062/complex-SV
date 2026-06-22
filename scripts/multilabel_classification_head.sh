@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-BASE="${BASE:-../results/pipeline5}"
+BASE="${BASE:-../results/pipeline7}"
 MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
 PROTOTYPE_ROOT="${PROTOTYPE_ROOT:-$BASE/prototype_chrom_arm_sample_norm}"
 INPUT_DIR="${INPUT_DIR:-$PROTOTYPE_ROOT/inference}"
