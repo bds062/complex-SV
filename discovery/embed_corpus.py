@@ -1142,7 +1142,7 @@ def _plot_prototype_distances(
     ax.set_yticklabels(y_labels, fontsize=_dense_tick_fontsize(len(plot_df)))
     _draw_gt_class_boundaries(ax, plot_df)
     ax.set_xlabel("Prototype class")
-    ax.set_title(f"Prototype Distances by Class (tau={tau:g}; stars = predicted classes; no star = none)")
+    ax.set_title(f"Prototype Distances by Class (tau={tau:g})\nstars = predicted class; no star = none")
     fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02, label="Cosine distance")
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
@@ -1422,8 +1422,8 @@ def _plot_tau_precision_recall(
     axes[1].set_ylabel("Score")
     axes[1].set_ylim(-0.03, 1.03)
     axes[1].set_title(
-        f"Best F1={best['f1']:.2f} "
-        f"(P={best['precision']:.2f}, R={best['recall']:.2f}; {n_pos} GT, {n_neg} other scan candidates)"
+        f"Best F1={best['f1']:.2f} (P={best['precision']:.2f}, R={best['recall']:.2f})\n"
+        f"{n_pos} GT positives, {n_neg} other scan candidates"
     )
     axes[1].grid(alpha=0.2)
     axes[1].legend(fontsize=8, loc="best")

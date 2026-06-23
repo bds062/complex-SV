@@ -1,4 +1,22 @@
-"""Train a few-shot prototypical classifier on frozen complex-SV embeddings."""
+"""Train hierarchical few-shot prototypical classifier on frozen complex-SV embeddings.
+
+Architecture
+------------
+Level 2 (family): 4 family prototypes built by pooling canonical + non-canonical examples.
+  BFB_family             <- BFB + non_canonical_BFB
+  chromothripsis_family  <- chromothripsis + non_canonical_chromothripsis
+  seismic_amplification  <- seismic_amplification  (no subtypes)
+  TIC                    <- TIC                    (no subtypes)
+
+Level 3 (subtype): 2-class prototypes within BFB_family and chromothripsis_family only.
+
+Training: single shared MetricProjection trained with a combined LOO loss at both levels
+simultaneously. Level 2 pulls family members together; Level 3 pushes canonical and
+non-canonical apart within each family. One optimizer, one backward pass per epoch.
+
+Inference: two-pass distance lookup — nearest family (Level 2) then nearest subtype within
+that family (Level 3). No additional learned parameters.
+"""
 
 from __future__ import annotations
 
@@ -30,8 +48,46 @@ from utils import set_seed
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Hierarchy definition
+# ---------------------------------------------------------------------------
+
+FAMILY_MAP: dict[str, str] = {
+    "BFB": "BFB_family",
+    "non_canonical_BFB": "BFB_family",
+    "chromothripsis": "chromothripsis_family",
+    "non_canonical_chromothripsis": "chromothripsis_family",
+    "seismic_amplification": "seismic_amplification",
+    "TIC": "TIC",
+}
+
+FAMILY_SUBTYPES: dict[str, list[str]] = {
+    "BFB_family": ["BFB", "non_canonical_BFB"],
+    "chromothripsis_family": ["chromothripsis", "non_canonical_chromothripsis"],
+}
+
+FAMILY_NAMES: list[str] = ["BFB_family", "chromothripsis_family", "seismic_amplification", "TIC"]
+
 SCAN_EVIDENCE_VALUES = {"chromosome_scan", "chromosome_arm_scan"}
 
+
+def _build_family_names(class_names: list[str]) -> list[str]:
+    """Return ordered family names covering all class_names, adding unknown classes as own families."""
+    seen: dict[str, None] = {}
+    for cn in class_names:
+        fam = FAMILY_MAP.get(cn, cn)
+        seen[fam] = None
+    # preserve the canonical order from FAMILY_NAMES, then append unknowns
+    result = [f for f in FAMILY_NAMES if f in seen]
+    for f in seen:
+        if f not in result:
+            result.append(f)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Metadata helpers
+# ---------------------------------------------------------------------------
 
 def _label_masks(metadata: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     labels = metadata["sv_class"].astype(str) if "sv_class" in metadata else pd.Series([""] * len(metadata))
@@ -62,7 +118,7 @@ def _type_targets(metadata: pd.DataFrame, class_names: list[str]) -> np.ndarray:
     targets = np.full(len(metadata), -1, dtype=np.int64)
     for i, label in enumerate(labels):
         if label:
-            targets[i] = class_to_idx[label]
+            targets[i] = class_to_idx.get(label, -1)
     return targets
 
 
@@ -74,15 +130,6 @@ def _class_counts(metadata: pd.DataFrame, labeled_mask: np.ndarray, class_names:
 
 def _parameter_count(model: torch.nn.Module) -> int:
     return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
-
-
-def make_model(input_dim: int, projection_dim: int, hidden_dim: int, dropout: float, device: torch.device) -> MetricProjection:
-    return MetricProjection(
-        in_dim=int(input_dim),
-        embed_dim=int(projection_dim),
-        hidden_dim=int(hidden_dim),
-        dropout=float(dropout),
-    ).to(device)
 
 
 def _class_weights(targets: np.ndarray, n_classes: int, mode: str) -> torch.Tensor | None:
@@ -102,12 +149,67 @@ def _class_weights(targets: np.ndarray, n_classes: int, mode: str) -> torch.Tens
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
+# ---------------------------------------------------------------------------
+# Hierarchy helpers (torch, used during training)
+# ---------------------------------------------------------------------------
+
+def _family_targets_torch(
+    y_class: torch.Tensor,
+    class_names: list[str],
+    family_names: list[str],
+) -> torch.Tensor:
+    """Map per-example class indices to family indices."""
+    result = torch.full_like(y_class, -1)
+    for class_idx, cn in enumerate(class_names):
+        fam = FAMILY_MAP.get(cn, cn)
+        if fam in family_names:
+            fam_idx = family_names.index(fam)
+            result[y_class == class_idx] = fam_idx
+    return result
+
+
+def _subtype_mask_and_targets(
+    y_class: torch.Tensor,
+    class_names: list[str],
+    family_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (bool mask, remapped 2-class subtype targets) for examples in family_name."""
+    subtypes = FAMILY_SUBTYPES.get(family_name, [])
+    mask = torch.zeros(len(y_class), dtype=torch.bool, device=y_class.device)
+    sub_targets = torch.full_like(y_class, -1)
+    for sub_idx, sub_name in enumerate(subtypes):
+        if sub_name in class_names:
+            ci = class_names.index(sub_name)
+            m = y_class == ci
+            mask |= m
+            sub_targets[m] = sub_idx
+    return mask, sub_targets[mask]
+
+
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
+def make_model(input_dim: int, projection_dim: int, hidden_dim: int, dropout: float, device: torch.device) -> MetricProjection:
+    return MetricProjection(
+        in_dim=int(input_dim),
+        embed_dim=int(projection_dim),
+        hidden_dim=int(hidden_dim),
+        dropout=float(dropout),
+    ).to(device)
+
+
+# ---------------------------------------------------------------------------
+# LOO prototype logits (used at both Level 2 and Level 3)
+# ---------------------------------------------------------------------------
+
 def _loo_prototype_logits(
     projected: torch.Tensor,
     targets: torch.Tensor,
     n_classes: int,
     temperature: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Squared-Euclidean LOO prototype logits. Returns (logits [N, C], usable mask [N])."""
     dim = int(projected.shape[1])
     sums = torch.zeros((int(n_classes), dim), dtype=projected.dtype, device=projected.device)
     sums.index_add_(0, targets, projected)
@@ -132,10 +234,15 @@ def _loo_prototype_logits(
     return logits, usable
 
 
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
 def train_projection(
     embeddings: np.ndarray,
     metadata: pd.DataFrame,
     class_names: list[str],
+    family_names: list[str],
     train_mask: np.ndarray,
     args: argparse.Namespace,
     device: torch.device,
@@ -151,17 +258,30 @@ def train_projection(
     if train_idx.size == 0:
         raise RuntimeError(f"No labeled rows available for {log_prefix}")
     train_targets_np = targets_all[train_idx]
-    counts = np.bincount(train_targets_np[train_targets_np >= 0], minlength=len(class_names))
-    if int((counts >= 2).sum()) < 2:
-        raise RuntimeError(f"Need at least two classes with two labels each for {log_prefix}; counts={counts.tolist()}")
+
+    # Need ≥2 families with ≥2 examples each for Level 2 LOO
+    family_targets_np = np.array([
+        family_names.index(FAMILY_MAP.get(class_names[t], class_names[t]))
+        if t >= 0 and FAMILY_MAP.get(class_names[t], class_names[t]) in family_names else -1
+        for t in train_targets_np
+    ], dtype=np.int64)
+    fam_counts = np.bincount(family_targets_np[family_targets_np >= 0], minlength=len(family_names))
+    if int((fam_counts >= 2).sum()) < 2:
+        raise RuntimeError(
+            f"Need at least two families with two examples each for {log_prefix}; family_counts={fam_counts.tolist()}"
+        )
 
     model = make_model(embeddings.shape[1], int(args.projection_dim), int(args.hidden_dim), float(args.dropout), device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+
     x_train = torch.as_tensor(embeddings[train_idx], dtype=torch.float32, device=device)
-    y_train = torch.as_tensor(train_targets_np, dtype=torch.long, device=device)
-    class_weight_t = _class_weights(train_targets_np, len(class_names), str(args.class_weighting))
-    if class_weight_t is not None:
-        class_weight_t = class_weight_t.to(device)
+    y_class = torch.as_tensor(train_targets_np, dtype=torch.long, device=device)
+    y_family = _family_targets_torch(y_class, class_names, family_names)
+
+    # Class weights for Level 2 (family-level)
+    family_weight_t = _class_weights(family_targets_np, len(family_names), str(args.class_weighting))
+    if family_weight_t is not None:
+        family_weight_t = family_weight_t.to(device)
 
     best_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
@@ -171,24 +291,65 @@ def train_projection(
     for epoch in range(1, int(epochs) + 1):
         model.train()
         opt.zero_grad(set_to_none=True)
-        projected = model(x_train)
-        logits, usable = _loo_prototype_logits(projected, y_train, len(class_names), float(args.temperature))
-        if not bool(usable.any()):
-            raise RuntimeError(f"No usable leave-one-out prototype queries for {log_prefix}")
-        loss = F.cross_entropy(
-            logits[usable],
-            y_train[usable],
-            weight=class_weight_t,
+
+        # Noise augmentation
+        if float(args.embedding_noise_sigma) > 0:
+            x_input = x_train + float(args.embedding_noise_sigma) * torch.randn_like(x_train)
+        else:
+            x_input = x_train
+        projected = model(x_input)
+
+        # Level 2: family LOO loss
+        usable_fam = y_family >= 0
+        if not usable_fam.any():
+            raise RuntimeError(f"No family-labeled rows for {log_prefix}")
+        logits_L2, usable_L2 = _loo_prototype_logits(
+            projected[usable_fam], y_family[usable_fam], len(family_names), float(args.temperature)
+        )
+        L2 = F.cross_entropy(
+            logits_L2[usable_L2],
+            y_family[usable_fam][usable_L2],
+            weight=family_weight_t,
             label_smoothing=float(args.label_smoothing),
         )
+        family_acc = float((torch.argmax(logits_L2[usable_L2], dim=1) == y_family[usable_fam][usable_L2]).float().mean().item())
+
+        # Level 3: per-family subtype LOO losses
+        L3 = torch.zeros((), dtype=projected.dtype, device=device)
+        subtype_accs: list[float] = []
+        for family_name in FAMILY_SUBTYPES:
+            if family_name not in family_names:
+                continue
+            fmask, sub_targets = _subtype_mask_and_targets(y_class, class_names, family_name)
+            if not fmask.any():
+                continue
+            sub_counts = torch.bincount(sub_targets, minlength=2)
+            if int((sub_counts >= 2).sum()) < 2:
+                continue
+            sub_proj = projected[fmask]
+            logits_L3, usable_L3 = _loo_prototype_logits(sub_proj, sub_targets, 2, float(args.temperature))
+            if not usable_L3.any():
+                continue
+            sub_weight = _class_weights(sub_targets.detach().cpu().numpy(), 2, str(args.class_weighting))
+            if sub_weight is not None:
+                sub_weight = sub_weight.to(device)
+            L3 = L3 + F.cross_entropy(
+                logits_L3[usable_L3],
+                sub_targets[usable_L3],
+                weight=sub_weight,
+                label_smoothing=float(args.label_smoothing),
+            )
+            subtype_accs.append(
+                float((torch.argmax(logits_L3[usable_L3], dim=1) == sub_targets[usable_L3]).float().mean().item())
+            )
+
+        loss = L2 + float(args.hierarchical_lambda) * L3
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
         opt.step()
 
-        with torch.no_grad():
-            pred = torch.argmax(logits[usable], dim=1)
-            acc = float((pred == y_train[usable]).float().mean().item())
         loss_value = float(loss.detach().cpu().item())
+        subtype_acc = float(np.mean(subtype_accs)) if subtype_accs else float("nan")
         improved = loss_value < best_loss - 1e-6
         if improved:
             best_loss = loss_value
@@ -197,28 +358,34 @@ def train_projection(
         else:
             patience_left -= 1
 
-        rows.append(
-            {
-                "epoch": int(epoch),
-                "loss": loss_value,
-                "loo_type_acc": acc,
-                "n_train_labeled": int(train_idx.size),
-                "n_usable_queries": int(usable.detach().cpu().numpy().sum()),
-                "is_best": bool(improved),
-                "split": log_prefix,
-            }
-        )
+        rows.append({
+            "epoch": int(epoch),
+            "loss": loss_value,
+            "family_loo_acc": family_acc,
+            "subtype_loo_acc": subtype_acc,
+            "n_train_labeled": int(train_idx.size),
+            "n_usable_family": int(usable_L2.detach().cpu().numpy().sum()),
+            "is_best": bool(improved),
+            "split": log_prefix,
+        })
         if log_prefix == "final" and (epoch == 1 or epoch % int(args.log_every) == 0 or epoch == int(epochs)):
-            log.info("epoch=%d loss=%.4f loo_acc=%.3f usable=%d", epoch, loss_value, acc, int(usable.sum().item()))
+            log.info(
+                "epoch=%d loss=%.4f family_acc=%.3f subtype_acc=%.3f",
+                epoch, loss_value, family_acc, subtype_acc,
+            )
         if int(patience) > 0 and patience_left <= 0:
             if log_prefix == "final":
-                log.info("Early stopping final few-shot projection at epoch %d; best loss %.4f", epoch, best_loss)
+                log.info("Early stopping at epoch %d; best loss %.4f", epoch, best_loss)
             break
 
     if best_state is not None:
         model.load_state_dict(best_state)
     return model, pd.DataFrame(rows)
 
+
+# ---------------------------------------------------------------------------
+# Inference helpers
+# ---------------------------------------------------------------------------
 
 def project_embeddings(
     model: MetricProjection,
@@ -235,17 +402,61 @@ def project_embeddings(
     return np.concatenate(rows, axis=0)
 
 
-def compute_prototypes(projected: np.ndarray, targets: np.ndarray, n_classes: int) -> tuple[np.ndarray, np.ndarray]:
+def compute_hierarchical_prototypes(
+    projected: np.ndarray,
+    type_targets: np.ndarray,
+    class_names: list[str],
+    family_names: list[str],
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Compute L2-normalized family and subtype prototype means.
+
+    Returns
+    -------
+    family_prototypes : [F, D]
+    family_counts : [F]
+    subtype_prototypes : dict family_name -> [S, D]
+    subtype_counts : dict family_name -> [S]
+    """
     dim = int(projected.shape[1])
-    prototypes = np.zeros((int(n_classes), dim), dtype=np.float32)
-    counts = np.bincount(targets[targets >= 0], minlength=int(n_classes)).astype(np.int64)
-    for class_idx in range(int(n_classes)):
-        mask = targets == class_idx
-        if bool(mask.any()):
+    n_fam = len(family_names)
+    family_prototypes = np.zeros((n_fam, dim), dtype=np.float32)
+    family_counts = np.zeros(n_fam, dtype=np.int64)
+
+    for fam_idx, fam_name in enumerate(family_names):
+        member_class_indices = [
+            ci for ci, cn in enumerate(class_names)
+            if FAMILY_MAP.get(cn, cn) == fam_name
+        ]
+        mask = np.zeros(len(type_targets), dtype=bool)
+        for ci in member_class_indices:
+            mask |= type_targets == ci
+        if mask.any():
             proto = projected[mask].mean(axis=0)
             norm = float(np.linalg.norm(proto))
-            prototypes[class_idx] = proto / norm if norm > 0 else proto
-    return prototypes, counts
+            family_prototypes[fam_idx] = proto / norm if norm > 0 else proto
+            family_counts[fam_idx] = int(mask.sum())
+
+    subtype_prototypes: dict[str, np.ndarray] = {}
+    subtype_counts: dict[str, np.ndarray] = {}
+    for fam_name, subtypes in FAMILY_SUBTYPES.items():
+        if fam_name not in family_names:
+            continue
+        n_sub = len(subtypes)
+        sub_protos = np.zeros((n_sub, dim), dtype=np.float32)
+        sub_cnts = np.zeros(n_sub, dtype=np.int64)
+        for sub_idx, sub_name in enumerate(subtypes):
+            if sub_name in class_names:
+                ci = class_names.index(sub_name)
+                mask = type_targets == ci
+                if mask.any():
+                    proto = projected[mask].mean(axis=0)
+                    norm = float(np.linalg.norm(proto))
+                    sub_protos[sub_idx] = proto / norm if norm > 0 else proto
+                    sub_cnts[sub_idx] = int(mask.sum())
+        subtype_prototypes[fam_name] = sub_protos
+        subtype_counts[fam_name] = sub_cnts
+
+    return family_prototypes, family_counts, subtype_prototypes, subtype_counts
 
 
 def _softmax_logits(logits: np.ndarray) -> np.ndarray:
@@ -257,48 +468,148 @@ def _softmax_logits(logits: np.ndarray) -> np.ndarray:
     return exp / denom
 
 
-def predict_with_prototypes(
+def predict_hierarchical(
     model: MetricProjection,
     embeddings: np.ndarray,
     metadata: pd.DataFrame,
     class_names: list[str],
-    prototypes: np.ndarray,
-    prototype_counts: np.ndarray,
+    family_prototypes: np.ndarray,
+    family_counts: np.ndarray,
+    subtype_prototypes: dict[str, np.ndarray],
+    subtype_counts: dict[str, np.ndarray],
     distance_tau: float,
     objectness_scale: float,
     temperature: float,
     device: torch.device,
     batch_size: int = 512,
+    family_names: list[str] | None = None,
 ) -> pd.DataFrame:
-    projected = project_embeddings(model, embeddings, device=device, batch_size=batch_size)
-    distances = np.sum((projected[:, None, :] - prototypes[None, :, :]) ** 2, axis=2).astype(np.float32)
-    absent = np.asarray(prototype_counts) <= 0
-    if absent.any():
-        distances[:, absent] = np.inf
-    logits = -distances / float(temperature)
-    logits[:, absent] = -1.0e9
-    type_probs = _softmax_logits(logits)
-    nearest_idx = np.argmin(distances, axis=1)
-    nearest_distance = distances[np.arange(distances.shape[0]), nearest_idx].astype(np.float32)
-    nearest_distance[~np.isfinite(nearest_distance)] = np.inf
-    objectness_prob = 1.0 / (1.0 + np.exp(-float(objectness_scale) * (float(distance_tau) - nearest_distance)))
-    objectness_prob[~np.isfinite(objectness_prob)] = 0.0
-    type_idx = np.argmax(type_probs, axis=1)
-    labeled_mask, background_mask = _label_masks(metadata)
+    if family_names is None:
+        family_names = _build_family_names(class_names)
 
+    projected = project_embeddings(model, embeddings, device=device, batch_size=batch_size)
+    N = projected.shape[0]
+
+    # ---- Level 2: family distances ----
+    absent_fam = np.asarray(family_counts) <= 0
+    family_distances = np.sum(
+        (projected[:, None, :] - family_prototypes[None, :, :]) ** 2, axis=2
+    ).astype(np.float32)  # [N, F]
+    family_distances[:, absent_fam] = np.inf
+
+    family_logits = -family_distances / float(temperature)
+    family_logits[:, absent_fam] = -1.0e9
+    family_probs = _softmax_logits(family_logits)  # [N, F]
+
+    nearest_family_idx = np.argmin(family_distances, axis=1)  # [N]
+    nearest_family_distance = family_distances[np.arange(N), nearest_family_idx].astype(np.float32)
+    nearest_family_distance[~np.isfinite(nearest_family_distance)] = np.inf
+
+    objectness_prob = 1.0 / (1.0 + np.exp(
+        -float(objectness_scale) * (float(distance_tau) - nearest_family_distance)
+    ))
+    objectness_prob[~np.isfinite(objectness_prob)] = 0.0
+
+    # ---- Level 3: subtype distances (vectorised per-family) ----
+    type_predicted_class = np.full(N, "", dtype=object)
+    max_type_probability = np.zeros(N, dtype=np.float32)
+    is_canonical = np.full(N, "", dtype=object)
+
+    # initialise per-class probability and distance columns
+    type_prob_cols: dict[str, np.ndarray] = {cn: np.zeros(N, dtype=np.float32) for cn in class_names}
+    proto_dist_cols: dict[str, np.ndarray] = {cn: np.full(N, np.inf, dtype=np.float32) for cn in class_names}
+
+    for fam_idx, fam_name in enumerate(family_names):
+        fam_mask = nearest_family_idx == fam_idx
+        if not fam_mask.any():
+            continue
+        global_indices = np.where(fam_mask)[0]
+        fam_proj = projected[fam_mask]  # [M, D]
+
+        if fam_name in FAMILY_SUBTYPES:
+            subtypes = FAMILY_SUBTYPES[fam_name]
+            sub_protos = subtype_prototypes.get(fam_name)
+            sub_cnts = subtype_counts.get(fam_name)
+            if sub_protos is None or sub_cnts is None:
+                # fallback: treat family as its own single class
+                type_predicted_class[global_indices] = fam_name
+                max_type_probability[global_indices] = family_probs[global_indices, fam_idx]
+                is_canonical[global_indices] = "True"
+                continue
+
+            sub_absent = sub_cnts <= 0
+            sub_dists = np.sum(
+                (fam_proj[:, None, :] - sub_protos[None, :, :]) ** 2, axis=2
+            ).astype(np.float32)  # [M, S]
+            sub_dists[:, sub_absent] = np.inf
+
+            sub_logits = -sub_dists / float(temperature)
+            sub_logits[:, sub_absent] = -1.0e9
+            sub_probs = _softmax_logits(sub_logits)  # [M, S]
+
+            nearest_sub = np.argmin(sub_dists, axis=1)  # [M]
+
+            for m_i, g_i in enumerate(global_indices):
+                sub_idx = int(nearest_sub[m_i])
+                sub_name = subtypes[sub_idx] if sub_idx < len(subtypes) else fam_name
+                type_predicted_class[g_i] = sub_name
+                fam_prob = float(family_probs[g_i, fam_idx])
+                max_type_probability[g_i] = float(fam_prob * sub_probs[m_i, sub_idx])
+                is_canonical[g_i] = str("non_canonical" not in sub_name)
+
+            # populate per-class columns for all subtypes
+            for si, sn in enumerate(subtypes):
+                if sn in type_prob_cols:
+                    fam_prob_vec = family_probs[global_indices, fam_idx]
+                    type_prob_cols[sn][global_indices] = (fam_prob_vec * sub_probs[:, si]).astype(np.float32)
+                    proto_dist_cols[sn][global_indices] = sub_dists[:, si]
+        else:
+            # seismic_amplification / TIC: family IS the final class
+            type_predicted_class[global_indices] = fam_name
+            max_type_probability[global_indices] = family_probs[global_indices, fam_idx].astype(np.float32)
+            is_canonical[global_indices] = "True"
+            if fam_name in type_prob_cols:
+                type_prob_cols[fam_name][global_indices] = family_probs[global_indices, fam_idx].astype(np.float32)
+                proto_dist_cols[fam_name][global_indices] = nearest_family_distance[global_indices]
+
+    # ---- Multi-label: per-family objectness (for predicted_families column) ----
+    objectness_tau_default = 0.5
+    per_fam_obj = 1.0 / (1.0 + np.exp(
+        -float(objectness_scale) * (float(distance_tau) - family_distances)
+    ))  # [N, F]
+    per_fam_obj[~np.isfinite(per_fam_obj)] = 0.0
+    predicted_families_list: list[str] = []
+    for i in range(N):
+        active = [
+            family_names[fi]
+            for fi in range(len(family_names))
+            if float(per_fam_obj[i, fi]) >= objectness_tau_default and not np.isinf(family_distances[i, fi])
+        ]
+        predicted_families_list.append(",".join(active))
+
+    # ---- Assemble output DataFrame ----
+    labeled_mask, background_mask = _label_masks(metadata)
     out = metadata.copy()
     out["is_labeled"] = labeled_mask.astype(int)
     out["is_background_chromosome"] = background_mask.astype(int)
     out["true_class"] = out["sv_class"].astype(str) if "sv_class" in out else ""
-    out["nearest_prototype_class"] = [class_names[int(i)] for i in nearest_idx]
-    out["nearest_prototype_distance"] = nearest_distance.astype(float)
-    out["objectness_logit"] = (float(objectness_scale) * (float(distance_tau) - nearest_distance)).astype(float)
+    out["nearest_prototype_class"] = [family_names[int(fi)] for fi in nearest_family_idx]
+    out["nearest_prototype_distance"] = nearest_family_distance.astype(float)
+    out["objectness_logit"] = (float(objectness_scale) * (float(distance_tau) - nearest_family_distance)).astype(float)
     out["objectness_prob"] = objectness_prob.astype(float)
-    out["type_predicted_class"] = [class_names[int(i)] for i in type_idx]
-    out["max_type_probability"] = type_probs.max(axis=1).astype(float)
-    for i, class_name in enumerate(class_names):
-        out[f"type_probability_{class_name}"] = type_probs[:, i].astype(float)
-        out[f"prototype_distance_{class_name}"] = distances[:, i].astype(float)
+    out["type_predicted_class"] = type_predicted_class.tolist()
+    out["max_type_probability"] = max_type_probability.astype(float)
+    out["predicted_families"] = predicted_families_list
+    out["is_canonical"] = is_canonical.tolist()
+
+    for cn in class_names:
+        out[f"type_probability_{cn}"] = type_prob_cols[cn]
+        out[f"prototype_distance_{cn}"] = proto_dist_cols[cn]
+
+    for fi, fn in enumerate(family_names):
+        out[f"family_probability_{fn}"] = family_probs[:, fi].astype(float)
+        out[f"family_distance_{fn}"] = family_distances[:, fi].astype(float)
+
     return out
 
 
@@ -335,7 +646,7 @@ def fewshot_predictions_to_distance_table(predictions: pd.DataFrame, class_names
     objectness = out["objectness_prob"].astype(float).to_numpy()
     max_type = out["max_type_probability"].astype(float).to_numpy()
     called = out["predicted_class"].astype(str).to_numpy() != "none"
-    out["distance_source"] = "fewshot_prototype"
+    out["distance_source"] = "fewshot_hierarchical_prototype"
     out["prototype_confidence"] = np.where(called, objectness * max_type, 0.0)
     for class_name in class_names:
         src = f"prototype_distance_{class_name}"
@@ -343,6 +654,10 @@ def fewshot_predictions_to_distance_table(predictions: pd.DataFrame, class_names
             out[f"d_{class_name}"] = out[src].astype(float)
     return out
 
+
+# ---------------------------------------------------------------------------
+# Tau calibration
+# ---------------------------------------------------------------------------
 
 def sweep_distance_tau(score_df: pd.DataFrame, tau_grid: np.ndarray) -> pd.DataFrame:
     if score_df.empty:
@@ -371,23 +686,21 @@ def sweep_distance_tau(score_df: pd.DataFrame, tau_grid: np.ndarray) -> pd.DataF
         typed_recall = typed_tp / int(y.sum()) if int(y.sum()) else 0.0
         typed_f1 = (2 * typed_precision * typed_recall / (typed_precision + typed_recall)) if typed_precision + typed_recall else 0.0
         type_accuracy_called_positives = typed_tp / tp if tp else 0.0
-        rows.append(
-            {
-                "distance_tau": float(tau),
-                "precision": float(precision),
-                "recall": float(recall),
-                "f1": float(f1),
-                "typed_precision": float(typed_precision),
-                "typed_recall": float(typed_recall),
-                "typed_f1": float(typed_f1),
-                "type_accuracy_called_positives": float(type_accuracy_called_positives),
-                "tp": tp,
-                "fp": fp,
-                "fn": fn,
-                "tn": tn,
-                "typed_tp": typed_tp,
-            }
-        )
+        rows.append({
+            "distance_tau": float(tau),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "typed_precision": float(typed_precision),
+            "typed_recall": float(typed_recall),
+            "typed_f1": float(typed_f1),
+            "type_accuracy_called_positives": float(type_accuracy_called_positives),
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "tn": tn,
+            "typed_tp": typed_tp,
+        })
     return pd.DataFrame(rows)
 
 
@@ -402,10 +715,15 @@ def choose_distance_tau(tau_df: pd.DataFrame, metric: str = "typed_f1") -> float
     return float(ranked.iloc[0]["distance_tau"])
 
 
+# ---------------------------------------------------------------------------
+# Leave-one-sample-out cross-validation
+# ---------------------------------------------------------------------------
+
 def run_leave_one_sample_out(
     embeddings: np.ndarray,
     metadata: pd.DataFrame,
     class_names: list[str],
+    family_names: list[str],
     args: argparse.Namespace,
     device: torch.device,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -422,13 +740,14 @@ def run_leave_one_sample_out(
         train_mask = samples != held_sample
         train_labels = labeled_mask & train_mask
         if int(train_labels.sum()) == 0:
-            log.warning("Skipping LOSO fold for %s; no labels remain in training fold", held_sample)
+            log.warning("Skipping LOSO fold for %s; no labels remain", held_sample)
             continue
         try:
             model, metrics = train_projection(
                 embeddings,
                 metadata,
                 class_names,
+                family_names,
                 train_mask=train_mask,
                 args=args,
                 device=device,
@@ -444,25 +763,37 @@ def run_leave_one_sample_out(
         train_metrics.append(metrics)
 
         projected_train = project_embeddings(model, embeddings[train_labels], device=device, batch_size=int(args.batch_size))
-        prototypes, counts = compute_prototypes(projected_train, targets[train_labels], len(class_names))
-        pred = predict_with_prototypes(
+        fam_protos, fam_counts, sub_protos, sub_counts = compute_hierarchical_prototypes(
+            projected_train, targets[train_labels], class_names, family_names
+        )
+        pred = predict_hierarchical(
             model,
             embeddings,
             metadata,
             class_names,
-            prototypes,
-            counts,
+            fam_protos,
+            fam_counts,
+            sub_protos,
+            sub_counts,
             distance_tau=0.5,
             objectness_scale=float(args.objectness_scale),
             temperature=float(args.temperature),
             device=device,
             batch_size=int(args.batch_size),
+            family_names=family_names,
         )
         eval_mask = (samples == held_sample) & (labeled_mask | background_mask)
         fold = pred.loc[eval_mask].copy()
         fold["held_out_sample"] = held_sample
         fold["train_n_labeled"] = int(train_labels.sum())
-        fold["train_class_counts"] = json.dumps(_class_counts(metadata.loc[train_mask].reset_index(drop=True), _label_masks(metadata.loc[train_mask].reset_index(drop=True))[0], class_names), sort_keys=True)
+        fold["train_class_counts"] = json.dumps(
+            _class_counts(
+                metadata.loc[train_mask].reset_index(drop=True),
+                _label_masks(metadata.loc[train_mask].reset_index(drop=True))[0],
+                class_names,
+            ),
+            sort_keys=True,
+        )
         rows.append(fold)
 
     cv_predictions = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -470,22 +801,32 @@ def run_leave_one_sample_out(
     return cv_predictions, cv_metrics
 
 
+# ---------------------------------------------------------------------------
+# Plotting helpers
+# ---------------------------------------------------------------------------
+
 def _plot_training(metrics: pd.DataFrame, output_path: Path) -> None:
     if metrics.empty:
         return
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.2))
-    axes[0].plot(metrics["epoch"], metrics["loss"], label="loss")
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2))
+    axes[0].plot(metrics["epoch"], metrics["loss"], label="total loss")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
-    axes[0].set_title("Few-Shot Projection Loss")
+    axes[0].set_title("Hierarchical Few-Shot Loss")
     axes[0].grid(alpha=0.2)
     axes[0].legend(fontsize=8)
-    axes[1].plot(metrics["epoch"], metrics["loo_type_acc"], label="LOO type acc")
+    axes[1].plot(metrics["epoch"], metrics["family_loo_acc"], label="family LOO acc (L2)")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylim(-0.03, 1.03)
-    axes[1].set_title("Training Leave-One-Out Accuracy")
+    axes[1].set_title("Level 2: Family LOO Accuracy")
     axes[1].grid(alpha=0.2)
     axes[1].legend(fontsize=8)
+    axes[2].plot(metrics["epoch"], metrics["subtype_loo_acc"], label="subtype LOO acc (L3)", color="tab:orange")
+    axes[2].set_xlabel("Epoch")
+    axes[2].set_ylim(-0.03, 1.03)
+    axes[2].set_title("Level 3: Subtype LOO Accuracy")
+    axes[2].grid(alpha=0.2)
+    axes[2].legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)
@@ -500,11 +841,11 @@ def _plot_tau(tau_df: pd.DataFrame, output_path: Path, selected_tau: float) -> N
     ax.plot(tau_df["distance_tau"], tau_df["f1"], label="F1")
     if "typed_f1" in tau_df:
         ax.plot(tau_df["distance_tau"], tau_df["typed_f1"], label="typed F1")
-    ax.axvline(float(selected_tau), color="black", linestyle=":", linewidth=1.2, label=f"selected distance={selected_tau:.3g}")
-    ax.set_xlabel("Nearest-prototype distance threshold")
+    ax.axvline(float(selected_tau), color="black", linestyle=":", linewidth=1.2, label=f"selected tau={selected_tau:.3g}")
+    ax.set_xlabel("Nearest-family distance threshold")
     ax.set_ylabel("Score")
     ax.set_ylim(-0.03, 1.03)
-    ax.set_title("Leave-One-Sample-Out Distance Sweep")
+    ax.set_title("LOSO Distance Sweep (family-level tau)")
     ax.grid(alpha=0.2)
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -526,13 +867,14 @@ def _plot_validation_confusion(predictions: pd.DataFrame, class_names: list[str]
     ax.set_xticklabels(cols, rotation=35, ha="right", fontsize=8)
     ax.set_yticks(np.arange(len(class_names)))
     ax.set_yticklabels(class_names, fontsize=8)
-    ax.set_xlabel("Predicted class")
-    ax.set_ylabel("GT class")
-    ax.set_title("Held-Out Few-Shot Predictions")
+    ax.set_xlabel("Predicted class (Level 3 subtype)")
+    ax.set_ylabel("True class")
+    ax.set_title("Held-Out Hierarchical Few-Shot Predictions")
     max_value = max(float(table.to_numpy().max()), 1.0)
     for i in range(table.shape[0]):
         for j in range(table.shape[1]):
-            ax.text(j, i, str(int(table.iat[i, j])), ha="center", va="center", color="white" if table.iat[i, j] > max_value * 0.45 else "black", fontsize=9)
+            ax.text(j, i, str(int(table.iat[i, j])), ha="center", va="center",
+                    color="white" if table.iat[i, j] > max_value * 0.45 else "black", fontsize=9)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Count")
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
@@ -548,11 +890,12 @@ def _plot_objectness_scores(predictions: pd.DataFrame, output_path: Path, select
     eligible = eligible.sort_values("nearest_prototype_distance", ascending=True).reset_index(drop=True)
     colors = np.where(eligible["is_labeled"].astype(bool), "#c43b3b", "#4a78b8")
     fig, ax = plt.subplots(figsize=(8.5, 4.4))
-    ax.scatter(np.arange(len(eligible)), eligible["nearest_prototype_distance"].astype(float), c=colors, s=18, alpha=0.85, linewidths=0)
-    ax.axhline(float(selected_tau), color="black", linestyle=":", linewidth=1.2, label=f"distance={selected_tau:.3g}")
-    ax.set_xlabel("Held-out rows sorted by nearest-prototype distance")
-    ax.set_ylabel("Nearest-prototype distance")
-    ax.set_title("Held-Out Few-Shot Distances")
+    ax.scatter(np.arange(len(eligible)), eligible["nearest_prototype_distance"].astype(float),
+               c=colors, s=18, alpha=0.85, linewidths=0)
+    ax.axhline(float(selected_tau), color="black", linestyle=":", linewidth=1.2, label=f"family tau={selected_tau:.3g}")
+    ax.set_xlabel("Held-out rows sorted by nearest-family distance")
+    ax.set_ylabel("Nearest-family distance")
+    ax.set_title("Held-Out Hierarchical Few-Shot Distances")
     ax.grid(axis="y", alpha=0.2)
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -574,8 +917,11 @@ def _write_prediction_view(predictions: pd.DataFrame, class_names: list[str], ou
             "called_complex_sv": bool(row.get("called_complex_sv", False)),
             "objectness_prob": float(row.get("objectness_prob", 0.0)),
             "nearest_prototype_distance": float(row.get("nearest_prototype_distance", np.inf)),
+            "nearest_family": row.get("nearest_prototype_class", ""),
             "type_predicted_class": row.get("type_predicted_class", ""),
             "max_type_probability": float(row.get("max_type_probability", 0.0)),
+            "predicted_families": row.get("predicted_families", ""),
+            "is_canonical": row.get("is_canonical", ""),
             "evidence": row.get("evidence", ""),
             "candidate_scope": row.get("candidate_scope", row.get("label_scope", "")),
             "true_class": row.get("true_class", ""),
@@ -585,6 +931,10 @@ def _write_prediction_view(predictions: pd.DataFrame, class_names: list[str], ou
         rows.append(out)
     pd.DataFrame(rows).to_csv(output_path, sep="\t", index=False)
 
+
+# ---------------------------------------------------------------------------
+# Main training entry point
+# ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -597,19 +947,21 @@ def run(args: argparse.Namespace) -> None:
     embeddings, metadata = enforce_candidate_resolution(embeddings, metadata, args.candidate_resolution)
     labeled_mask, background_mask = _label_masks(metadata)
     if int(labeled_mask.sum()) < 4:
-        raise RuntimeError("Need at least four labeled embeddings for few-shot prototype training")
+        raise RuntimeError("Need at least four labeled embeddings for hierarchical few-shot training")
     class_names = _parse_class_names(args.class_names, metadata, labeled_mask)
+    family_names = _build_family_names(class_names)
     class_counts = _class_counts(metadata, labeled_mask, class_names)
-    observed_classes = [name for name, count in class_counts.items() if count > 0]
-    if len(observed_classes) < 2:
-        raise RuntimeError(f"Need at least two observed classes; observed {class_counts}")
+    log.info(
+        "device=%s embeddings=%s class_counts=%s family_names=%s background=%d",
+        device, embeddings.shape, class_counts, family_names, int(background_mask.sum()),
+    )
 
-    log.info("Using device=%s; input embeddings=%s labels=%s background=%s", device, embeddings.shape, class_counts, int(background_mask.sum()))
     all_train_mask = np.ones(len(metadata), dtype=bool)
     final_model, training_metrics = train_projection(
         embeddings,
         metadata,
         class_names,
+        family_names,
         train_mask=all_train_mask,
         args=args,
         device=device,
@@ -629,11 +981,21 @@ def run(args: argparse.Namespace) -> None:
         tau_df = pd.DataFrame()
         selected_distance_tau = float(args.distance_tau) if args.distance_tau is not None else 0.5
     else:
-        cv_predictions, cv_training_metrics = run_leave_one_sample_out(embeddings, metadata, class_names, args, device)
+        cv_predictions, cv_training_metrics = run_leave_one_sample_out(
+            embeddings, metadata, class_names, family_names, args, device
+        )
         cv_training_metrics.to_csv(out_dir / "loso_training_metrics.tsv", sep="\t", index=False)
         tau_df = sweep_distance_tau(cv_predictions, tau_grid)
-        selected_distance_tau = float(args.distance_tau) if args.distance_tau is not None else choose_distance_tau(tau_df, metric=str(args.tau_selection_metric))
-        cv_annotated = annotate_predictions(cv_predictions, selected_distance_tau, float(args.objectness_scale), objectness_tau=0.5) if not cv_predictions.empty else cv_predictions
+        selected_distance_tau = (
+            float(args.distance_tau)
+            if args.distance_tau is not None
+            else choose_distance_tau(tau_df, metric=str(args.tau_selection_metric))
+        )
+        cv_annotated = (
+            annotate_predictions(cv_predictions, selected_distance_tau, float(args.objectness_scale), objectness_tau=0.5)
+            if not cv_predictions.empty
+            else cv_predictions
+        )
         cv_predictions.to_csv(out_dir / "leave_one_sample_out_raw.tsv", sep="\t", index=False)
         cv_annotated.to_csv(out_dir / "leave_one_sample_out.tsv", sep="\t", index=False)
         tau_df.to_csv(out_dir / "distance_tau_sweep.tsv", sep="\t", index=False)
@@ -643,19 +1005,25 @@ def run(args: argparse.Namespace) -> None:
 
     targets = _type_targets(metadata, class_names)
     projected_labeled = project_embeddings(final_model, embeddings[labeled_mask], device=device, batch_size=int(args.batch_size))
-    prototypes, prototype_counts = compute_prototypes(projected_labeled, targets[labeled_mask], len(class_names))
-    predictions = predict_with_prototypes(
+    fam_protos, fam_counts, sub_protos, sub_counts = compute_hierarchical_prototypes(
+        projected_labeled, targets[labeled_mask], class_names, family_names
+    )
+
+    predictions = predict_hierarchical(
         final_model,
         embeddings,
         metadata,
         class_names,
-        prototypes,
-        prototype_counts,
+        fam_protos,
+        fam_counts,
+        sub_protos,
+        sub_counts,
         distance_tau=selected_distance_tau,
         objectness_scale=float(args.objectness_scale),
         temperature=float(args.temperature),
         device=device,
         batch_size=int(args.batch_size),
+        family_names=family_names,
     )
     predictions = annotate_predictions(predictions, selected_distance_tau, float(args.objectness_scale), objectness_tau=0.5)
     predictions.to_csv(out_dir / "classification_predictions.tsv", sep="\t", index=False)
@@ -665,7 +1033,11 @@ def run(args: argparse.Namespace) -> None:
 
     compatibility_distances = fewshot_predictions_to_distance_table(predictions, class_names)
     compatibility_distances.to_csv(out_dir / "prototype_distances.tsv", sep="\t", index=False)
-    compatibility_loo = fewshot_predictions_to_distance_table(cv_annotated, class_names) if not cv_annotated.empty else pd.DataFrame()
+    compatibility_loo = (
+        fewshot_predictions_to_distance_table(cv_annotated, class_names)
+        if not cv_annotated.empty
+        else pd.DataFrame()
+    )
     compatibility_loo.to_csv(out_dir / "anchor_leave_one_out.tsv", sep="\t", index=False)
     embed_corpus.write_visualizations(
         embeddings,
@@ -678,16 +1050,23 @@ def run(args: argparse.Namespace) -> None:
 
     parameter_count = _parameter_count(final_model)
     architecture = {
-        "model": "MetricProjection + nearest class prototypes",
+        "model": "MetricProjection + hierarchical family/subtype prototypes",
         "input_dim": int(embeddings.shape[1]),
         "hidden_dim": int(args.hidden_dim),
         "projection_dim": int(args.projection_dim),
         "dropout": float(args.dropout),
         "normalization": "L2-normalized projected embeddings and prototypes",
-        "distance": "squared Euclidean",
-        "type_probabilities": f"softmax(-distance / {float(args.temperature):.6g})",
-        "objectness": f"sigmoid({float(args.objectness_scale):.6g} * (selected_distance_tau - nearest_distance))",
+        "level2_distance": "squared Euclidean to family prototypes",
+        "level3_distance": "squared Euclidean to subtype prototypes within family",
+        "family_names": family_names,
+        "family_subtypes": FAMILY_SUBTYPES,
+        "objectness": f"sigmoid({float(args.objectness_scale):.6g} * (family_tau - nearest_family_distance))",
     }
+
+    # serialise subtype prototype tensors for checkpoint
+    sub_protos_serialised = {k: torch.as_tensor(v, dtype=torch.float32) for k, v in sub_protos.items()}
+    sub_counts_serialised = {k: torch.as_tensor(v, dtype=torch.long) for k, v in sub_counts.items()}
+
     torch.save(
         {
             "model_state_dict": final_model.state_dict(),
@@ -697,28 +1076,38 @@ def run(args: argparse.Namespace) -> None:
             "dropout": float(args.dropout),
             "class_names": class_names,
             "class_counts": class_counts,
-            "prototype_vectors": torch.as_tensor(prototypes, dtype=torch.float32),
-            "prototype_counts": torch.as_tensor(prototype_counts, dtype=torch.long),
+            "family_map": FAMILY_MAP,
+            "family_names": family_names,
+            "family_prototype_vectors": torch.as_tensor(fam_protos, dtype=torch.float32),
+            "family_prototype_counts": torch.as_tensor(fam_counts, dtype=torch.long),
+            "subtype_prototype_vectors": sub_protos_serialised,
+            "subtype_prototype_counts": sub_counts_serialised,
             "selected_distance_tau": float(selected_distance_tau),
             "objectness_tau": 0.5,
             "objectness_scale": float(args.objectness_scale),
             "temperature": float(args.temperature),
+            "hierarchical_lambda": float(args.hierarchical_lambda),
+            "embedding_noise_sigma": float(args.embedding_noise_sigma),
             "parameter_count": int(parameter_count),
             "architecture": architecture,
             "config": vars(args),
         },
         out_dir / "fewshot_classification_head.pt",
     )
+
     summary: dict[str, Any] = {
         "architecture": architecture,
         "parameter_count": int(parameter_count),
         "class_names": class_names,
         "class_counts": class_counts,
-        "prototype_counts": {name: int(prototype_counts[i]) for i, name in enumerate(class_names)},
+        "family_names": family_names,
+        "family_counts": {fn: int(fam_counts[fi]) for fi, fn in enumerate(family_names)},
         "selected_distance_tau": float(selected_distance_tau),
         "objectness_tau": 0.5,
         "objectness_scale": float(args.objectness_scale),
         "temperature": float(args.temperature),
+        "hierarchical_lambda": float(args.hierarchical_lambda),
+        "embedding_noise_sigma": float(args.embedding_noise_sigma),
         "tau_selection_metric": str(args.tau_selection_metric),
         "n_labeled": int(labeled_mask.sum()),
         "n_background": int(background_mask.sum()),
@@ -726,21 +1115,24 @@ def run(args: argparse.Namespace) -> None:
     }
     if not tau_df.empty:
         best_row = tau_df.loc[(tau_df["distance_tau"] - float(selected_distance_tau)).abs().idxmin()].to_dict()
-        summary["selected_tau_metrics"] = {k: (float(v) if isinstance(v, (int, float, np.integer, np.floating)) else v) for k, v in best_row.items()}
+        summary["selected_tau_metrics"] = {
+            k: (float(v) if isinstance(v, (int, float, np.integer, np.floating)) else v)
+            for k, v in best_row.items()
+        }
     with (out_dir / "training_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
-    log.info("Wrote few-shot classifier outputs to %s; called=%d/%d", out_dir, int(called.shape[0]), len(predictions))
+    log.info("Wrote hierarchical few-shot outputs to %s; called=%d/%d", out_dir, int(called.shape[0]), len(predictions))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--embeddings_npz", required=True, help="Input embeddings.npz from prototype-mode inference/anchors.")
-    parser.add_argument("--metadata_tsv", default=None, help="Optional candidate_embeddings.tsv; otherwise metadata is read from NPZ arrays.")
+    parser.add_argument("--embeddings_npz", required=True)
+    parser.add_argument("--metadata_tsv", default=None)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--candidate_resolution", choices=("auto", "chromosome-arm", "any"), default="chromosome-arm")
-    parser.add_argument("--class_names", default=",".join(DEFAULT_CLASS_NAMES), help="Comma-separated output class order.")
+    parser.add_argument("--class_names", default=",".join(DEFAULT_CLASS_NAMES))
     parser.add_argument("--projection_dim", type=int, default=64)
-    parser.add_argument("--hidden_dim", type=int, default=128, help="Set to 0 for a linear projection.")
+    parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--objectness_scale", type=float, default=12.0)
@@ -756,13 +1148,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--distance_tau_min", type=float, default=0.0)
     parser.add_argument("--distance_tau_max", type=float, default=4.0)
     parser.add_argument("--distance_tau_steps", type=int, default=161)
-    parser.add_argument("--distance_tau", type=float, default=None, help="Override calibrated nearest-prototype distance threshold.")
+    parser.add_argument("--distance_tau", type=float, default=None)
     parser.add_argument("--tau_selection_metric", choices=("f1", "typed_f1", "precision", "recall"), default="typed_f1")
-    parser.add_argument("--skip_loso", action="store_true", help="Skip leave-one-sample-out calibration and use --distance_tau or 0.5.")
+    parser.add_argument("--skip_loso", action="store_true")
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log_every", type=int, default=25)
+    parser.add_argument("--embedding_noise_sigma", type=float, default=0.02,
+                        help="Gaussian noise std added to training embeddings each epoch (0=disabled).")
+    parser.add_argument("--hierarchical_lambda", type=float, default=0.5,
+                        help="Weight for Level 3 subtype LOO loss relative to Level 2 family loss.")
     return parser.parse_args(argv)
 
 

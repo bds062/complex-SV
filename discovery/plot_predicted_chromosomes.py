@@ -635,11 +635,17 @@ def plot_chromosome_prediction(
     class_color = CLASS_COLORS.get(top_pred, "#4E79A7")
     highlight_color = {"HIGH": "#C83232", "LOW": "#D89021"}.get(confidence.upper(), class_color)
     score_text = _format_score_text(row, pred_classes)
+    count_text = f"{len(segs)} CN segments, {len(sv_chr)} SV records"
     title_lines = [f"{sample_id} {region}: predicted {pred}"]
     if highlight_label:
         shatterseek_label = "ShatterSeek" + (f" {confidence}" if confidence else "")
         title_lines.append(f"{shatterseek_label}: {highlight_label}")
-    title_lines.append(f"{score_text} | {len(segs)} CN segments, {len(sv_chr)} SV records")
+    if " | type_probs" in score_text:
+        score_main, score_types = score_text.split(" | type_probs", 1)
+        title_lines.append(f"{score_main} | {count_text}")
+        title_lines.append(f"type_probs{score_types}")
+    else:
+        title_lines.append(f"{score_text} | {count_text}")
     title = "\n".join(title_lines)
     fig.suptitle(title, x=0.5, y=0.985, fontsize=12, color="black")
     fig.patch.set_facecolor("white")

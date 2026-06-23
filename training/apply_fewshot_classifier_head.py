@@ -1,4 +1,4 @@
-"""Apply a trained few-shot prototypical classifier to saved complex-SV embeddings."""
+"""Apply a trained hierarchical few-shot prototypical classifier to saved complex-SV embeddings."""
 
 from __future__ import annotations
 
@@ -20,9 +20,11 @@ from discovery import embed_corpus
 from model.heads import MetricProjection
 from training.train_classifier_head import enforce_candidate_resolution, load_embedding_table
 from training.train_fewshot_classifier_head import (
+    FAMILY_NAMES,
+    _build_family_names,
     annotate_predictions,
     fewshot_predictions_to_distance_table,
-    predict_with_prototypes,
+    predict_hierarchical,
     _parameter_count,
     _write_prediction_view,
 )
@@ -30,25 +32,29 @@ from utils import torch_load_checkpoint
 
 log = logging.getLogger(__name__)
 
+_REQUIRED_CHECKPOINT_KEYS = [
+    "model_state_dict",
+    "input_dim",
+    "projection_dim",
+    "hidden_dim",
+    "dropout",
+    "class_names",
+    "family_prototype_vectors",
+    "family_prototype_counts",
+    "subtype_prototype_vectors",
+    "subtype_prototype_counts",
+]
+
 
 def _load_model(checkpoint_path: str | Path, device: torch.device) -> tuple[MetricProjection, dict[str, Any]]:
     checkpoint = torch_load_checkpoint(checkpoint_path, map_location=device)
-    missing = [
-        key
-        for key in [
-            "model_state_dict",
-            "input_dim",
-            "projection_dim",
-            "hidden_dim",
-            "dropout",
-            "class_names",
-            "prototype_vectors",
-            "prototype_counts",
-        ]
-        if key not in checkpoint
-    ]
+    missing = [k for k in _REQUIRED_CHECKPOINT_KEYS if k not in checkpoint]
     if missing:
-        raise KeyError(f"Few-shot checkpoint missing required key(s): {missing}; checkpoint={checkpoint_path}")
+        raise KeyError(
+            f"Checkpoint missing keys: {missing}. "
+            f"This checkpoint may be from the old flat few-shot model — please retrain with the new hierarchical code. "
+            f"checkpoint={checkpoint_path}"
+        )
     model = MetricProjection(
         in_dim=int(checkpoint["input_dim"]),
         embed_dim=int(checkpoint["projection_dim"]),
@@ -67,9 +73,20 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
 
     model, checkpoint = _load_model(args.checkpoint, device)
-    class_names = [str(name) for name in checkpoint["class_names"]]
-    prototypes = checkpoint["prototype_vectors"].detach().cpu().numpy()
-    prototype_counts = checkpoint["prototype_counts"].detach().cpu().numpy()
+    class_names = [str(n) for n in checkpoint["class_names"]]
+    family_names = [str(n) for n in checkpoint.get("family_names", _build_family_names(class_names))]
+
+    family_prototypes = checkpoint["family_prototype_vectors"].detach().cpu().numpy()
+    family_counts = checkpoint["family_prototype_counts"].detach().cpu().numpy()
+    subtype_prototypes = {
+        k: v.detach().cpu().numpy()
+        for k, v in checkpoint["subtype_prototype_vectors"].items()
+    }
+    subtype_counts = {
+        k: v.detach().cpu().numpy()
+        for k, v in checkpoint["subtype_prototype_counts"].items()
+    }
+
     distance_tau = float(args.distance_tau) if args.distance_tau is not None else float(checkpoint.get("selected_distance_tau", 0.5))
     objectness_tau = float(args.objectness_tau) if args.objectness_tau is not None else float(checkpoint.get("objectness_tau", 0.5))
     objectness_scale = float(args.objectness_scale) if args.objectness_scale is not None else float(checkpoint.get("objectness_scale", 12.0))
@@ -80,28 +97,29 @@ def run(args: argparse.Namespace) -> None:
     if embeddings.shape[1] != int(checkpoint["input_dim"]):
         raise ValueError(
             f"Embedding dimension mismatch: embeddings have {embeddings.shape[1]}, "
-            f"checkpoint expects {checkpoint['input_dim']}. Use the same encoder/embedding mode used for training."
+            f"checkpoint expects {checkpoint['input_dim']}."
         )
 
     log.info(
-        "Applying few-shot checkpoint=%s to %d candidate(s), classes=%s, distance_tau=%.4g",
-        args.checkpoint,
-        len(metadata),
-        class_names,
-        distance_tau,
+        "Applying checkpoint=%s to %d candidates, families=%s, distance_tau=%.4g",
+        args.checkpoint, len(metadata), family_names, distance_tau,
     )
-    predictions = predict_with_prototypes(
+
+    predictions = predict_hierarchical(
         model,
         embeddings,
         metadata,
         class_names,
-        prototypes,
-        prototype_counts,
+        family_prototypes,
+        family_counts,
+        subtype_prototypes,
+        subtype_counts,
         distance_tau=distance_tau,
         objectness_scale=objectness_scale,
         temperature=temperature,
         device=device,
         batch_size=int(args.batch_size),
+        family_names=family_names,
     )
     predictions = annotate_predictions(predictions, distance_tau, objectness_scale, objectness_tau=objectness_tau)
     predictions.to_csv(out_dir / "classification_predictions.tsv", sep="\t", index=False)
@@ -121,12 +139,13 @@ def run(args: argparse.Namespace) -> None:
             tau=float(distance_tau),
         )
 
-    summary = {
+    summary: dict[str, Any] = {
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "embeddings_npz": str(Path(args.embeddings_npz).resolve()),
         "metadata_tsv": str(Path(args.metadata_tsv).resolve()) if args.metadata_tsv else "",
         "class_names": class_names,
-        "prototype_counts": {name: int(prototype_counts[i]) for i, name in enumerate(class_names)},
+        "family_names": family_names,
+        "family_counts": {fn: int(family_counts[fi]) for fi, fn in enumerate(family_names)},
         "selected_distance_tau": float(distance_tau),
         "objectness_tau": float(objectness_tau),
         "objectness_scale": float(objectness_scale),
@@ -140,20 +159,20 @@ def run(args: argparse.Namespace) -> None:
     }
     with (out_dir / "inference_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
-    log.info("Wrote few-shot inference outputs to %s; called=%d/%d", out_dir, int(called.shape[0]), len(predictions))
+    log.info("Wrote hierarchical few-shot inference to %s; called=%d/%d", out_dir, int(called.shape[0]), len(predictions))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, help="Trained fewshot_classification_head.pt")
-    parser.add_argument("--embeddings_npz", required=True, help="Frozen embeddings.npz from prototype/inference embedding stage")
-    parser.add_argument("--metadata_tsv", default=None, help="candidate_embeddings.tsv matching embeddings_npz")
+    parser.add_argument("--embeddings_npz", required=True)
+    parser.add_argument("--metadata_tsv", default=None)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--candidate_resolution", choices=("auto", "chromosome-arm", "any"), default="chromosome-arm")
-    parser.add_argument("--distance_tau", type=float, default=None, help="Override checkpoint nearest-prototype distance threshold")
-    parser.add_argument("--objectness_tau", type=float, default=None, help="Override checkpoint objectness probability threshold")
-    parser.add_argument("--objectness_scale", type=float, default=None, help="Override checkpoint distance-to-objectness sigmoid scale")
-    parser.add_argument("--temperature", type=float, default=None, help="Override checkpoint distance softmax temperature")
+    parser.add_argument("--distance_tau", type=float, default=None)
+    parser.add_argument("--objectness_tau", type=float, default=None)
+    parser.add_argument("--objectness_scale", type=float, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--skip_visualizations", action="store_true")
