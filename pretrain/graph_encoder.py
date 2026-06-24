@@ -180,6 +180,18 @@ class AttentionReadout(nn.Module):
         global_ctx = self.global_proj(node_embeds.mean(dim=0))
         return self.out_proj(torch.cat([attended, global_ctx], dim=-1))
 
+    def forward_with_weights(self, node_embeds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Like forward() but also returns per-node attention weights [K]."""
+        if node_embeds.ndim != 2:
+            raise ValueError(f"node_embeds must be [K, D], got {tuple(node_embeds.shape)}")
+        if node_embeds.shape[0] == 0:
+            raise ValueError("AttentionReadout cannot pool an empty node set")
+        scores = self.attn_score(node_embeds)
+        weights = torch.softmax(scores, dim=0)
+        attended = (weights * node_embeds).sum(dim=0)
+        global_ctx = self.global_proj(node_embeds.mean(dim=0))
+        return self.out_proj(torch.cat([attended, global_ctx], dim=-1)), weights.squeeze(-1)
+
     def forward_batched(self, node_embeds: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         if node_embeds.ndim != 3:
             raise ValueError(f"node_embeds must be [B, K, D], got {tuple(node_embeds.shape)}")
@@ -273,10 +285,19 @@ class SVGraphMAE(nn.Module):
     def regional_embed(self, node_h: torch.Tensor, node_indices: Iterable[int]) -> torch.Tensor:
         idx = torch.as_tensor(list(node_indices), dtype=torch.long, device=node_h.device)
         if idx.numel() == 0:
-            # Empty candidates can happen in CN-only proposals. Use global mean
-            # context rather than crashing, so downstream inference can continue.
             return self.global_embed(node_h)
         return self.readout(node_h[idx])
+
+    def regional_embed_with_weights(
+        self, node_h: torch.Tensor, node_indices: Iterable[int]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Like regional_embed() but also returns per-node attention weights [K], or None if no nodes."""
+        idx_list = list(node_indices)
+        if not idx_list:
+            return self.global_embed(node_h), None
+        idx = torch.as_tensor(idx_list, dtype=torch.long, device=node_h.device)
+        embedding, weights = self.readout.forward_with_weights(node_h[idx])
+        return embedding, weights
 
     def global_embed(self, node_h: torch.Tensor) -> torch.Tensor:
         if node_h.ndim != 2 or node_h.shape[0] == 0:

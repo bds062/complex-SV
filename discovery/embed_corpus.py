@@ -386,6 +386,147 @@ def _light_graph_candidates(bundle: SampleBundle, min_junctions: int = 3, min_sp
     return candidates
 
 
+def _predict_haplotype(segs: pd.DataFrame, sub_df: pd.DataFrame | None) -> dict[str, Any]:
+    """Rule-based haplotype prediction from CN segments and SV haplotype support.
+
+    Combines three signals: (1) SV read-support vote (supp_hp1 vs supp_hp2),
+    (2) length-weighted CN asymmetry, and (3) bilateral detection when both
+    haplotypes show elevated copy number.
+
+    Returns keys: haplotype (HP1/HP2/bilateral), haplotype_score [-1,1],
+    haplotype_confidence [0,1], sv_hp1_support, sv_hp2_support,
+    cn_hp1_mean, cn_hp2_mean.
+    """
+    sv_hp1, sv_hp2, sv_score = 0.0, 0.0, 0.0
+    if sub_df is not None and not sub_df.empty and "supp_hp1" in sub_df and "supp_hp2" in sub_df:
+        sv_hp1 = float(pd.to_numeric(sub_df["supp_hp1"], errors="coerce").fillna(0).sum())
+        sv_hp2 = float(pd.to_numeric(sub_df["supp_hp2"], errors="coerce").fillna(0).sum())
+        total = sv_hp1 + sv_hp2
+        if total > 0:
+            sv_score = (sv_hp1 - sv_hp2) / total
+
+    cn_hp1_mean, cn_hp2_mean, cn_score = 1.0, 1.0, 0.0
+    if not segs.empty and "cn_hp1" in segs and "cn_hp2" in segs:
+        hp1 = pd.to_numeric(segs["cn_hp1"], errors="coerce").fillna(1.0)
+        hp2 = pd.to_numeric(segs["cn_hp2"], errors="coerce").fillna(1.0)
+        lengths = (
+            pd.to_numeric(segs.get("end", pd.Series(dtype=float)), errors="coerce")
+            - pd.to_numeric(segs.get("start", pd.Series(dtype=float)), errors="coerce")
+        ).clip(lower=0).fillna(0)
+        total_len = float(lengths.sum())
+        if total_len > 0:
+            cn_hp1_mean = float((hp1 * lengths).sum() / total_len)
+            cn_hp2_mean = float((hp2 * lengths).sum() / total_len)
+        else:
+            cn_hp1_mean, cn_hp2_mean = float(hp1.mean()), float(hp2.mean())
+        cn_total = cn_hp1_mean + cn_hp2_mean
+        if cn_total > 0:
+            cn_score = (cn_hp1_mean - cn_hp2_mean) / cn_total
+
+    sv_weight = 2.0 if (sv_hp1 + sv_hp2) > 0 else 0.0
+    haplotype_score = (sv_weight * sv_score + cn_score) / (sv_weight + 1.0)
+
+    sv_frac = sv_hp1 / (sv_hp1 + sv_hp2 + 1e-9)
+    both_cn_elevated = cn_hp1_mean > 2.5 and cn_hp2_mean > 2.5
+    sv_mixed = (sv_hp1 + sv_hp2) > 0 and 0.3 <= sv_frac <= 0.7
+    bilateral = both_cn_elevated or sv_mixed
+
+    THRESHOLD = 0.25
+    if bilateral:
+        haplotype = "bilateral"
+        if both_cn_elevated:
+            confidence = float(min(1.0, (min(cn_hp1_mean, cn_hp2_mean) - 2.0) / 3.0))
+        else:
+            confidence = float(max(0.3, 1.0 - abs(sv_frac - 0.5) / 0.2))
+    elif haplotype_score > THRESHOLD:
+        haplotype = "HP1"
+        confidence = float(min(1.0, (haplotype_score - THRESHOLD) / (1.0 - THRESHOLD)))
+    elif haplotype_score < -THRESHOLD:
+        haplotype = "HP2"
+        confidence = float(min(1.0, (-haplotype_score - THRESHOLD) / (1.0 - THRESHOLD)))
+    else:
+        haplotype = "bilateral"
+        confidence = 0.2
+
+    return {
+        "haplotype": haplotype,
+        "haplotype_score": round(float(haplotype_score), 4),
+        "haplotype_confidence": round(confidence, 4),
+        "sv_hp1_support": round(sv_hp1, 2),
+        "sv_hp2_support": round(sv_hp2, 2),
+        "cn_hp1_mean": round(cn_hp1_mean, 4),
+        "cn_hp2_mean": round(cn_hp2_mean, 4),
+    }
+
+
+def _localize_from_signals(
+    sv_pos: list[int],
+    sv_end: list[int],
+    sv_weights: np.ndarray | None,
+    cn_bin_relevance: np.ndarray | None,
+    start_bp: int,
+    end_bp: int,
+) -> dict[str, Any]:
+    """Compute sub-arm localized interval from SV attention span and/or CN bin relevance.
+
+    Priority: SV span (most precise) → CN attention → full candidate window.
+    Returns localized_start_bp, localized_end_bp, localization_method,
+    localization_confidence, localization_span_fraction.
+    """
+    span = max(end_bp - start_bp, 1)
+    loc_start, loc_end, method, confidence = start_bp, end_bp, "candidate_window", 0.0
+
+    # SV-span: use attention-weighted top-50% of SV nodes
+    if sv_pos and sv_weights is not None and len(sv_weights) == len(sv_pos):
+        w = np.asarray(sv_weights, dtype=float)
+        threshold = float(np.percentile(w, 50))
+        hot = w >= threshold
+        hot_pos = [sv_pos[i] for i in range(len(sv_pos)) if hot[i]]
+        hot_end = [sv_end[i] for i in range(len(sv_end)) if hot[i]]
+        if hot_pos:
+            loc_start = max(start_bp, min(hot_pos))
+            loc_end = min(end_bp, max(hot_end))
+            if loc_end > loc_start:
+                method = "sv_attention"
+                concentration = float(1.0 - np.exp(-(w.max() / (w.mean() + 1e-9) - 1)))
+                confidence = float(min(1.0, max(0.3, concentration)))
+    elif sv_pos:
+        loc_start = max(start_bp, min(sv_pos))
+        loc_end = min(end_bp, max(sv_end))
+        if loc_end > loc_start:
+            method = "sv_span"
+            confidence = 0.5
+
+    # CN bin attention: refine or replace when SV span not available
+    if cn_bin_relevance is not None and len(cn_bin_relevance) > 0 and method == "candidate_window":
+        n_bins = len(cn_bin_relevance)
+        bin_starts = np.linspace(start_bp, end_bp, n_bins + 1)[:-1].astype(int)
+        bin_ends = np.linspace(start_bp, end_bp, n_bins + 1)[1:].astype(int)
+        rel = np.abs(cn_bin_relevance)
+        threshold = float(np.percentile(rel, 70))
+        hot = rel >= threshold
+        if hot.any():
+            hot_idx = np.where(hot)[0]
+            loc_start = int(bin_starts[hot_idx[0]])
+            loc_end = int(bin_ends[hot_idx[-1]])
+            if loc_end > loc_start:
+                method = "cn_attention"
+                concentration = float(rel[hot].mean() / (rel.mean() + 1e-9))
+                confidence = float(min(0.7, max(0.2, concentration / 5.0)))
+
+    loc_start = max(start_bp, min(loc_start, end_bp))
+    loc_end = max(loc_start + 1, min(loc_end, end_bp))
+    span_fraction = round((loc_end - loc_start) / span, 4)
+
+    return {
+        "localized_start_bp": int(loc_start),
+        "localized_end_bp": int(loc_end),
+        "localization_method": method,
+        "localization_confidence": round(confidence, 4),
+        "localization_span_fraction": span_fraction,
+    }
+
+
 def embed_candidate(
     candidate: dict[str, Any],
     bundle: SampleBundle,
@@ -401,12 +542,23 @@ def embed_candidate(
     cn_tensor = region_to_tensor(segs, start_bp, end_bp, n_bins=cn_cfg.n_bins_region).unsqueeze(0).to(device)
     cn_mask = torch.zeros(cn_tensor.shape[:2], dtype=torch.bool, device=device)
 
+    cn_bin_relevance: np.ndarray | None = None
+    sv_pos: list[int] = []
+    sv_end: list[int] = []
+    sv_weights: np.ndarray | None = None
+    sub_df: pd.DataFrame | None = None
+
     with torch.no_grad():
-        _cn_recon, cn_cls, _cn_bins = cn_model(cn_tensor, cn_mask)
+        _cn_recon, cn_cls, cn_bin_embs = cn_model(cn_tensor, cn_mask)
+        # Per-bin relevance: alignment of each bin embedding with the CLS token
+        cn_cls_vec = cn_cls.squeeze(0)
+        cn_bin_embs_2d = cn_bin_embs.squeeze(0)  # [n_bins, d_model]
+        cn_bin_relevance = (cn_bin_embs_2d @ cn_cls_vec).cpu().numpy().astype(np.float32)
+
         def normalize_block(x: torch.Tensor) -> torch.Tensor:
             return l2_normalize(x, dim=0)
 
-        parts = [normalize_block(cn_cls.squeeze(0))]
+        parts = [normalize_block(cn_cls_vec)]
 
         sv_indices = _sv_indices_in_candidate(bundle, candidate)
         original_n_sv = len(sv_indices)
@@ -433,9 +585,15 @@ def embed_candidate(
             mask = torch.zeros(region_graph["sv"].x.shape[0], dtype=torch.bool, device=device)
             _graph_recon, node_h = graph_model(region_graph, mask)
             local_indices = list(range(region_graph["sv"].x.shape[0]))
-            graph_regional = graph_model.regional_embed(node_h, local_indices)
+            graph_regional, attn_weights = graph_model.regional_embed_with_weights(node_h, local_indices)
             graph_global = graph_model.global_embed(node_h)
             parts.extend([normalize_block(graph_regional), normalize_block(graph_global)])
+            # Capture SV genomic positions and attention weights for localization
+            if "pos" in sub_df.columns and "end" in sub_df.columns:
+                sv_pos = pd.to_numeric(sub_df["pos"], errors="coerce").fillna(start_bp).astype(int).tolist()
+                sv_end = pd.to_numeric(sub_df["end"], errors="coerce").fillna(end_bp).astype(int).tolist()
+            if attn_weights is not None:
+                sv_weights = attn_weights.cpu().numpy().astype(np.float32)
         else:
             embed_dim = int(getattr(getattr(graph_model, "cfg", None), "embed_dim", 64)) if graph_model is not None else 64
             parts.extend(
@@ -449,7 +607,10 @@ def embed_candidate(
         parts.append(normalize_block(stats))
         embedding = l2_normalize(torch.cat(parts, dim=0), dim=0)
 
-    metadata = {
+    loc = _localize_from_signals(sv_pos, sv_end, sv_weights, cn_bin_relevance, start_bp, end_bp)
+    hap = _predict_haplotype(segs, sub_df)
+
+    metadata: dict[str, Any] = {
         "candidate_id": candidate.get("candidate_id", candidate.get("label_id", "")),
         "label_id": candidate.get("label_id", ""),
         "sample_id": bundle.sample_id,
@@ -465,6 +626,8 @@ def embed_candidate(
         "n_sv_nodes": int(original_n_sv),
         "encoded_sv_nodes": int(len(sv_indices)),
         "embedding_mode": "encoder_concat",
+        **loc,
+        **hap,
     }
     return embedding.detach().cpu().numpy().astype(np.float32), metadata
 
@@ -1119,10 +1282,15 @@ def _plot_prototype_distances(
         return
 
     matrix = plot_df[distance_cols].astype(float).to_numpy()
+    matrix_masked = np.ma.masked_invalid(matrix)
+    finite_vals = matrix[np.isfinite(matrix)]
+    vmax = float(finite_vals.max()) if finite_vals.size else 1.0
+    cmap = plt.get_cmap("viridis_r").copy()
+    cmap.set_bad(color="#d0d0d0")
     fig_h = max(5.0, min(22.0, 0.24 * len(plot_df) + 2.0))
     fig_w = max(6.5, 1.2 * len(distance_cols) + 4.5)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    im = ax.imshow(matrix, aspect="auto", cmap="viridis_r")
+    im = ax.imshow(matrix_masked, aspect="auto", cmap=cmap, vmin=0.0, vmax=vmax)
     pred_to_col = {col.removeprefix("d_"): i for i, col in enumerate(distance_cols)}
     star_x: list[int] = []
     star_y: list[int] = []
@@ -1143,7 +1311,7 @@ def _plot_prototype_distances(
     _draw_gt_class_boundaries(ax, plot_df)
     ax.set_xlabel("Prototype class")
     ax.set_title(f"Prototype Distances by Class (tau={tau:g})\nstars = predicted class; no star = none")
-    fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02, label="Cosine distance")
+    fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02, label="Distance (gray = other family, not computed)")
     fig.tight_layout()
     fig.savefig(output_path, dpi=180)
     plt.close(fig)

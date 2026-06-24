@@ -157,8 +157,14 @@ def _format_bp(value: int | float) -> str:
 
 
 def _highlight_interval(row: pd.Series, start_bp: int, end_bp: int) -> tuple[int, int]:
-    highlight_start = int(_numeric(row, "highlight_start_bp", start_bp))
-    highlight_end = int(_numeric(row, "highlight_end_bp", end_bp))
+    # Prefer explicit ShatterSeek highlight; fall back to model-predicted localization
+    has_explicit = np.isfinite(_numeric(row, "highlight_start_bp", np.nan)) or np.isfinite(_numeric(row, "highlight_end_bp", np.nan))
+    if not has_explicit and np.isfinite(_numeric(row, "localized_start_bp", np.nan)):
+        highlight_start = int(_numeric(row, "localized_start_bp", start_bp))
+        highlight_end = int(_numeric(row, "localized_end_bp", end_bp))
+    else:
+        highlight_start = int(_numeric(row, "highlight_start_bp", start_bp))
+        highlight_end = int(_numeric(row, "highlight_end_bp", end_bp))
     if highlight_end < highlight_start:
         highlight_start, highlight_end = highlight_end, highlight_start
     highlight_start = max(start_bp, min(highlight_start, end_bp))
@@ -621,6 +627,8 @@ def plot_chromosome_prediction(
     highlight_label = _clean_text(row.get("highlight_label", ""))
     if not highlight_label and ("highlight_start_bp" in row or "highlight_end_bp" in row):
         highlight_label = f"{chrom}:{_format_bp(highlight_start_bp)}-{_format_bp(highlight_end_bp)}"
+    haplotype_tag = _clean_text(row.get("haplotype", ""))
+    haplotype_conf = _numeric(row, "haplotype_confidence", np.nan)
 
     segs = _subset_segments(wakhan_df, chrom, start_bp, end_bp)
     sv_chr = _subset_sv_on_chrom(severus_df, chrom, start_bp, end_bp)
@@ -669,6 +677,22 @@ def plot_chromosome_prediction(
     _plot_sv_panel(axes[0], severus_df, sv_chr, chrom, start_bp, end_bp)
     _plot_cn_panel(axes[1], segs, start_bp, end_bp)
     _plot_breakpoint_panel(axes[2], segs, severus_df, sv_chr, chrom, start_bp, end_bp)
+
+    if haplotype_tag:
+        _HAP_COLORS = {"HP1": "#4E79A7", "HP2": "#E15759", "bilateral": "#76B7B2"}
+        hap_color = _HAP_COLORS.get(haplotype_tag, "#999999")
+        hap_text = haplotype_tag
+        if np.isfinite(haplotype_conf):
+            hap_text = f"{haplotype_tag} ({haplotype_conf:.2f})"
+        axes[0].annotate(
+            hap_text,
+            xy=(1.0, 1.0), xycoords="axes fraction",
+            xytext=(-4, -4), textcoords="offset points",
+            ha="right", va="top",
+            fontsize=8, fontweight="bold", color="white",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor=hap_color, edgecolor="none", alpha=0.88),
+            zorder=25,
+        )
 
     axes[-1].set_xlim(start_bp / 1e6, end_bp / 1e6)
     axes[-1].set_xlabel(f"{chrom} position (Mb)")
