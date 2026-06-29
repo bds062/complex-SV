@@ -1,0 +1,1999 @@
+"""Train a candidate-region complex-SV classifier.
+
+This pipeline uses generated candidate regions as the prediction unit. Positive
+candidate rows carry one or more event-class labels, while rows with no class
+calls are treated as empty candidate-region negatives.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from discovery import embed_corpus
+from data.anchor_manifest import canonical_sample_id
+from data.cn_resampler import get_arm_bounds
+from training.train_multilabel_classifier_head import (
+    _class_counts,
+    _hidden_dims,
+    _label_background_masks,
+    _multi_hot_targets,
+    _objectness_weights,
+    _plot_thresholds,
+    _plot_training,
+    _pos_weight,
+    _smooth_binary_targets,
+    annotate_predictions,
+    predictions_to_distance_table,
+    sweep_objectness_tau,
+)
+from utils import set_seed
+
+log = logging.getLogger(__name__)
+
+EVENT_CLASS_COLUMNS = ["ecDNA", "Seismic_Amplification", "chromothripsis", "BFB"]
+DEFAULT_CLASS_NAMES = "ecDNA,Seismic_Amplification,chromothripsis,BFB"
+EMPTY_EVIDENCE = "candidate_region_empty"
+POSITIVE_EVIDENCE = "candidate_region_label"
+SAFE_TABULAR_FEATURES = [
+    "n_windows",
+    "n_segments",
+    "n_segments_ge_100kb",
+    "component_length",
+    "segment_frequency",
+    "ploidy",
+    "segment_len_q25",
+    "segment_len_q50",
+    "segment_len_q75",
+    "oscillating_two_state",
+    "oscillating_segment_fraction",
+    "oscillating_transition_fraction",
+    "n_TCN_0",
+    "n_TCN_1",
+    "n_TCN_2",
+    "n_TCN_3",
+    "n_TCN_4",
+    "n_TCN_5",
+    "n_TCN_6",
+    "n_TCN_7",
+    "n_TCN_7_10",
+    "n_TCN_11_20",
+    "n_TCN_20_40",
+    "n_TCN_gt_40",
+    "n_breakpoints",
+    "n_FB_lowCN_2Mb",
+    "FB_first_index",
+    "FB_last_index",
+    "FB_lowCN_first_index",
+    "FB_lowCN_last_index",
+    "n_DEL",
+    "n_DUP",
+    "n_FB",
+    "n_INTER_CHR",
+    "n_INV_LIKE",
+    "n_sBND",
+    "n_interchromosomal_SV",
+]
+BOOLEAN_TABULAR_FEATURES = {"oscillating_two_state"}
+FRACTION_TABULAR_FEATURES = {"oscillating_segment_fraction", "oscillating_transition_fraction"}
+LENGTH_TABULAR_FEATURES = {"component_length", "segment_len_q25", "segment_len_q50", "segment_len_q75"}
+COUNT_TABULAR_FEATURES = {
+    "n_windows",
+    "n_segments",
+    "n_segments_ge_100kb",
+    "n_TCN_0",
+    "n_TCN_1",
+    "n_TCN_2",
+    "n_TCN_3",
+    "n_TCN_4",
+    "n_TCN_5",
+    "n_TCN_6",
+    "n_TCN_7",
+    "n_TCN_7_10",
+    "n_TCN_11_20",
+    "n_TCN_20_40",
+    "n_TCN_gt_40",
+    "n_breakpoints",
+    "n_FB_lowCN_2Mb",
+    "FB_first_index",
+    "FB_last_index",
+    "FB_lowCN_first_index",
+    "FB_lowCN_last_index",
+    "n_DEL",
+    "n_DUP",
+    "n_FB",
+    "n_INTER_CHR",
+    "n_INV_LIKE",
+    "n_sBND",
+    "n_interchromosomal_SV",
+}
+
+
+def _clean_text(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _has_class_call(value: object) -> bool:
+    text = _clean_text(value).lower()
+    return text not in {"", "0", "false", "f", "no", "n", "none", "nan", "<na>"}
+
+
+def _split_csv(value: str | None) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _threshold_grid(min_value: float, max_value: float, steps: int) -> np.ndarray:
+    return np.linspace(float(min_value), float(max_value), int(steps), dtype=np.float32)
+
+
+def choose_tau_from_sweep(tau_df: pd.DataFrame, metric: str = "f1", tie_break: str = "low") -> float:
+    if tau_df.empty:
+        return 0.5
+    metric = metric if metric in tau_df.columns else "f1"
+    tau_ascending = str(tie_break).lower() != "high"
+    return float(
+        tau_df.sort_values(
+            [metric, "precision", "recall", "objectness_tau"],
+            ascending=[False, False, False, tau_ascending],
+        ).iloc[0]["objectness_tau"]
+    )
+
+
+def choose_type_thresholds_from_predictions(
+    predictions: pd.DataFrame,
+    class_names: list[str],
+    tau_grid: np.ndarray,
+    tie_break: str = "low",
+) -> tuple[dict[str, float], pd.DataFrame]:
+    labeled_df = predictions[predictions["is_labeled"].astype(bool)].copy()
+    rows: list[dict[str, Any]] = []
+    thresholds: dict[str, float] = {}
+    if labeled_df.empty:
+        return {name: 0.5 for name in class_names}, pd.DataFrame()
+    true_sets = _sets_from_series(labeled_df["true_classes"])
+    prefer_higher_tau = str(tie_break).lower() == "high"
+    for class_name in class_names:
+        y = np.asarray([class_name in values for values in true_sets], dtype=bool)
+        score = labeled_df[f"type_probability_{class_name}"].astype(float).to_numpy()
+        best: dict[str, Any] | None = None
+        for tau in tau_grid:
+            pred = score >= float(tau)
+            tp = int((y & pred).sum())
+            fp = int(((~y) & pred).sum())
+            fn = int((y & (~pred)).sum())
+            tn = int(((~y) & (~pred)).sum())
+            precision = tp / (tp + fp) if tp + fp else 1.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
+            row = {
+                "class_name": class_name,
+                "type_tau": float(tau),
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "tn": tn,
+            }
+            rows.append(row)
+            tie_tau = float(tau) if prefer_higher_tau else -float(tau)
+            best_tie_tau = float(best["type_tau"]) if (best is not None and prefer_higher_tau) else (-float(best["type_tau"]) if best is not None else None)
+            if best is None or (f1, precision, recall, tie_tau) > (best["f1"], best["precision"], best["recall"], best_tie_tau):
+                best = row
+        thresholds[class_name] = float(best["type_tau"]) if best is not None and int(y.sum()) > 0 else 0.5
+    return thresholds, pd.DataFrame(rows)
+
+
+def _chrom_key(chrom: object) -> str:
+    return _clean_text(chrom).removeprefix("chr").removeprefix("CHR")
+
+
+def _chrom_equal(a: object, b: object) -> bool:
+    return _chrom_key(a).lower() == _chrom_key(b).lower()
+
+
+def _clean_arm(value: object) -> str:
+    text = _clean_text(value).lower()
+    return text if text in {"p", "q"} else text
+
+
+def read_candidate_regions(path: str | Path, class_names: list[str]) -> pd.DataFrame:
+    df = pd.read_csv(path).fillna("")
+    required = {"sample_id", "candidate_id", "chrom", "arm", "start", "end"}
+    missing = sorted(required.difference(df.columns))
+    if missing:
+        raise ValueError(f"Candidate regions file missing columns: {missing}")
+    missing_classes = sorted(set(class_names).difference(df.columns))
+    if missing_classes:
+        raise ValueError(f"Candidate regions file missing class columns: {missing_classes}")
+
+    out = df.copy()
+    out["start_bp"] = pd.to_numeric(out["start"], errors="coerce").fillna(0).astype(int)
+    out["end_bp"] = pd.to_numeric(out["end"], errors="coerce").fillna(0).astype(int)
+    bad_span = out["end_bp"] <= out["start_bp"]
+    if bool(bad_span.any()):
+        examples = out.loc[bad_span, ["candidate_id", "sample_id", "chrom", "start_bp", "end_bp"]].head(8).to_dict("records")
+        raise ValueError(f"Candidate regions contain non-positive spans, examples={examples}")
+
+    sv_classes: list[str] = []
+    raw_sv_classes: list[str] = []
+    evidence: list[str] = []
+    for row in out.to_dict("records"):
+        classes: list[str] = []
+        raw_parts: list[str] = []
+        for class_name in class_names:
+            value = row.get(class_name, "")
+            if not _has_class_call(value):
+                continue
+            classes.append(class_name)
+            raw_value = _clean_text(value)
+            raw_parts.append(class_name if raw_value in {"", "True", "true", "1"} else f"{class_name}:{raw_value}")
+        sv_classes.append(";".join(classes))
+        raw_sv_classes.append(";".join(raw_parts))
+        evidence.append(POSITIVE_EVIDENCE if classes else EMPTY_EVIDENCE)
+
+    out["sv_class"] = sv_classes
+    out["sv_classes"] = sv_classes
+    out["raw_sv_classes"] = raw_sv_classes
+    out["evidence"] = evidence
+    out["label_scope"] = np.where(out["sv_classes"].astype(str) != "", "region", "empty_candidate_region")
+    out["candidate_scope"] = "candidate_region"
+    out["label_id"] = np.where(out["sv_classes"].astype(str) != "", out["candidate_id"].astype(str), "")
+    return out
+
+
+def _candidate_dict(row: pd.Series) -> dict[str, Any]:
+    return {
+        "candidate_id": str(row["candidate_id"]),
+        "label_id": str(row.get("label_id", "")),
+        "sample_id": canonical_sample_id(str(row["sample_id"])),
+        "chrom": str(row["chrom"]),
+        "arm": str(row.get("arm", "")),
+        "start_bp": int(row["start_bp"]),
+        "end_bp": int(row["end_bp"]),
+        "evidence": str(row.get("evidence", "")),
+        "sv_class": str(row.get("sv_classes", row.get("sv_class", ""))),
+        "label_scope": str(row.get("label_scope", "")),
+        "candidate_scope": str(row.get("candidate_scope", "candidate_region")),
+    }
+
+
+def _chrom_segments(bundle: embed_corpus.SampleBundle, chrom: object) -> pd.DataFrame:
+    df = bundle.wakhan_df
+    if df.empty:
+        return pd.DataFrame()
+    mask = df["chrom"].astype(str).map(lambda value: _chrom_equal(value, chrom))
+    return df.loc[mask].copy()
+
+
+def _context_interval(bundle: embed_corpus.SampleBundle, chrom: str, arm: str) -> tuple[str, int, int]:
+    chrom_df = _chrom_segments(bundle, chrom)
+    if chrom_df.empty:
+        return "candidate", 0, 0
+    chrom_start = int(pd.to_numeric(chrom_df["start"], errors="coerce").min())
+    chrom_end = int(pd.to_numeric(chrom_df["end"], errors="coerce").max())
+    arm_clean = _clean_arm(arm)
+    if arm_clean in {"p", "q"}:
+        try:
+            for arm_name, arm_start, arm_end in get_arm_bounds(chrom_df):
+                if str(arm_name).lower().endswith(arm_clean):
+                    return "chromosome_arm", int(arm_start), int(arm_end)
+        except Exception as exc:
+            log.warning("Could not resolve arm bounds for %s %s%s: %s", bundle.sample_id, chrom, arm_clean, exc)
+    return "chromosome", chrom_start, chrom_end
+
+
+def _coordinate_features(start_bp: int, end_bp: int, context_start: int, context_end: int, arm: str, context_scope: str) -> np.ndarray:
+    span = max(int(end_bp) - int(start_bp), 1)
+    context_span = max(int(context_end) - int(context_start), 1)
+    rel_start = (int(start_bp) - int(context_start)) / context_span
+    rel_end = (int(end_bp) - int(context_start)) / context_span
+    rel_center = ((int(start_bp) + int(end_bp)) * 0.5 - int(context_start)) / context_span
+    width_frac = span / context_span
+    arm_clean = _clean_arm(arm)
+    values = np.array(
+        [
+            np.clip(rel_start, -1.0, 2.0),
+            np.clip(rel_end, -1.0, 2.0),
+            np.clip(rel_center, -1.0, 2.0),
+            np.clip(width_frac, 0.0, 2.0),
+            min(np.log1p(span / 1_000_000.0) / 5.0, 1.0),
+            min(np.log1p(context_span / 1_000_000.0) / 6.0, 1.0),
+            1.0 if arm_clean == "mixed" else 0.0,
+            1.0 if context_scope == "chromosome" else 0.0,
+        ],
+        dtype=np.float32,
+    )
+    return values
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    if value is None:
+        return float(default)
+    try:
+        if pd.isna(value):
+            return float(default)
+    except TypeError:
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _bool_float(value: object) -> float:
+    text = _clean_text(value).lower()
+    if text in {"true", "t", "1", "yes", "y"}:
+        return 1.0
+    if text in {"false", "f", "0", "no", "n", "", "none", "nan", "<na>"}:
+        return 0.0
+    return 1.0 if _safe_float(value, 0.0) > 0 else 0.0
+
+
+def _scale_tabular_feature(name: str, value: object) -> float:
+    if name in BOOLEAN_TABULAR_FEATURES:
+        return _bool_float(value)
+    raw = max(_safe_float(value, 0.0), 0.0)
+    if name in FRACTION_TABULAR_FEATURES:
+        return float(np.clip(raw, 0.0, 1.0))
+    if name in LENGTH_TABULAR_FEATURES:
+        return float(min(np.log1p(raw / 1_000_000.0) / 6.0, 1.0))
+    if name == "segment_frequency":
+        return float(min(np.log1p(raw * 1_000_000.0) / np.log1p(256.0), 1.0))
+    if name == "ploidy":
+        return float(min(np.log1p(raw) / np.log1p(64.0), 1.0))
+    if name in COUNT_TABULAR_FEATURES:
+        return float(min(np.log1p(raw) / np.log1p(512.0), 1.0))
+    return float(np.clip(raw, 0.0, 1.0))
+
+
+def selected_tabular_feature_names(mode: str) -> list[str]:
+    text = str(mode or "safe").strip().lower()
+    if text in {"", "none", "off", "0"}:
+        return []
+    if text == "safe":
+        return list(SAFE_TABULAR_FEATURES)
+    return [part.strip() for part in str(mode).split(",") if part.strip()]
+
+
+def make_tabular_features(metadata: pd.DataFrame, feature_names: list[str]) -> np.ndarray:
+    if not feature_names:
+        return np.zeros((len(metadata), 0), dtype=np.float32)
+    values = np.zeros((len(metadata), len(feature_names)), dtype=np.float32)
+    for col_i, name in enumerate(feature_names):
+        if name not in metadata.columns:
+            continue
+        values[:, col_i] = [_scale_tabular_feature(name, value) for value in metadata[name].tolist()]
+    return values.astype(np.float32)
+
+
+def write_tabular_feature_table(metadata: pd.DataFrame, tabular_features: np.ndarray, feature_names: list[str], output_dir: Path) -> None:
+    rows = pd.DataFrame(tabular_features, columns=[f"tabular_{name}" for name in feature_names])
+    for col in ["candidate_id", "sample_id", "chrom", "arm", "sv_classes", "evidence"]:
+        if col in metadata.columns:
+            rows.insert(len([c for c in rows.columns if c in {"candidate_id", "sample_id", "chrom", "arm", "sv_classes", "evidence"}]), col, metadata[col].astype(str).to_numpy())
+    rows.to_csv(output_dir / "tabular_features.tsv", sep="\t", index=False)
+    (output_dir / "tabular_feature_names.txt").write_text("\n".join(feature_names) + ("\n" if feature_names else ""), encoding="utf-8")
+    np.savez(output_dir / "tabular_features.npz", features=tabular_features.astype(np.float32), feature_names=np.asarray(feature_names, dtype=object))
+
+
+def select_embedding_features(
+    embeddings: np.ndarray,
+    metadata: pd.DataFrame,
+    mode: str,
+    output_dir: Path,
+) -> tuple[np.ndarray, pd.DataFrame, str]:
+    text = str(mode or "full").strip().lower()
+    if text in {"", "full", "all", "local_context_diff_coords", "local+context+diff+coords"}:
+        selected = np.asarray(embeddings, dtype=np.float32)
+        selected_mode = "local_context_diff_coords"
+    elif text in {"coord", "coords", "coordinate", "coordinates"}:
+        if "coordinate_feature_dim" not in metadata.columns:
+            raise ValueError("--embedding_features coords requires coordinate_feature_dim in candidate metadata")
+        coord_dims = pd.to_numeric(metadata["coordinate_feature_dim"], errors="coerce").dropna().astype(int)
+        coord_dim = int(coord_dims.mode().iloc[0]) if not coord_dims.empty else 8
+        if coord_dim <= 0:
+            raise ValueError(f"Invalid coordinate_feature_dim={coord_dim}")
+        emb = np.asarray(embeddings, dtype=np.float32)
+        if emb.shape[1] == coord_dim:
+            selected = emb
+        elif emb.shape[1] > coord_dim:
+            selected = emb[:, -coord_dim:]
+        else:
+            raise ValueError(f"Cannot select {coord_dim} coordinate feature(s) from embedding matrix with dim={emb.shape[1]}")
+        selected_mode = "coords"
+    else:
+        raise ValueError("--embedding_features must be full or coords")
+
+    metadata = metadata.copy()
+    metadata["embedding_features"] = selected_mode
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(output_dir / "selected_embedding_features.npz", embeddings=selected.astype(np.float32), embedding_features=selected_mode)
+    (output_dir / "embedding_features.txt").write_text(f"{selected_mode}\n", encoding="utf-8")
+    embed_corpus.write_embedding_outputs(selected, metadata, output_dir)
+    return selected.astype(np.float32), metadata, selected_mode
+
+
+def embed_candidate_table(
+    candidates_df: pd.DataFrame,
+    manifest: pd.DataFrame,
+    cn_checkpoint: str | Path,
+    graph_checkpoint: str | Path | None,
+    output_dir: Path,
+    embedding_normalization: str,
+    sample_baseline_min_candidates: int,
+    strict: bool,
+    device: torch.device,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    cn_model, cn_cfg = embed_corpus.load_cn_encoder(cn_checkpoint, device=device, strict=strict)
+    graph_model, graph_cfg, graph_scaler = embed_corpus.load_graph_encoder(graph_checkpoint, device=device, strict=strict)
+    bundles = embed_corpus.load_sample_bundles(manifest, graph_cfg=graph_cfg, graph_scaler=graph_scaler)
+
+    local_embeddings: list[np.ndarray] = []
+    final_embeddings: list[np.ndarray] = []
+    metadata_rows: list[dict[str, Any]] = []
+    context_cache: dict[tuple[str, str, str, int, int], np.ndarray] = {}
+
+    records = candidates_df.to_dict("records")
+    for idx, raw_row in enumerate(records, start=1):
+        if idx == 1 or idx % 25 == 0 or idx == len(records):
+            log.info("Embedding candidate region %d/%d", idx, len(records))
+        row = pd.Series(raw_row)
+        candidate = _candidate_dict(row)
+        sample_id = canonical_sample_id(str(candidate["sample_id"]))
+        if sample_id not in bundles:
+            raise KeyError(f"Candidate {candidate['candidate_id']} references sample_id={sample_id}, absent from manifest")
+        bundle = bundles[sample_id]
+        local_embedding, meta = embed_corpus.embed_candidate(candidate, bundle, cn_model, cn_cfg, graph_model, device)
+
+        context_scope, context_start, context_end = _context_interval(bundle, str(candidate["chrom"]), str(candidate.get("arm", "")))
+        if context_start == 0 and context_end == 0:
+            context_start, context_end = int(candidate["start_bp"]), int(candidate["end_bp"])
+        context_candidate = {
+            "candidate_id": f"{candidate['candidate_id']}__context",
+            "sample_id": sample_id,
+            "chrom": str(candidate["chrom"]),
+            "arm": str(candidate.get("arm", "")) if context_scope == "chromosome_arm" else "",
+            "start_bp": int(context_start),
+            "end_bp": int(context_end),
+            "evidence": "candidate_region_context",
+            "sv_class": "",
+            "label_scope": context_scope,
+            "candidate_scope": context_scope,
+        }
+        cache_key = (sample_id, str(candidate["chrom"]), context_scope, int(context_start), int(context_end))
+        if cache_key not in context_cache:
+            context_embedding, _context_meta = embed_corpus.embed_candidate(
+                context_candidate,
+                bundle,
+                cn_model,
+                cn_cfg,
+                graph_model,
+                device,
+            )
+            context_cache[cache_key] = context_embedding
+        context_embedding = context_cache[cache_key]
+
+        coord = _coordinate_features(
+            int(candidate["start_bp"]),
+            int(candidate["end_bp"]),
+            int(context_start),
+            int(context_end),
+            str(candidate.get("arm", "")),
+            context_scope,
+        )
+        final_embedding = np.concatenate(
+            [
+                local_embedding.astype(np.float32),
+                context_embedding.astype(np.float32),
+                (local_embedding - context_embedding).astype(np.float32),
+                coord,
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+        meta.update(
+            {
+                "candidate_id": str(candidate["candidate_id"]),
+                "label_id": str(candidate.get("label_id", "")),
+                "sample_id": sample_id,
+                "arm": str(row.get("arm", "")),
+                "sv_class": str(row.get("sv_classes", "")),
+                "sv_classes": str(row.get("sv_classes", "")),
+                "raw_sv_classes": str(row.get("raw_sv_classes", "")),
+                "evidence": str(row.get("evidence", "")),
+                "label_scope": str(row.get("label_scope", "")),
+                "candidate_scope": "candidate_region",
+                "context_scope": context_scope,
+                "context_start_bp": int(context_start),
+                "context_end_bp": int(context_end),
+                "local_embedding_dim": int(local_embedding.shape[0]),
+                "context_embedding_dim": int(context_embedding.shape[0]),
+                "coordinate_feature_dim": int(coord.shape[0]),
+                "embedding_mode": "candidate_region_with_context",
+            }
+        )
+        for extra_col in SAFE_TABULAR_FEATURES:
+            if extra_col in row:
+                meta[extra_col] = row.get(extra_col, "")
+
+        local_embeddings.append(local_embedding.astype(np.float32))
+        final_embeddings.append(final_embedding)
+        metadata_rows.append(meta)
+
+    raw_final = np.stack(final_embeddings, axis=0).astype(np.float32)
+    raw_local = np.stack(local_embeddings, axis=0).astype(np.float32)
+    metadata = pd.DataFrame(metadata_rows).fillna("")
+    metadata["embedding_normalization"] = embedding_normalization
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidates_df.to_csv(output_dir / "candidate_regions_from_csv.tsv", sep="\t", index=False)
+    np.savez(output_dir / "local_region_embeddings_raw.npz", embeddings=raw_local)
+    embed_corpus.write_raw_embedding_outputs(raw_final, metadata, output_dir)
+    embeddings = embed_corpus.apply_embedding_normalization(
+        raw_final,
+        metadata,
+        mode=embedding_normalization,
+        output_dir=output_dir,
+        min_background=int(sample_baseline_min_candidates),
+    )
+    embed_corpus.write_embedding_outputs(embeddings, metadata, output_dir)
+    return embeddings, metadata
+
+
+def select_test_samples(samples: np.ndarray, required: str, explicit: list[str], n_test_samples: int, seed: int) -> list[str]:
+    available = sorted(pd.unique(samples).tolist())
+    if required and required not in available:
+        raise ValueError(f"Required test sample {required!r} is absent from candidate regions; available examples={available[:10]}")
+    selected: list[str] = []
+    for sample in explicit:
+        if sample not in available:
+            raise ValueError(f"Explicit test sample {sample!r} is absent from candidate regions")
+        if sample not in selected:
+            selected.append(sample)
+    if required and required not in selected:
+        selected.insert(0, required)
+    target_n = min(max(int(n_test_samples), len(selected)), len(available))
+    remaining = [sample for sample in available if sample not in set(selected)]
+    rng = np.random.default_rng(int(seed))
+    rng.shuffle(remaining)
+    selected.extend(remaining[: max(0, target_n - len(selected))])
+    return selected
+
+
+def _sets_from_series(values: pd.Series) -> list[set[str]]:
+    result: list[set[str]] = []
+    for value in values.astype(str).tolist():
+        parts = [part.strip() for part in value.replace(",", ";").split(";") if part.strip() and part.strip().lower() != "none"]
+        result.append(set(parts))
+    return result
+
+
+def _split_class_tokens(value: object) -> list[str]:
+    return [part.strip() for part in str(value).replace(",", ";").split(";") if part.strip() and part.strip().lower() != "none"]
+
+
+def annotate_predictions_with_secondary(
+    predictions: pd.DataFrame,
+    objectness_tau: float,
+    type_thresholds: dict[str, float],
+    class_names: list[str],
+    secondary_min: float | None = None,
+    secondary_delta: float | None = None,
+    rescue_type_tau: float | None = None,
+    rescue_objectness_floor: float | None = None,
+    rescue_margin: float | None = None,
+) -> pd.DataFrame:
+    out = predictions.copy()
+    out["objectness_tau"] = float(objectness_tau)
+    use_secondary = secondary_min is not None and secondary_delta is not None
+    use_rescue = rescue_type_tau is not None and rescue_objectness_floor is not None and rescue_margin is not None
+    out["secondary_thresholding"] = "min_delta" if use_secondary else "off"
+    out["secondary_min"] = float(secondary_min) if use_secondary else np.nan
+    out["secondary_delta"] = float(secondary_delta) if use_secondary else np.nan
+    out["type_rescue"] = "type_confidence" if use_rescue else "off"
+    out["rescue_type_tau"] = float(rescue_type_tau) if use_rescue else np.nan
+    out["rescue_objectness_floor"] = float(rescue_objectness_floor) if use_rescue else np.nan
+    out["rescue_margin"] = float(rescue_margin) if use_rescue else np.nan
+    for class_name in class_names:
+        primary = float(type_thresholds.get(class_name, 0.5))
+        out[f"type_threshold_{class_name}"] = primary
+        out[f"secondary_threshold_{class_name}"] = max(primary + float(secondary_delta), float(secondary_min)) if use_secondary else primary
+
+    pred_lists: list[list[str]] = []
+    primary_classes: list[str] = []
+    prediction_sources: list[str] = []
+    rescued_flags: list[bool] = []
+    rescue_top_classes: list[str] = []
+    rescue_top_probs: list[float] = []
+    rescue_margins: list[float] = []
+    for _, row in out.iterrows():
+        probs = {class_name: float(row[f"type_probability_{class_name}"]) for class_name in class_names}
+        ranked = sorted(class_names, key=lambda name: probs[name], reverse=True)
+        top_class = ranked[0] if ranked else "none"
+        top_prob = float(probs[top_class]) if ranked else 0.0
+        second_prob = float(probs[ranked[1]]) if len(ranked) > 1 else 0.0
+        margin = float(top_prob - second_prob)
+        rescue_top_classes.append(top_class)
+        rescue_top_probs.append(top_prob)
+        rescue_margins.append(margin)
+
+        objectness_prob = float(row["objectness_prob"])
+        if objectness_prob < float(objectness_tau):
+            can_rescue = (
+                use_rescue
+                and objectness_prob >= float(rescue_objectness_floor)
+                and top_prob >= float(rescue_type_tau)
+                and margin >= float(rescue_margin)
+            )
+            if can_rescue:
+                pred_lists.append([top_class])
+                primary_classes.append(top_class)
+                prediction_sources.append("rescued_type_confidence")
+                rescued_flags.append(True)
+            else:
+                pred_lists.append([])
+                primary_classes.append("none")
+                prediction_sources.append("none_objectness")
+                rescued_flags.append(False)
+            continue
+
+        primary_pass = [class_name for class_name in class_names if probs[class_name] >= float(type_thresholds.get(class_name, 0.5))]
+        if not primary_pass:
+            pred_lists.append([])
+            primary_classes.append("none")
+            prediction_sources.append("none_type_threshold")
+            rescued_flags.append(False)
+            continue
+
+        # Primary call is the strongest class among those passing normal LOGO thresholds.
+        primary = max(primary_pass, key=lambda name: probs[name])
+        selected = {primary}
+        if use_secondary:
+            for class_name in primary_pass:
+                if class_name == primary:
+                    continue
+                sec_tau = max(float(type_thresholds.get(class_name, 0.5)) + float(secondary_delta), float(secondary_min))
+                if probs[class_name] >= sec_tau:
+                    selected.add(class_name)
+        else:
+            selected.update(primary_pass)
+        pred_lists.append([class_name for class_name in class_names if class_name in selected])
+        primary_classes.append(primary)
+        prediction_sources.append("objectness_type_threshold")
+        rescued_flags.append(False)
+
+    out["primary_predicted_class"] = primary_classes
+    out["prediction_source"] = prediction_sources
+    out["rescued_by_type_confidence"] = rescued_flags
+    out["rescue_top_type_class"] = rescue_top_classes
+    out["rescue_top_type_probability"] = rescue_top_probs
+    out["rescue_type_margin"] = rescue_margins
+    out["predicted_classes"] = [";".join(values) for values in pred_lists]
+    out["predicted_class"] = out["predicted_classes"].mask(out["predicted_classes"].astype(str) == "", "none")
+    out["called_complex_sv"] = out["predicted_classes"].astype(str) != ""
+
+    exact: list[bool] = []
+    any_match: list[bool] = []
+    for true_value, pred_value, is_labeled in zip(out["true_classes"].tolist(), out["predicted_classes"].tolist(), out["is_labeled"].astype(bool).tolist()):
+        if not is_labeled:
+            exact.append(False)
+            any_match.append(False)
+            continue
+        true_set = set(_split_class_tokens(true_value))
+        pred_set = set(_split_class_tokens(pred_value))
+        exact.append(true_set == pred_set)
+        any_match.append(bool(true_set & pred_set))
+    out["class_exact_match"] = exact
+    out["class_any_match"] = any_match
+    out["objectness_correct"] = (out["called_complex_sv"] == out["is_labeled"].astype(bool)) | ((~out["called_complex_sv"]) & out["is_background_chromosome"].astype(bool))
+    out["n_predicted_classes"] = [len(values) for values in pred_lists]
+    return out
+
+
+
+def _float_grid_from_csv(raw: str, default: list[float]) -> np.ndarray:
+    text = str(raw or "").strip()
+    if not text:
+        return np.asarray(default, dtype=np.float32)
+    vals: list[float] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(float(part))
+    return np.asarray(vals or default, dtype=np.float32)
+
+
+def rescue_threshold_metrics(
+    predictions: pd.DataFrame,
+    class_names: list[str],
+    rescue_type_tau: float,
+    rescue_objectness_floor: float,
+    rescue_margin: float,
+) -> dict[str, Any]:
+    eligible = predictions["is_labeled"].astype(bool) | predictions["is_background_chromosome"].astype(bool)
+    df = predictions.loc[eligible].copy()
+    overall, _per_class = metric_tables(df, class_names, "rescue_sweep")
+    row = overall.iloc[0].to_dict() if not overall.empty else {}
+    labeled_df = df[df["is_labeled"].astype(bool)].copy()
+    true_sets = _sets_from_series(labeled_df["true_classes"]) if not labeled_df.empty else []
+    pred_sets = _sets_from_series(labeled_df["predicted_classes"]) if not labeled_df.empty else []
+    pred_counts = [len(pred) for pred in pred_sets]
+    rescue_mask = df.get("rescued_by_type_confidence", pd.Series(False, index=df.index)).astype(bool)
+    rescued = df.loc[rescue_mask].copy()
+    n_rescued = int(len(rescued))
+    n_rescued_labeled = int(rescued["is_labeled"].astype(bool).sum()) if n_rescued else 0
+    n_rescued_empty = int((~rescued["is_labeled"].astype(bool)).sum()) if n_rescued else 0
+    n_empty = int(row.get("n_empty", 0) or 0)
+    fp = int(row.get("fp", 0) or 0)
+    row.update(
+        {
+            "rescue_type_tau": float(rescue_type_tau),
+            "rescue_objectness_floor": float(rescue_objectness_floor),
+            "rescue_margin": float(rescue_margin),
+            "mean_predicted_labels_labeled": float(np.mean(pred_counts)) if pred_counts else 0.0,
+            "multicall_rate_labeled": float(np.mean([count > 1 for count in pred_counts])) if pred_counts else 0.0,
+            "empty_false_positive_rate": float(fp / n_empty) if n_empty else 0.0,
+            "n_rescued": n_rescued,
+            "n_rescued_labeled": n_rescued_labeled,
+            "n_rescued_empty": n_rescued_empty,
+            "rescued_precision": float(n_rescued_labeled / n_rescued) if n_rescued else 1.0,
+        }
+    )
+    return row
+
+
+def choose_rescue_thresholds(
+    calibration_raw: pd.DataFrame,
+    objectness_tau: float,
+    type_thresholds: dict[str, float],
+    class_names: list[str],
+    type_tau_grid: np.ndarray,
+    objectness_floor_grid: np.ndarray,
+    margin_grid: np.ndarray,
+    min_recall: float,
+    min_precision: float,
+    max_empty_fp_rate: float,
+) -> tuple[float | None, float | None, float | None, pd.DataFrame]:
+    rows: list[dict[str, Any]] = []
+    if calibration_raw.empty:
+        return None, None, None, pd.DataFrame()
+    for rescue_type_tau in type_tau_grid:
+        for rescue_objectness_floor in objectness_floor_grid:
+            for rescue_margin in margin_grid:
+                annotated = annotate_predictions_with_secondary(
+                    calibration_raw,
+                    objectness_tau,
+                    type_thresholds,
+                    class_names,
+                    rescue_type_tau=float(rescue_type_tau),
+                    rescue_objectness_floor=float(rescue_objectness_floor),
+                    rescue_margin=float(rescue_margin),
+                )
+                rows.append(
+                    rescue_threshold_metrics(
+                        annotated,
+                        class_names,
+                        float(rescue_type_tau),
+                        float(rescue_objectness_floor),
+                        float(rescue_margin),
+                    )
+                )
+    sweep = pd.DataFrame(rows)
+    if sweep.empty:
+        return None, None, None, sweep
+    sweep["meets_constraints"] = (
+        (sweep["objectness_recall"].astype(float) >= float(min_recall))
+        & (sweep["objectness_precision"].astype(float) >= float(min_precision))
+        & (sweep["empty_false_positive_rate"].astype(float) <= float(max_empty_fp_rate))
+    )
+    sweep["rescue_objective"] = (
+        sweep["objectness_recall"].astype(float)
+        + 0.35 * sweep["class_any_match_labeled"].astype(float)
+        + 0.20 * sweep["class_exact_match_labeled"].astype(float)
+        - 0.40 * sweep["empty_false_positive_rate"].astype(float)
+        - 0.15 * sweep["multicall_rate_labeled"].astype(float)
+    )
+    candidates = sweep[sweep["meets_constraints"]].copy()
+    if candidates.empty:
+        candidates = sweep.copy()
+    best = candidates.sort_values(
+        [
+            "rescue_objective",
+            "objectness_recall",
+            "class_any_match_labeled",
+            "class_exact_match_labeled",
+            "objectness_precision",
+            "empty_false_positive_rate",
+            "n_rescued_empty",
+            "rescue_type_tau",
+            "rescue_margin",
+            "rescue_objectness_floor",
+        ],
+        ascending=[False, False, False, False, False, True, True, False, False, False],
+    ).iloc[0]
+    return float(best["rescue_type_tau"]), float(best["rescue_objectness_floor"]), float(best["rescue_margin"]), sweep
+
+
+def choose_rescue_thresholding(
+    calibration_raw: pd.DataFrame,
+    objectness_tau: float,
+    type_thresholds: dict[str, float],
+    class_names: list[str],
+    args: argparse.Namespace,
+) -> tuple[float | None, float | None, float | None, pd.DataFrame]:
+    mode = str(args.rescue_thresholding).lower()
+    if mode == "off":
+        return None, None, None, pd.DataFrame()
+    if mode == "fixed":
+        return float(args.rescue_type_tau), float(args.rescue_objectness_floor), float(args.rescue_margin), pd.DataFrame()
+    type_grid = _threshold_grid(args.rescue_type_tau_min, args.rescue_type_tau_max, args.rescue_type_tau_steps)
+    floor_grid = _float_grid_from_csv(
+        str(args.rescue_objectness_floor_grid),
+        [0.0, 0.001, 0.005, 0.01, 0.02, 0.05, 0.10],
+    )
+    margin_grid = _threshold_grid(args.rescue_margin_min, args.rescue_margin_max, args.rescue_margin_steps)
+    return choose_rescue_thresholds(
+        calibration_raw,
+        float(objectness_tau),
+        type_thresholds,
+        class_names,
+        type_grid,
+        floor_grid,
+        margin_grid,
+        min_recall=float(args.rescue_min_recall),
+        min_precision=float(args.rescue_min_precision),
+        max_empty_fp_rate=float(args.rescue_max_empty_fp_rate),
+    )
+
+
+def rescue_sweep_table_for_selected(
+    annotated: pd.DataFrame,
+    class_names: list[str],
+    selected_rescue_type_tau: float | None,
+    selected_rescue_objectness_floor: float | None,
+    selected_rescue_margin: float | None,
+    mode: str,
+) -> pd.DataFrame:
+    if selected_rescue_type_tau is None or selected_rescue_objectness_floor is None or selected_rescue_margin is None:
+        return pd.DataFrame(
+            [
+                {
+                    "rescue_thresholding": str(mode).lower(),
+                    "rescue_type_tau": np.nan,
+                    "rescue_objectness_floor": np.nan,
+                    "rescue_margin": np.nan,
+                }
+            ]
+        )
+    row = rescue_threshold_metrics(
+        annotated,
+        class_names,
+        float(selected_rescue_type_tau),
+        float(selected_rescue_objectness_floor),
+        float(selected_rescue_margin),
+    )
+    row["rescue_thresholding"] = str(mode).lower()
+    return pd.DataFrame([row])
+
+
+def secondary_threshold_metrics(predictions: pd.DataFrame, class_names: list[str], secondary_min: float, secondary_delta: float) -> dict[str, Any]:
+    eligible = predictions["is_labeled"].astype(bool) | predictions["is_background_chromosome"].astype(bool)
+    df = predictions.loc[eligible].copy()
+    overall, _per_class = metric_tables(df, class_names, "secondary_sweep")
+    row = overall.iloc[0].to_dict() if not overall.empty else {}
+    labeled_df = df[df["is_labeled"].astype(bool)].copy()
+    true_sets = _sets_from_series(labeled_df["true_classes"]) if not labeled_df.empty else []
+    pred_sets = _sets_from_series(labeled_df["predicted_classes"]) if not labeled_df.empty else []
+    extra_counts = [len(pred - true) for true, pred in zip(true_sets, pred_sets)]
+    missing_counts = [len(true - pred) for true, pred in zip(true_sets, pred_sets)]
+    pred_counts = [len(pred) for pred in pred_sets]
+    n_empty = int(row.get("n_empty", 0) or 0)
+    fp = int(row.get("fp", 0) or 0)
+    row.update(
+        {
+            "secondary_min": float(secondary_min),
+            "secondary_delta": float(secondary_delta),
+            "mean_predicted_labels_labeled": float(np.mean(pred_counts)) if pred_counts else 0.0,
+            "multicall_rate_labeled": float(np.mean([count > 1 for count in pred_counts])) if pred_counts else 0.0,
+            "mean_extra_labels_labeled": float(np.mean(extra_counts)) if extra_counts else 0.0,
+            "mean_missing_labels_labeled": float(np.mean(missing_counts)) if missing_counts else 0.0,
+            "empty_false_positive_rate": float(fp / n_empty) if n_empty else 0.0,
+        }
+    )
+    return row
+
+
+def choose_secondary_thresholds(
+    calibration_raw: pd.DataFrame,
+    objectness_tau: float,
+    type_thresholds: dict[str, float],
+    class_names: list[str],
+    min_grid: np.ndarray,
+    delta_grid: np.ndarray,
+    min_recall: float,
+    min_precision: float,
+    rescue_type_tau: float | None = None,
+    rescue_objectness_floor: float | None = None,
+    rescue_margin: float | None = None,
+) -> tuple[float | None, float | None, pd.DataFrame]:
+    rows: list[dict[str, Any]] = []
+    if calibration_raw.empty:
+        return None, None, pd.DataFrame()
+    for secondary_min in min_grid:
+        for secondary_delta in delta_grid:
+            annotated = annotate_predictions_with_secondary(
+                calibration_raw,
+                objectness_tau,
+                type_thresholds,
+                class_names,
+                secondary_min=float(secondary_min),
+                secondary_delta=float(secondary_delta),
+                rescue_type_tau=rescue_type_tau,
+                rescue_objectness_floor=rescue_objectness_floor,
+                rescue_margin=rescue_margin,
+            )
+            rows.append(secondary_threshold_metrics(annotated, class_names, float(secondary_min), float(secondary_delta)))
+    sweep = pd.DataFrame(rows)
+    if sweep.empty:
+        return None, None, sweep
+    sweep["meets_constraints"] = (sweep["objectness_recall"].astype(float) >= float(min_recall)) & (sweep["objectness_precision"].astype(float) >= float(min_precision))
+    candidates = sweep[sweep["meets_constraints"]].copy()
+    if candidates.empty:
+        candidates = sweep.copy()
+    sweep["secondary_objective"] = (
+        sweep["class_any_match_labeled"].astype(float)
+        + 0.35 * sweep["class_exact_match_labeled"].astype(float)
+        - 0.25 * sweep["mean_extra_labels_labeled"].astype(float)
+        - 0.10 * sweep["multicall_rate_labeled"].astype(float)
+    )
+    candidates = sweep[sweep["meets_constraints"]].copy()
+    if candidates.empty:
+        candidates = sweep.copy()
+    best = candidates.sort_values(
+        [
+            "secondary_objective",
+            "class_any_match_labeled",
+            "objectness_recall",
+            "mean_extra_labels_labeled",
+            "multicall_rate_labeled",
+            "class_exact_match_labeled",
+            "objectness_precision",
+            "secondary_min",
+            "secondary_delta",
+        ],
+        ascending=[False, False, False, True, True, False, False, False, False],
+    ).iloc[0]
+    return float(best["secondary_min"]), float(best["secondary_delta"]), sweep
+
+
+def choose_secondary_thresholding(
+    calibration_raw: pd.DataFrame,
+    objectness_tau: float,
+    type_thresholds: dict[str, float],
+    class_names: list[str],
+    args: argparse.Namespace,
+    rescue_type_tau: float | None = None,
+    rescue_objectness_floor: float | None = None,
+    rescue_margin: float | None = None,
+) -> tuple[float | None, float | None, pd.DataFrame]:
+    mode = str(args.secondary_thresholding).lower()
+    if mode == "off":
+        return None, None, pd.DataFrame()
+    if mode == "fixed":
+        return float(args.secondary_min), float(args.secondary_delta), pd.DataFrame()
+    min_grid = _threshold_grid(args.secondary_min_min, args.secondary_min_max, args.secondary_min_steps)
+    delta_grid = _threshold_grid(args.secondary_delta_min, args.secondary_delta_max, args.secondary_delta_steps)
+    return choose_secondary_thresholds(
+        calibration_raw,
+        float(objectness_tau),
+        type_thresholds,
+        class_names,
+        min_grid,
+        delta_grid,
+        min_recall=float(args.secondary_min_recall),
+        min_precision=float(args.secondary_min_precision),
+        rescue_type_tau=rescue_type_tau,
+        rescue_objectness_floor=rescue_objectness_floor,
+        rescue_margin=rescue_margin,
+    )
+
+
+def secondary_sweep_table_for_selected(
+    annotated: pd.DataFrame,
+    class_names: list[str],
+    selected_secondary_min: float | None,
+    selected_secondary_delta: float | None,
+    mode: str,
+) -> pd.DataFrame:
+    if selected_secondary_min is None or selected_secondary_delta is None:
+        return pd.DataFrame([{"secondary_thresholding": str(mode).lower(), "secondary_min": np.nan, "secondary_delta": np.nan}])
+    row = secondary_threshold_metrics(
+        annotated,
+        class_names,
+        float(selected_secondary_min),
+        float(selected_secondary_delta),
+    )
+    row["secondary_thresholding"] = str(mode).lower()
+    return pd.DataFrame([row])
+
+
+def metric_tables(predictions: pd.DataFrame, class_names: list[str], split_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if predictions.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    eligible = predictions["is_labeled"].astype(bool) | predictions["is_background_chromosome"].astype(bool)
+    df = predictions.loc[eligible].copy()
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    y = df["is_labeled"].astype(bool).to_numpy()
+    called = df["called_complex_sv"].astype(bool).to_numpy()
+    tp = int((y & called).sum())
+    fp = int(((~y) & called).sum())
+    fn = int((y & (~called)).sum())
+    tn = int(((~y) & (~called)).sum())
+    precision = tp / (tp + fp) if tp + fp else 1.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+    labeled = df[df["is_labeled"].astype(bool)].copy()
+    exact = float(labeled["class_exact_match"].astype(bool).mean()) if not labeled.empty else 0.0
+    any_match = float(labeled["class_any_match"].astype(bool).mean()) if not labeled.empty else 0.0
+    overall = pd.DataFrame(
+        [
+            {
+                "split": split_name,
+                "n_candidates": int(len(df)),
+                "n_labeled": int(y.sum()),
+                "n_empty": int((~y).sum()),
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "tn": tn,
+                "objectness_precision": float(precision),
+                "objectness_recall": float(recall),
+                "objectness_f1": float(f1),
+                "class_exact_match_labeled": exact,
+                "class_any_match_labeled": any_match,
+            }
+        ]
+    )
+
+    true_sets = _sets_from_series(df["true_classes"])
+    pred_sets = _sets_from_series(df["predicted_classes"] if "predicted_classes" in df else df["predicted_class"])
+    per_class_rows: list[dict[str, Any]] = []
+    for class_name in class_names:
+        true = np.asarray([class_name in values for values in true_sets], dtype=bool)
+        pred = np.asarray([class_name in values for values in pred_sets], dtype=bool)
+        c_tp = int((true & pred).sum())
+        c_fp = int(((~true) & pred).sum())
+        c_fn = int((true & (~pred)).sum())
+        c_precision = c_tp / (c_tp + c_fp) if c_tp + c_fp else 1.0
+        c_recall = c_tp / (c_tp + c_fn) if c_tp + c_fn else 0.0
+        c_f1 = 2 * c_precision * c_recall / (c_precision + c_recall) if c_precision + c_recall else 0.0
+        per_class_rows.append(
+            {
+                "split": split_name,
+                "class_name": class_name,
+                "support": int(true.sum()),
+                "predicted": int(pred.sum()),
+                "tp": c_tp,
+                "fp": c_fp,
+                "fn": c_fn,
+                "precision": float(c_precision),
+                "recall": float(c_recall),
+                "f1": float(c_f1),
+            }
+        )
+    return overall, pd.DataFrame(per_class_rows)
+
+
+
+class CandidateRegionTabularClassifierHead(nn.Module):
+    """Frozen embedding branch plus scaled candidate-table feature branch."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        tabular_dim: int,
+        num_classes: int,
+        hidden_dims: list[int],
+        tabular_hidden_dim: int = 32,
+        dropout: float = 0.2,
+        activation: str = "relu",
+    ):
+        super().__init__()
+        act: type[nn.Module] = nn.GELU if str(activation).lower() == "gelu" else nn.ReLU
+        emb_layers: list[nn.Module] = []
+        prev = int(embedding_dim)
+        for hidden in [int(x) for x in hidden_dims if int(x) > 0]:
+            emb_layers.extend([nn.Linear(prev, hidden), nn.LayerNorm(hidden), act(), nn.Dropout(float(dropout))])
+            prev = hidden
+        self.embedding_backbone = nn.Sequential(*emb_layers) if emb_layers else nn.Identity()
+        self.embedding_out_dim = int(prev)
+        self.tabular_dim = int(tabular_dim)
+        tab_hidden = int(tabular_hidden_dim)
+        if self.tabular_dim > 0 and tab_hidden > 0:
+            self.tabular_backbone = nn.Sequential(
+                nn.Linear(self.tabular_dim, tab_hidden),
+                nn.LayerNorm(tab_hidden),
+                act(),
+                nn.Dropout(float(dropout)),
+            )
+            self.tabular_out_dim = tab_hidden
+        elif self.tabular_dim > 0:
+            self.tabular_backbone = nn.Identity()
+            self.tabular_out_dim = self.tabular_dim
+        else:
+            self.tabular_backbone = nn.Identity()
+            self.tabular_out_dim = 0
+        fused_dim = self.embedding_out_dim + self.tabular_out_dim
+        self.objectness = nn.Linear(fused_dim, 1)
+        self.type_classifier = nn.Linear(fused_dim, int(num_classes))
+
+    def forward(self, embedding: torch.Tensor, tabular: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.embedding_backbone(embedding)
+        if self.tabular_dim > 0:
+            if tabular is None:
+                raise ValueError("tabular features are required for this model")
+            h_tab = self.tabular_backbone(tabular)
+            h = torch.cat([h, h_tab], dim=-1)
+        return self.objectness(h).squeeze(-1), self.type_classifier(h)
+
+
+def _make_model(args: argparse.Namespace, embedding_dim: int, tabular_dim: int, n_classes: int, device: torch.device) -> CandidateRegionTabularClassifierHead:
+    return CandidateRegionTabularClassifierHead(
+        embedding_dim=int(embedding_dim),
+        tabular_dim=int(tabular_dim),
+        num_classes=int(n_classes),
+        hidden_dims=_hidden_dims(args.hidden_dims),
+        tabular_hidden_dim=int(args.tabular_hidden_dim),
+        dropout=float(args.dropout),
+        activation=str(args.activation),
+    ).to(device)
+
+
+def _train_model(
+    embeddings: np.ndarray,
+    tabular_features: np.ndarray,
+    metadata: pd.DataFrame,
+    class_names: list[str],
+    train_mask: np.ndarray,
+    args: argparse.Namespace,
+    device: torch.device,
+    epochs: int,
+    patience: int,
+    seed_offset: int = 0,
+    log_prefix: str = "train",
+) -> tuple[CandidateRegionTabularClassifierHead, pd.DataFrame]:
+    set_seed(int(args.seed) + int(seed_offset))
+    targets_np = _multi_hot_targets(metadata, class_names)
+    labeled, background = _label_background_masks(metadata)
+    usable_mask = train_mask & (labeled | background)
+    train_idx = np.where(usable_mask)[0]
+    if train_idx.size == 0:
+        raise RuntimeError(f"No usable labeled/background rows for {log_prefix}")
+    if not bool(labeled[train_idx].any()):
+        raise RuntimeError(f"No positive labels available for {log_prefix}")
+
+    x_train = torch.as_tensor(embeddings[train_idx], dtype=torch.float32, device=device)
+    tab_np = np.asarray(tabular_features, dtype=np.float32)
+    if tab_np.shape[0] != embeddings.shape[0]:
+        raise ValueError(f"tabular row count {tab_np.shape[0]} does not match embeddings {embeddings.shape[0]}")
+    x_tab_train = torch.as_tensor(tab_np[train_idx], dtype=torch.float32, device=device)
+    objectness_targets = torch.as_tensor(labeled[train_idx].astype(np.float32), dtype=torch.float32, device=device)
+    type_targets = torch.as_tensor(targets_np[train_idx], dtype=torch.float32, device=device)
+    type_mask_np = labeled[train_idx]
+    type_mask = torch.as_tensor(type_mask_np, dtype=torch.bool, device=device)
+    objectness_weights = torch.as_tensor(_objectness_weights(metadata, train_idx, labeled, background, float(args.background_weight)), dtype=torch.float32, device=device)
+    pos_weight = _pos_weight(targets_np[train_idx], type_mask_np, str(args.class_weighting), device)
+
+    model = _make_model(args, embeddings.shape[1], tab_np.shape[1], len(class_names), device)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    best_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    patience_left = int(patience)
+    rows: list[dict[str, Any]] = []
+
+    for epoch in range(1, int(epochs) + 1):
+        model.train()
+        opt.zero_grad(set_to_none=True)
+        objectness_logits, type_logits = model(x_train, x_tab_train)
+        bce_obj = F.binary_cross_entropy_with_logits(objectness_logits.view(-1), objectness_targets, reduction="none")
+        objectness_loss = (bce_obj * objectness_weights).sum() / objectness_weights.sum().clamp_min(1e-8)
+        if type_mask.any():
+            smooth_targets = _smooth_binary_targets(type_targets[type_mask], float(args.label_smoothing))
+            type_loss = F.binary_cross_entropy_with_logits(
+                type_logits[type_mask],
+                smooth_targets,
+                pos_weight=pos_weight,
+            )
+        else:
+            type_loss = torch.zeros((), dtype=objectness_loss.dtype, device=device)
+        loss = objectness_loss + float(args.type_loss_weight) * type_loss
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+        opt.step()
+
+        with torch.no_grad():
+            objectness_prob = torch.sigmoid(objectness_logits)
+            obj_acc = float(((objectness_prob >= 0.5) == objectness_targets.bool()).float().mean().item())
+            if type_mask.any():
+                type_prob = torch.sigmoid(type_logits[type_mask])
+                exact = ((type_prob >= 0.5) == type_targets[type_mask].bool()).all(dim=1).float().mean().item()
+            else:
+                exact = 0.0
+        loss_value = float(loss.detach().cpu().item())
+        improved = loss_value < best_loss - 1e-6
+        if improved:
+            best_loss = loss_value
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience_left = int(patience)
+        else:
+            patience_left -= 1
+        rows.append(
+            {
+                "epoch": int(epoch),
+                "loss": loss_value,
+                "objectness_loss": float(objectness_loss.detach().cpu().item()),
+                "type_loss": float(type_loss.detach().cpu().item()),
+                "objectness_acc_at_0_5": obj_acc,
+                "type_subset_acc_labeled_at_0_5": float(exact),
+                "n_train": int(train_idx.size),
+                "n_labeled": int(labeled[train_idx].sum()),
+                "n_background": int(background[train_idx].sum()),
+                "is_best": bool(improved),
+                "split": log_prefix,
+            }
+        )
+        if log_prefix == "final" and (epoch == 1 or epoch % int(args.log_every) == 0 or epoch == int(epochs)):
+            log.info(
+                "epoch=%d loss=%.4f obj=%.4f type=%.4f",
+                epoch,
+                loss_value,
+                float(objectness_loss.detach().cpu().item()),
+                float(type_loss.detach().cpu().item()),
+            )
+        if int(patience) > 0 and patience_left <= 0:
+            if log_prefix == "final":
+                log.info("Early stopping final head at epoch %d; best loss %.4f", epoch, best_loss)
+            break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, pd.DataFrame(rows)
+
+
+def predict_model(
+    model: CandidateRegionTabularClassifierHead,
+    embeddings: np.ndarray,
+    tabular_features: np.ndarray,
+    metadata: pd.DataFrame,
+    class_names: list[str],
+    device: torch.device,
+    batch_size: int = 512,
+) -> pd.DataFrame:
+    model.eval()
+    obj_logits: list[np.ndarray] = []
+    type_logits_out: list[np.ndarray] = []
+    tab_np = np.asarray(tabular_features, dtype=np.float32)
+    with torch.no_grad():
+        for start in range(0, embeddings.shape[0], int(batch_size)):
+            stop = start + int(batch_size)
+            batch = torch.as_tensor(embeddings[start:stop], dtype=torch.float32, device=device)
+            tab_batch = torch.as_tensor(tab_np[start:stop], dtype=torch.float32, device=device)
+            objectness_logits, type_logits = model(batch, tab_batch)
+            obj_logits.append(objectness_logits.detach().cpu().numpy().astype(np.float32))
+            type_logits_out.append(type_logits.detach().cpu().numpy().astype(np.float32))
+    objectness_logit_np = np.concatenate(obj_logits, axis=0)
+    objectness_prob_np = 1.0 / (1.0 + np.exp(-objectness_logit_np))
+    type_logit_np = np.concatenate(type_logits_out, axis=0)
+    type_prob_np = 1.0 / (1.0 + np.exp(-type_logit_np))
+    out = metadata.copy()
+    labeled, background = _label_background_masks(out)
+    targets = _multi_hot_targets(out, class_names)
+    out["is_labeled"] = labeled.astype(int)
+    out["is_background_chromosome"] = background.astype(int)
+    if "raw_sv_classes" in out:
+        out["raw_true_classes"] = out["raw_sv_classes"].astype(str)
+    out["true_classes"] = [";".join([class_names[i] for i, flag in enumerate(row) if flag > 0]) for row in targets]
+    out["objectness_logit"] = objectness_logit_np.astype(float)
+    out["objectness_prob"] = objectness_prob_np.astype(float)
+    max_idx = np.argmax(type_prob_np, axis=1)
+    out["top_type_class"] = [class_names[int(i)] for i in max_idx]
+    out["max_type_probability"] = type_prob_np.max(axis=1).astype(float)
+    out["max_type_logit"] = type_logit_np[np.arange(type_logit_np.shape[0]), max_idx].astype(float)
+    for i, class_name in enumerate(class_names):
+        out[f"type_logit_{class_name}"] = type_logit_np[:, i].astype(float)
+        out[f"type_probability_{class_name}"] = type_prob_np[:, i].astype(float)
+    return out
+
+
+def run_train_logo_calibration(
+    embeddings: np.ndarray,
+    tabular_features: np.ndarray,
+    metadata: pd.DataFrame,
+    class_names: list[str],
+    outer_train_mask: np.ndarray,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    labeled, background = _label_background_masks(metadata)
+    samples = metadata["sample_id"].astype(str).to_numpy()
+    eligible_outer = outer_train_mask & (labeled | background)
+    held_samples = sorted(pd.unique(samples[eligible_outer]).tolist())
+    rows: list[pd.DataFrame] = []
+    metric_rows: list[pd.DataFrame] = []
+    logo_epochs = int(args.logo_epochs) if args.logo_epochs is not None else int(args.epochs)
+    logo_patience = int(args.logo_patience) if args.logo_patience is not None else int(args.patience)
+
+    log.info(
+        "Running LOGO threshold calibration on %d training genome(s): epochs=%d patience=%d",
+        len(held_samples),
+        logo_epochs,
+        logo_patience,
+    )
+    for fold_i, held_sample in enumerate(held_samples, start=1):
+        eval_mask = eligible_outer & (samples == held_sample)
+        fold_train_mask = outer_train_mask & (samples != held_sample)
+        n_fold_pos = int((fold_train_mask & labeled).sum())
+        n_fold_background = int((fold_train_mask & background).sum())
+        if n_fold_pos == 0:
+            log.warning("Skipping LOGO fold for %s; no positive candidate remains in calibration training fold", held_sample)
+            continue
+        if int(eval_mask.sum()) == 0:
+            log.warning("Skipping LOGO fold for %s; no eligible held-out candidate rows", held_sample)
+            continue
+
+        log.info(
+            "LOGO fold %d/%d held_out=%s train_pos=%d train_empty=%d eval_candidates=%d",
+            fold_i,
+            len(held_samples),
+            held_sample,
+            n_fold_pos,
+            n_fold_background,
+            int(eval_mask.sum()),
+        )
+        model, metrics = _train_model(
+            embeddings,
+            tabular_features,
+            metadata,
+            class_names,
+            train_mask=fold_train_mask,
+            args=args,
+            device=device,
+            epochs=logo_epochs,
+            patience=logo_patience,
+            seed_offset=2000 + fold_i,
+            log_prefix=f"logo:{held_sample}",
+        )
+        metrics["held_out_sample"] = held_sample
+        metrics["calibration_split"] = "logo"
+        metric_rows.append(metrics)
+
+        pred = predict_model(model, embeddings, tabular_features, metadata, class_names, device=device, batch_size=int(args.batch_size))
+        fold = pred.loc[eval_mask].copy()
+        fold["held_out_sample"] = held_sample
+        fold["calibration_split"] = "logo"
+        fold["logo_fold"] = int(fold_i)
+        fold["logo_train_n_labeled"] = n_fold_pos
+        fold["logo_train_n_empty"] = n_fold_background
+        rows.append(fold)
+
+    calibration_predictions = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    calibration_metrics = pd.concat(metric_rows, ignore_index=True) if metric_rows else pd.DataFrame()
+    return calibration_predictions, calibration_metrics
+
+
+def plot_split_metrics(metrics: pd.DataFrame, output_path: Path) -> None:
+    if metrics.empty:
+        return
+    df = metrics[metrics["split"].isin(["train", "test"])].copy()
+    if df.empty:
+        return
+    x = np.arange(len(df))
+    width = 0.24
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
+    for offset, column, label in [
+        (-width, "objectness_precision", "precision"),
+        (0.0, "objectness_recall", "recall"),
+        (width, "objectness_f1", "F1"),
+    ]:
+        axes[0].bar(x + offset, df[column].astype(float), width=width, label=label)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(df["split"].astype(str))
+    axes[0].set_ylim(0, 1.05)
+    axes[0].set_ylabel("Score")
+    axes[0].set_title("Objectness Metrics")
+    axes[0].legend(fontsize=8)
+    axes[0].grid(axis="y", alpha=0.2)
+
+    for offset, column, label in [
+        (-width / 2, "class_exact_match_labeled", "exact"),
+        (width / 2, "class_any_match_labeled", "any match"),
+    ]:
+        axes[1].bar(x + offset, df[column].astype(float), width=width, label=label)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(df["split"].astype(str))
+    axes[1].set_ylim(0, 1.05)
+    axes[1].set_ylabel("Score")
+    axes[1].set_title("Labeled Candidate Type Metrics")
+    axes[1].legend(fontsize=8)
+    axes[1].grid(axis="y", alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_per_class_metrics(per_class: pd.DataFrame, output_path: Path) -> None:
+    if per_class.empty:
+        return
+    df = per_class[per_class["split"].isin(["train", "test"])].copy()
+    if df.empty:
+        return
+    classes = list(dict.fromkeys(df["class_name"].astype(str).tolist()))
+    splits = [split for split in ["train", "test"] if split in set(df["split"].astype(str))]
+    x = np.arange(len(classes))
+    width = 0.34 if len(splits) > 1 else 0.5
+    fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.4), sharey=True)
+    for ax, metric in zip(axes, ["precision", "recall", "f1"]):
+        for i, split in enumerate(splits):
+            vals = []
+            for class_name in classes:
+                sub = df[(df["split"].astype(str) == split) & (df["class_name"].astype(str) == class_name)]
+                vals.append(float(sub[metric].iloc[0]) if not sub.empty else 0.0)
+            offset = (i - (len(splits) - 1) / 2) * width
+            ax.bar(x + offset, vals, width=width, label=split)
+        ax.set_xticks(x)
+        ax.set_xticklabels(classes, rotation=30, ha="right")
+        ax.set_ylim(0, 1.05)
+        ax.set_title(metric.title())
+        ax.grid(axis="y", alpha=0.2)
+    axes[0].set_ylabel("Score")
+    axes[-1].legend(fontsize=8)
+    fig.suptitle("Per-Class Candidate-Region Metrics", y=1.02)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+def _jsonable_config(args: argparse.Namespace) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            out[key] = str(value)
+        else:
+            out[key] = value
+    return out
+
+
+def run(args: argparse.Namespace) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    set_seed(int(args.seed))
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    class_names = _split_csv(args.class_names)
+    if not class_names:
+        raise ValueError("--class_names must include at least one class")
+
+    manifest = embed_corpus.read_manifest(args.manifest)
+    candidates_df = read_candidate_regions(args.candidate_regions, class_names)
+    device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+    log.info("Using device=%s; candidates=%d classes=%s", device, len(candidates_df), class_names)
+
+    if args.reuse_embeddings and (output_dir / "embeddings.npz").exists() and (output_dir / "candidate_embeddings.tsv").exists():
+        data = np.load(output_dir / "embeddings.npz", allow_pickle=True)
+        embeddings = np.asarray(data["embeddings"], dtype=np.float32)
+        metadata = pd.read_csv(output_dir / "candidate_embeddings.tsv", sep="\t").fillna("")
+        log.info("Reusing embeddings from %s", output_dir)
+    else:
+        embeddings, metadata = embed_candidate_table(
+            candidates_df,
+            manifest,
+            args.cn_checkpoint,
+            args.graph_checkpoint,
+            output_dir,
+            args.embedding_normalization,
+            int(args.sample_baseline_min_candidates),
+            bool(args.strict),
+            device,
+        )
+
+    embeddings, metadata, selected_embedding_features = select_embedding_features(
+        embeddings,
+        metadata,
+        str(args.embedding_features),
+        output_dir,
+    )
+    log.info("Using embedding_features=%s; embedding_dim=%d", selected_embedding_features, embeddings.shape[1])
+
+    tabular_feature_names = selected_tabular_feature_names(str(args.tabular_features))
+    tabular_features = make_tabular_features(metadata, tabular_feature_names)
+    write_tabular_feature_table(metadata, tabular_features, tabular_feature_names, output_dir)
+    log.info("Using %d safe tabular feature(s): %s", len(tabular_feature_names), ",".join(tabular_feature_names) if tabular_feature_names else "none")
+
+    targets = _multi_hot_targets(metadata, class_names)
+    labeled, background = _label_background_masks(metadata)
+    class_counts = _class_counts(targets, class_names)
+    samples = metadata["sample_id"].astype(str).to_numpy()
+    test_samples = select_test_samples(
+        samples,
+        required=str(args.required_test_sample),
+        explicit=_split_csv(args.test_samples),
+        n_test_samples=int(args.n_test_samples),
+        seed=int(args.seed),
+    )
+    test_mask = np.isin(samples, np.asarray(test_samples, dtype=object))
+    train_mask = ~test_mask
+    if int((train_mask & labeled).sum()) < 4:
+        raise RuntimeError("Training split has fewer than four positive candidate regions")
+    if int((train_mask & background).sum()) == 0:
+        raise RuntimeError("Training split has no empty candidate-region negatives")
+
+    split_rows = []
+    for sample_id in sorted(pd.unique(samples)):
+        sample_mask = samples == sample_id
+        split_rows.append(
+            {
+                "sample_id": sample_id,
+                "split": "test" if sample_id in test_samples else "train",
+                "n_candidates": int(sample_mask.sum()),
+                "n_positive": int((sample_mask & labeled).sum()),
+                "n_empty": int((sample_mask & background).sum()),
+            }
+        )
+    split_df = pd.DataFrame(split_rows)
+    split_df.to_csv(output_dir / "sample_splits.tsv", sep="\t", index=False)
+    log.info(
+        "Split: train_candidates=%d train_pos=%d train_empty=%d test_samples=%s test_candidates=%d",
+        int(train_mask.sum()),
+        int((train_mask & labeled).sum()),
+        int((train_mask & background).sum()),
+        ",".join(test_samples),
+        int(test_mask.sum()),
+    )
+
+    objectness_grid = _threshold_grid(args.tau_min, args.tau_max, args.tau_steps)
+    type_grid = _threshold_grid(args.type_tau_min, args.type_tau_max, args.type_tau_steps)
+    threshold_calibration = str(args.threshold_calibration).lower()
+    objectness_tau_df = pd.DataFrame()
+    type_threshold_sweep = pd.DataFrame()
+    calibration_raw = pd.DataFrame()
+    calibration_annotated = pd.DataFrame()
+    calibration_training_metrics = pd.DataFrame()
+    rescue_threshold_sweep = pd.DataFrame()
+    secondary_threshold_sweep = pd.DataFrame()
+    selected_objectness_tau: float | None = None
+    type_thresholds: dict[str, float] = {}
+    selected_rescue_type_tau: float | None = None
+    selected_rescue_objectness_floor: float | None = None
+    selected_rescue_margin: float | None = None
+    selected_secondary_min: float | None = None
+    selected_secondary_delta: float | None = None
+
+    if threshold_calibration == "logo":
+        calibration_raw, calibration_training_metrics = run_train_logo_calibration(
+            embeddings,
+            tabular_features,
+            metadata,
+            class_names,
+            outer_train_mask=train_mask,
+            args=args,
+            device=device,
+        )
+        if calibration_raw.empty:
+            raise RuntimeError("LOGO threshold calibration produced no held-out predictions")
+        calibration_raw.to_csv(output_dir / "logo_calibration_raw.tsv", sep="\t", index=False)
+        calibration_training_metrics.to_csv(output_dir / "logo_training_metrics.tsv", sep="\t", index=False)
+        objectness_tau_df = sweep_objectness_tau(calibration_raw, objectness_grid)
+        selected_objectness_tau = float(args.tau) if args.tau is not None else choose_tau_from_sweep(
+            objectness_tau_df,
+            metric=str(args.tau_selection_metric),
+            tie_break=str(args.threshold_tie_break),
+        )
+        if args.type_tau is not None:
+            type_thresholds = {name: float(args.type_tau) for name in class_names}
+            type_threshold_sweep = pd.DataFrame()
+        else:
+            type_thresholds, type_threshold_sweep = choose_type_thresholds_from_predictions(
+                calibration_raw,
+                class_names,
+                type_grid,
+                tie_break=str(args.threshold_tie_break),
+            )
+        selected_rescue_type_tau, selected_rescue_objectness_floor, selected_rescue_margin, rescue_threshold_sweep = choose_rescue_thresholding(
+            calibration_raw,
+            float(selected_objectness_tau),
+            type_thresholds,
+            class_names,
+            args,
+        )
+        selected_secondary_min, selected_secondary_delta, secondary_threshold_sweep = choose_secondary_thresholding(
+            calibration_raw,
+            float(selected_objectness_tau),
+            type_thresholds,
+            class_names,
+            args,
+            rescue_type_tau=selected_rescue_type_tau,
+            rescue_objectness_floor=selected_rescue_objectness_floor,
+            rescue_margin=selected_rescue_margin,
+        )
+        calibration_annotated = annotate_predictions_with_secondary(
+            calibration_raw,
+            float(selected_objectness_tau),
+            type_thresholds,
+            class_names,
+            secondary_min=selected_secondary_min,
+            secondary_delta=selected_secondary_delta,
+            rescue_type_tau=selected_rescue_type_tau,
+            rescue_objectness_floor=selected_rescue_objectness_floor,
+            rescue_margin=selected_rescue_margin,
+        )
+        if rescue_threshold_sweep.empty:
+            rescue_threshold_sweep = rescue_sweep_table_for_selected(
+                calibration_annotated,
+                class_names,
+                selected_rescue_type_tau,
+                selected_rescue_objectness_floor,
+                selected_rescue_margin,
+                str(args.rescue_thresholding),
+            )
+        if secondary_threshold_sweep.empty:
+            secondary_threshold_sweep = secondary_sweep_table_for_selected(
+                calibration_annotated,
+                class_names,
+                selected_secondary_min,
+                selected_secondary_delta,
+                str(args.secondary_thresholding),
+            )
+        calibration_annotated.to_csv(output_dir / "logo_calibration_predictions.tsv", sep="\t", index=False)
+        objectness_tau_df.to_csv(output_dir / "objectness_tau_sweep_logo.tsv", sep="\t", index=False)
+        objectness_tau_df.to_csv(output_dir / "objectness_tau_sweep_calibration.tsv", sep="\t", index=False)
+        type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_logo.tsv", sep="\t", index=False)
+        type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_calibration.tsv", sep="\t", index=False)
+        rescue_threshold_sweep.to_csv(output_dir / "rescue_threshold_sweep_logo.tsv", sep="\t", index=False)
+        rescue_threshold_sweep.to_csv(output_dir / "rescue_threshold_sweep_calibration.tsv", sep="\t", index=False)
+        secondary_threshold_sweep.to_csv(output_dir / "secondary_threshold_sweep_logo.tsv", sep="\t", index=False)
+        secondary_threshold_sweep.to_csv(output_dir / "secondary_threshold_sweep_calibration.tsv", sep="\t", index=False)
+        logo_overall, logo_per_class = metric_tables(calibration_annotated, class_names, "logo")
+        logo_overall.to_csv(output_dir / "logo_metrics_summary.tsv", sep="\t", index=False)
+        logo_per_class.to_csv(output_dir / "logo_per_class_metrics.tsv", sep="\t", index=False)
+        log.info(
+            "LOGO-selected thresholds: objectness_tau=%.4g type_thresholds=%s rescue_type_tau=%s rescue_floor=%s rescue_margin=%s secondary_min=%s secondary_delta=%s",
+            float(selected_objectness_tau),
+            {name: round(float(value), 4) for name, value in type_thresholds.items()},
+            None if selected_rescue_type_tau is None else round(float(selected_rescue_type_tau), 4),
+            None if selected_rescue_objectness_floor is None else round(float(selected_rescue_objectness_floor), 4),
+            None if selected_rescue_margin is None else round(float(selected_rescue_margin), 4),
+            None if selected_secondary_min is None else round(float(selected_secondary_min), 4),
+            None if selected_secondary_delta is None else round(float(selected_secondary_delta), 4),
+        )
+
+    model_args = argparse.Namespace(**vars(args))
+    final_model, training_metrics = _train_model(
+        embeddings,
+        tabular_features,
+        metadata,
+        class_names,
+        train_mask=train_mask,
+        args=model_args,
+        device=device,
+        epochs=int(args.epochs),
+        patience=int(args.patience),
+        seed_offset=0,
+        log_prefix="final",
+    )
+    training_metrics.to_csv(output_dir / "training_metrics.tsv", sep="\t", index=False)
+    _plot_training(training_metrics, output_dir / "training_curves.png")
+
+    raw_predictions = predict_model(final_model, embeddings, tabular_features, metadata, class_names, device=device, batch_size=int(args.batch_size))
+    train_raw = raw_predictions.loc[train_mask].copy()
+    train_objectness_tau_df = sweep_objectness_tau(train_raw, objectness_grid)
+    train_objectness_tau_df.to_csv(output_dir / "objectness_tau_sweep_in_sample_train.tsv", sep="\t", index=False)
+    train_type_thresholds, train_type_threshold_sweep = choose_type_thresholds_from_predictions(
+        train_raw,
+        class_names,
+        type_grid,
+        tie_break=str(args.threshold_tie_break),
+    )
+    train_type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_in_sample_train.tsv", sep="\t", index=False)
+
+    if threshold_calibration == "train":
+        objectness_tau_df = train_objectness_tau_df
+        selected_objectness_tau = float(args.tau) if args.tau is not None else choose_tau_from_sweep(
+            objectness_tau_df,
+            metric=str(args.tau_selection_metric),
+            tie_break=str(args.threshold_tie_break),
+        )
+        if args.type_tau is not None:
+            type_thresholds = {name: float(args.type_tau) for name in class_names}
+            type_threshold_sweep = pd.DataFrame()
+        else:
+            type_thresholds = train_type_thresholds
+            type_threshold_sweep = train_type_threshold_sweep
+        selected_rescue_type_tau, selected_rescue_objectness_floor, selected_rescue_margin, rescue_threshold_sweep = choose_rescue_thresholding(
+            train_raw,
+            float(selected_objectness_tau),
+            type_thresholds,
+            class_names,
+            args,
+        )
+        selected_secondary_min, selected_secondary_delta, secondary_threshold_sweep = choose_secondary_thresholding(
+            train_raw,
+            float(selected_objectness_tau),
+            type_thresholds,
+            class_names,
+            args,
+            rescue_type_tau=selected_rescue_type_tau,
+            rescue_objectness_floor=selected_rescue_objectness_floor,
+            rescue_margin=selected_rescue_margin,
+        )
+        train_calibration_annotated = annotate_predictions_with_secondary(
+            train_raw,
+            float(selected_objectness_tau),
+            type_thresholds,
+            class_names,
+            secondary_min=selected_secondary_min,
+            secondary_delta=selected_secondary_delta,
+            rescue_type_tau=selected_rescue_type_tau,
+            rescue_objectness_floor=selected_rescue_objectness_floor,
+            rescue_margin=selected_rescue_margin,
+        )
+        if rescue_threshold_sweep.empty:
+            rescue_threshold_sweep = rescue_sweep_table_for_selected(
+                train_calibration_annotated,
+                class_names,
+                selected_rescue_type_tau,
+                selected_rescue_objectness_floor,
+                selected_rescue_margin,
+                str(args.rescue_thresholding),
+            )
+        if secondary_threshold_sweep.empty:
+            secondary_threshold_sweep = secondary_sweep_table_for_selected(
+                train_calibration_annotated,
+                class_names,
+                selected_secondary_min,
+                selected_secondary_delta,
+                str(args.secondary_thresholding),
+            )
+        objectness_tau_df.to_csv(output_dir / "objectness_tau_sweep_train.tsv", sep="\t", index=False)
+        objectness_tau_df.to_csv(output_dir / "objectness_tau_sweep_calibration.tsv", sep="\t", index=False)
+        type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_train.tsv", sep="\t", index=False)
+        type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_calibration.tsv", sep="\t", index=False)
+        rescue_threshold_sweep.to_csv(output_dir / "rescue_threshold_sweep_train.tsv", sep="\t", index=False)
+        rescue_threshold_sweep.to_csv(output_dir / "rescue_threshold_sweep_calibration.tsv", sep="\t", index=False)
+        secondary_threshold_sweep.to_csv(output_dir / "secondary_threshold_sweep_train.tsv", sep="\t", index=False)
+        secondary_threshold_sweep.to_csv(output_dir / "secondary_threshold_sweep_calibration.tsv", sep="\t", index=False)
+
+    if selected_objectness_tau is None:
+        raise RuntimeError("No objectness threshold was selected")
+    _plot_thresholds(objectness_tau_df, type_threshold_sweep, output_dir, float(selected_objectness_tau))
+
+    predictions = annotate_predictions_with_secondary(
+        raw_predictions,
+        float(selected_objectness_tau),
+        type_thresholds,
+        class_names,
+        secondary_min=selected_secondary_min,
+        secondary_delta=selected_secondary_delta,
+        rescue_type_tau=selected_rescue_type_tau,
+        rescue_objectness_floor=selected_rescue_objectness_floor,
+        rescue_margin=selected_rescue_margin,
+    )
+    predictions["split"] = np.where(test_mask, "test", "train")
+    predictions.to_csv(output_dir / "classification_predictions.tsv", sep="\t", index=False)
+    predictions.loc[train_mask].to_csv(output_dir / "train_predictions.tsv", sep="\t", index=False)
+    predictions.loc[test_mask].to_csv(output_dir / "test_predictions.tsv", sep="\t", index=False)
+    predictions[predictions["called_complex_sv"].astype(bool)].to_csv(output_dir / "predicted_complex_sv.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        [
+            {
+                "class_name": name,
+                "type_threshold": float(type_thresholds.get(name, 0.5)),
+                "secondary_threshold": (
+                    max(float(type_thresholds.get(name, 0.5)) + float(selected_secondary_delta), float(selected_secondary_min))
+                    if selected_secondary_min is not None and selected_secondary_delta is not None
+                    else float(type_thresholds.get(name, 0.5))
+                ),
+            }
+            for name in class_names
+        ]
+    ).to_csv(output_dir / "type_thresholds.tsv", sep="\t", index=False)
+
+    overall_tables: list[pd.DataFrame] = []
+    per_class_tables: list[pd.DataFrame] = []
+    for split_name, split_mask in [("train", train_mask), ("test", test_mask), ("all", np.ones(len(metadata), dtype=bool))]:
+        overall, per_class = metric_tables(predictions.loc[split_mask].copy(), class_names, split_name)
+        if not overall.empty:
+            overall_tables.append(overall)
+        if not per_class.empty:
+            per_class_tables.append(per_class)
+    overall_metrics = pd.concat(overall_tables, ignore_index=True) if overall_tables else pd.DataFrame()
+    per_class_metrics = pd.concat(per_class_tables, ignore_index=True) if per_class_tables else pd.DataFrame()
+    overall_metrics.to_csv(output_dir / "metrics_summary.tsv", sep="\t", index=False)
+    per_class_metrics.to_csv(output_dir / "per_class_metrics.tsv", sep="\t", index=False)
+    plot_split_metrics(overall_metrics, output_dir / "split_metrics.png")
+    plot_per_class_metrics(per_class_metrics, output_dir / "per_class_metrics.png")
+
+    compatibility_distances = predictions_to_distance_table(predictions, class_names)
+    compatibility_distances.to_csv(output_dir / "prototype_distances.tsv", sep="\t", index=False)
+    try:
+        embed_corpus.write_visualizations(
+            embeddings,
+            metadata,
+            compatibility_distances,
+            pd.DataFrame(),
+            output_dir,
+            tau=1.0 - float(selected_objectness_tau),
+        )
+    except Exception as exc:
+        log.warning("Candidate-region embedding visualization failed: %s", exc)
+
+    checkpoint = {
+        "model_state_dict": final_model.state_dict(),
+        "input_dim": int(embeddings.shape[1]),
+        "embedding_dim": int(embeddings.shape[1]),
+        "tabular_dim": int(tabular_features.shape[1]),
+        "tabular_feature_names": tabular_feature_names,
+        "tabular_hidden_dim": int(args.tabular_hidden_dim),
+        "hidden_dims": _hidden_dims(args.hidden_dims),
+        "dropout": float(args.dropout),
+        "activation": str(args.activation),
+        "class_names": class_names,
+        "selected_objectness_tau": float(selected_objectness_tau),
+        "type_thresholds": {name: float(value) for name, value in type_thresholds.items()},
+        "threshold_calibration": threshold_calibration,
+        "threshold_tie_break": str(args.threshold_tie_break),
+        "rescue_thresholding": str(args.rescue_thresholding),
+        "selected_rescue_type_tau": None if selected_rescue_type_tau is None else float(selected_rescue_type_tau),
+        "selected_rescue_objectness_floor": None if selected_rescue_objectness_floor is None else float(selected_rescue_objectness_floor),
+        "selected_rescue_margin": None if selected_rescue_margin is None else float(selected_rescue_margin),
+        "secondary_thresholding": str(args.secondary_thresholding),
+        "selected_secondary_min": None if selected_secondary_min is None else float(selected_secondary_min),
+        "selected_secondary_delta": None if selected_secondary_delta is None else float(selected_secondary_delta),
+        "calibration_n_candidates": int(len(calibration_raw)),
+        "class_counts_train": _class_counts(_multi_hot_targets(metadata.loc[train_mask].reset_index(drop=True), class_names), class_names),
+        "class_counts_all": class_counts,
+        "test_samples": test_samples,
+        "embedding_mode": "candidate_region_with_context",
+        "embedding_features": selected_embedding_features,
+        "config": _jsonable_config(args),
+    }
+    torch.save(checkpoint, output_dir / "candidate_region_classifier.pt")
+
+    summary = {
+        "class_names": class_names,
+        "class_counts_all": class_counts,
+        "selected_objectness_tau": float(selected_objectness_tau),
+        "type_thresholds": {name: float(value) for name, value in type_thresholds.items()},
+        "threshold_calibration": threshold_calibration,
+        "threshold_tie_break": str(args.threshold_tie_break),
+        "rescue_thresholding": str(args.rescue_thresholding),
+        "selected_rescue_type_tau": None if selected_rescue_type_tau is None else float(selected_rescue_type_tau),
+        "selected_rescue_objectness_floor": None if selected_rescue_objectness_floor is None else float(selected_rescue_objectness_floor),
+        "selected_rescue_margin": None if selected_rescue_margin is None else float(selected_rescue_margin),
+        "secondary_thresholding": str(args.secondary_thresholding),
+        "selected_secondary_min": None if selected_secondary_min is None else float(selected_secondary_min),
+        "selected_secondary_delta": None if selected_secondary_delta is None else float(selected_secondary_delta),
+        "calibration_n_candidates": int(len(calibration_raw)),
+        "calibration_samples": sorted(pd.unique(calibration_raw["held_out_sample"].astype(str)).tolist()) if "held_out_sample" in calibration_raw else [],
+        "n_candidates": int(len(metadata)),
+        "n_positive_candidates": int(labeled.sum()),
+        "n_empty_candidates": int(background.sum()),
+        "test_samples": test_samples,
+        "required_test_sample": str(args.required_test_sample),
+        "embedding_mode": "candidate_region_with_context",
+        "embedding_features": selected_embedding_features,
+        "embedding_dim": int(embeddings.shape[1]),
+        "tabular_dim": int(tabular_features.shape[1]),
+        "tabular_feature_names": tabular_feature_names,
+        "tabular_hidden_dim": int(args.tabular_hidden_dim),
+        "metrics": overall_metrics.to_dict("records") if not overall_metrics.empty else [],
+        "config": _jsonable_config(args),
+    }
+    with (output_dir / "training_summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
+    log.info("Wrote candidate-region classifier outputs to %s", output_dir)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", required=True, help="Complex-SV manifest TSV")
+    parser.add_argument("--candidate_regions", required=True, help="merged_candidate_regions.csv from gen_candidates.py")
+    parser.add_argument("--cn_checkpoint", required=True)
+    parser.add_argument("--graph_checkpoint", default=None)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--class_names", default=DEFAULT_CLASS_NAMES)
+    parser.add_argument("--required_test_sample", default="H1395")
+    parser.add_argument("--test_samples", default="", help="Comma-separated explicit held-out samples; required_test_sample is added if missing")
+    parser.add_argument("--n_test_samples", type=int, default=5)
+    parser.add_argument("--reuse_embeddings", action="store_true", help="Reuse output_dir embeddings.npz and candidate_embeddings.tsv if present")
+    parser.add_argument("--embedding_features", choices=("full", "coords"), default="full", help="Embedding feature subset for the model branch: full 1214D local/context/diff/coords or coords-only 8D.")
+    parser.add_argument("--embedding_normalization", choices=embed_corpus.EMBEDDING_NORMALIZATION_CHOICES, default="sample_residual")
+    parser.add_argument("--sample_baseline_min_candidates", type=int, default=3)
+    parser.add_argument("--hidden_dims", default="128")
+    parser.add_argument("--tabular_features", default="safe", help="Tabular candidate CSV features to use: safe, off, or comma-separated column names.")
+    parser.add_argument("--tabular_hidden_dim", type=int, default=32, help="Hidden width for the tabular feature branch; use 0 for a linear tabular passthrough.")
+    parser.add_argument("--activation", choices=("relu", "gelu"), default="relu")
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--patience", type=int, default=60)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+    parser.add_argument("--background_weight", type=float, default=1.0)
+    parser.add_argument("--type_loss_weight", type=float, default=1.0)
+    parser.add_argument("--label_smoothing", type=float, default=0.02)
+    parser.add_argument("--class_weighting", choices=("none", "inverse", "inverse_sqrt"), default="inverse_sqrt")
+    parser.add_argument("--grad_clip", type=float, default=5.0)
+    parser.add_argument("--tau_min", type=float, default=0.05)
+    parser.add_argument("--tau_max", type=float, default=0.95)
+    parser.add_argument("--tau_steps", type=int, default=91)
+    parser.add_argument("--tau", type=float, default=None)
+    parser.add_argument("--tau_selection_metric", choices=("f1", "precision", "recall"), default="f1")
+    parser.add_argument("--threshold_calibration", choices=("logo", "train"), default="logo", help="Select thresholds from training-genome LOGO predictions or in-sample train predictions.")
+    parser.add_argument("--threshold_tie_break", choices=("low", "high"), default="low", help="When threshold metrics tie, choose the lower or higher tau.")
+    parser.add_argument("--logo_epochs", type=int, default=None, help="Epochs per LOGO calibration fold; defaults to --epochs.")
+    parser.add_argument("--logo_patience", type=int, default=None, help="Early-stopping patience per LOGO fold; defaults to --patience.")
+    parser.add_argument("--type_tau_min", type=float, default=0.05)
+    parser.add_argument("--type_tau_max", type=float, default=0.95)
+    parser.add_argument("--type_tau_steps", type=int, default=91)
+    parser.add_argument("--type_tau", type=float, default=None)
+    parser.add_argument("--rescue_thresholding", choices=("off", "fixed", "optimize"), default="optimize", help="Use high type confidence to rescue low-objectness single-label calls.")
+    parser.add_argument("--rescue_type_tau", type=float, default=0.85, help="Fixed type-confidence rescue threshold when --rescue_thresholding=fixed.")
+    parser.add_argument("--rescue_objectness_floor", type=float, default=0.0, help="Fixed minimum objectness for type-confidence rescue when --rescue_thresholding=fixed.")
+    parser.add_argument("--rescue_margin", type=float, default=0.0, help="Fixed minimum top-vs-second type probability margin for rescue when --rescue_thresholding=fixed.")
+    parser.add_argument("--rescue_type_tau_min", type=float, default=0.60)
+    parser.add_argument("--rescue_type_tau_max", type=float, default=0.98)
+    parser.add_argument("--rescue_type_tau_steps", type=int, default=20)
+    parser.add_argument("--rescue_objectness_floor_grid", default="0,0.001,0.005,0.01,0.02,0.05,0.10")
+    parser.add_argument("--rescue_margin_min", type=float, default=0.0)
+    parser.add_argument("--rescue_margin_max", type=float, default=0.30)
+    parser.add_argument("--rescue_margin_steps", type=int, default=7)
+    parser.add_argument("--rescue_min_recall", type=float, default=0.85, help="Calibration recall constraint for type-confidence rescue sweep.")
+    parser.add_argument("--rescue_min_precision", type=float, default=0.60, help="Calibration precision constraint for type-confidence rescue sweep.")
+    parser.add_argument("--rescue_max_empty_fp_rate", type=float, default=0.75, help="Maximum empty-candidate false-positive rate allowed during rescue sweep.")
+    parser.add_argument("--secondary_thresholding", choices=("off", "fixed", "optimize"), default="optimize", help="Use a stricter threshold for non-primary labels to reduce multicalls.")
+    parser.add_argument("--secondary_min", type=float, default=0.55, help="Fixed secondary minimum threshold when --secondary_thresholding=fixed.")
+    parser.add_argument("--secondary_delta", type=float, default=0.15, help="Fixed extra threshold above each class threshold when --secondary_thresholding=fixed.")
+    parser.add_argument("--secondary_min_min", type=float, default=0.30)
+    parser.add_argument("--secondary_min_max", type=float, default=0.90)
+    parser.add_argument("--secondary_min_steps", type=int, default=13)
+    parser.add_argument("--secondary_delta_min", type=float, default=0.0)
+    parser.add_argument("--secondary_delta_max", type=float, default=0.50)
+    parser.add_argument("--secondary_delta_steps", type=int, default=11)
+    parser.add_argument("--secondary_min_recall", type=float, default=0.85, help="Calibration recall constraint for secondary threshold sweep.")
+    parser.add_argument("--secondary_min_precision", type=float, default=0.60, help="Calibration precision constraint for secondary threshold sweep.")
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--log_every", type=int, default=25)
+    parser.add_argument("--strict", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    run(parse_args(argv))
+
+
+if __name__ == "__main__":
+    main()

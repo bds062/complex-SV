@@ -52,7 +52,7 @@ DEFAULT_TAU = 0.1
 EMBEDDING_NORMALIZATION_CHOICES = ("none", "sample_residual")
 REPORT_SCOPE_CHOICES = ("all", "anchors")
 CANDIDATE_SOURCE_CHOICES = ("labels", "chromosomes", "chromosome-arms", "proposals", "all")
-SCAN_EVIDENCE_VALUES = {"chromosome_scan", "chromosome_arm_scan"}
+SCAN_EVIDENCE_VALUES = {"chromosome_scan", "chromosome_arm_scan", "candidate_region_empty"}
 
 
 @dataclass
@@ -390,10 +390,10 @@ def _predict_haplotype(segs: pd.DataFrame, sub_df: pd.DataFrame | None) -> dict[
     """Rule-based haplotype prediction from CN segments and SV haplotype support.
 
     Combines three signals: (1) SV read-support vote (supp_hp1 vs supp_hp2),
-    (2) length-weighted CN asymmetry, and (3) bilateral detection when both
+    (2) length-weighted CN asymmetry, and (3) mixed_HP detection when both
     haplotypes show elevated copy number.
 
-    Returns keys: haplotype (HP1/HP2/bilateral), haplotype_score [-1,1],
+    Returns keys: haplotype (HP1/HP2/mixed_HP), haplotype_score [-1,1],
     haplotype_confidence [0,1], sv_hp1_support, sv_hp2_support,
     cn_hp1_mean, cn_hp2_mean.
     """
@@ -429,11 +429,11 @@ def _predict_haplotype(segs: pd.DataFrame, sub_df: pd.DataFrame | None) -> dict[
     sv_frac = sv_hp1 / (sv_hp1 + sv_hp2 + 1e-9)
     both_cn_elevated = cn_hp1_mean > 2.5 and cn_hp2_mean > 2.5
     sv_mixed = (sv_hp1 + sv_hp2) > 0 and 0.3 <= sv_frac <= 0.7
-    bilateral = both_cn_elevated or sv_mixed
+    mixed_hp = both_cn_elevated or sv_mixed
 
     THRESHOLD = 0.25
-    if bilateral:
-        haplotype = "bilateral"
+    if mixed_hp:
+        haplotype = "mixed_HP"
         if both_cn_elevated:
             confidence = float(min(1.0, (min(cn_hp1_mean, cn_hp2_mean) - 2.0) / 3.0))
         else:
@@ -445,7 +445,7 @@ def _predict_haplotype(segs: pd.DataFrame, sub_df: pd.DataFrame | None) -> dict[
         haplotype = "HP2"
         confidence = float(min(1.0, (-haplotype_score - THRESHOLD) / (1.0 - THRESHOLD)))
     else:
-        haplotype = "bilateral"
+        haplotype = "mixed_HP"
         confidence = 0.2
 
     return {
@@ -1367,32 +1367,80 @@ def _plot_leave_one_out(
     plt.close(fig)
 
 
+def _bool_flag(value: object) -> bool | None:
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n"}:
+        return False
+    return None
+
+
+def _summary_class_order(values: pd.Series) -> list[str]:
+    unique = list(dict.fromkeys([str(value).strip() for value in values.tolist() if str(value).strip()]))
+    none_values = [value for value in unique if value.lower() == "none"]
+    class_values = [value for value in unique if value.lower() != "none"]
+    class_values = sorted(class_values, key=lambda value: _display_class(value).lower())
+    return class_values + none_values
+
+
+def _summary_gt_class(row: pd.Series) -> str:
+    classes = _split_class_set(row.get("sv_class", ""))
+    if classes:
+        return ";".join(classes)
+    classes = _split_class_set(row.get("true_classes", ""))
+    if classes:
+        return ";".join(classes)
+
+    evidence = str(row.get("evidence", "")).strip()
+    label_scope = str(row.get("label_scope", "")).strip()
+    is_background = _bool_flag(row.get("is_background_chromosome", ""))
+    if is_background is True or evidence == "candidate_region_empty" or label_scope == "empty_candidate_region":
+        return "none"
+    return ""
+
+
+def _summary_class_set(label: object) -> set[str]:
+    text = str(label).strip()
+    if text.lower() == "none":
+        return set()
+    return set(_split_class_set(text))
+
+
 def _plot_anchor_prediction_summary(
     distances: pd.DataFrame,
     output_path: Path,
     tau: float,
+    title_suffix: str = "",
 ) -> None:
-    if "sv_class" not in distances or "predicted_class" not in distances:
+    if distances.empty or "predicted_class" not in distances:
         return
-    gt = distances[distances["sv_class"].astype(str) != ""].copy()
+    gt = distances.copy()
+    gt["_gt_class"] = gt.apply(_summary_gt_class, axis=1)
+    gt = gt[gt["_gt_class"].astype(str) != ""].copy()
     if gt.empty:
         return
 
-    gt["correct"] = gt["sv_class"].astype(str) == gt["predicted_class"].astype(str)
-    class_order = sorted(gt["sv_class"].astype(str).unique(), key=lambda value: _display_class(value).lower())
-    correct_counts = [int(gt[(gt["sv_class"] == cls) & gt["correct"]].shape[0]) for cls in class_order]
-    incorrect_counts = [int(gt[(gt["sv_class"] == cls) & ~gt["correct"]].shape[0]) for cls in class_order]
+    gt["_predicted_class"] = gt.apply(_prediction_label, axis=1)
+    gt["correct"] = [
+        _summary_class_set(true_value) == _summary_class_set(pred_value)
+        for true_value, pred_value in zip(gt["_gt_class"].tolist(), gt["_predicted_class"].tolist())
+    ]
+    class_order = _summary_class_order(gt["_gt_class"].astype(str))
+    correct_counts = [int(gt[(gt["_gt_class"] == cls) & gt["correct"]].shape[0]) for cls in class_order]
+    incorrect_counts = [int(gt[(gt["_gt_class"] == cls) & ~gt["correct"]].shape[0]) for cls in class_order]
 
     pred_order = list(class_order)
-    for pred in sorted(gt["predicted_class"].astype(str).unique(), key=lambda value: _display_class(value).lower()):
+    for pred in _summary_class_order(gt["_predicted_class"].astype(str)):
         if pred not in pred_order:
             pred_order.append(pred)
-    confusion = pd.crosstab(gt["sv_class"].astype(str), gt["predicted_class"].astype(str))
+    confusion = pd.crosstab(gt["_gt_class"].astype(str), gt["_predicted_class"].astype(str))
     confusion = confusion.reindex(index=class_order, columns=pred_order, fill_value=0)
 
     fig_w = max(9.0, 1.25 * max(len(class_order), len(pred_order)) + 6.0)
     fig, axes = plt.subplots(1, 2, figsize=(fig_w, 4.6), gridspec_kw={"width_ratios": [1.0, 1.25]})
 
+    suffix = f" - {title_suffix}" if title_suffix else ""
     x = np.arange(len(class_order))
     axes[0].bar(x, correct_counts, color="#59A14F", label="Correct")
     axes[0].bar(x, incorrect_counts, bottom=correct_counts, color="#E15759", label="Incorrect")
@@ -1401,8 +1449,8 @@ def _plot_anchor_prediction_summary(
         axes[0].text(i, total + 0.05, str(total), ha="center", va="bottom", fontsize=9)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels([_display_class(cls) for cls in class_order], rotation=25, ha="right")
-    axes[0].set_ylabel("GT anchor count")
-    axes[0].set_title(f"GT Anchor Prediction Accuracy (tau={tau:g})")
+    axes[0].set_ylabel("GT region count")
+    axes[0].set_title(f"GT Region Prediction Accuracy{suffix} (tau={tau:g})")
     axes[0].legend(fontsize=8)
     axes[0].grid(axis="y", alpha=0.2)
 
@@ -1414,7 +1462,7 @@ def _plot_anchor_prediction_summary(
     axes[1].set_yticklabels([_display_class(cls) for cls in class_order])
     axes[1].set_xlabel("Predicted class")
     axes[1].set_ylabel("GT class")
-    axes[1].set_title("GT vs Thresholded Predicted Class")
+    axes[1].set_title(f"GT vs Thresholded Predicted Class{suffix}")
     for y in range(matrix.shape[0]):
         for x_i in range(matrix.shape[1]):
             value = int(matrix[y, x_i])
@@ -1637,6 +1685,16 @@ def write_visualizations(
     _plot_prototype_distances(distances, out_dir / "prototype_distances.png", tau=tau)
     _plot_leave_one_out(leave_one_out, out_dir / "anchor_leave_one_out.png", tau=tau)
     _plot_anchor_prediction_summary(distances, out_dir / "anchor_prediction_summary.png", tau=tau)
+    if "split" in distances:
+        split_values = distances["split"].astype(str).str.lower()
+        for split_name in ["train", "test"]:
+            split_df = distances.loc[split_values == split_name].copy()
+            _plot_anchor_prediction_summary(
+                split_df,
+                out_dir / f"anchor_prediction_summary_{split_name}.png",
+                tau=tau,
+                title_suffix=split_name,
+            )
     _plot_tau_precision_recall(distances, leave_one_out, out_dir / "tau_precision_recall.png", tau=tau)
 
     known_mask = metadata["sv_class"].astype(str) != "" if "sv_class" in metadata else pd.Series([False] * len(metadata))

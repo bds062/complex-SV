@@ -45,7 +45,7 @@ CLASS_ALIASES = {
     "non_canonical_BFB": "BFB",
     "non_canonical_chromothripsis": "chromothripsis",
 }
-SCAN_EVIDENCE_VALUES = {"chromosome_scan", "chromosome_arm_scan"}
+SCAN_EVIDENCE_VALUES = {"chromosome_scan", "chromosome_arm_scan", "candidate_region_empty"}
 
 
 def _canonical_class_name(value: object) -> str:

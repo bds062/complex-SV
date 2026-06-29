@@ -58,6 +58,7 @@ STRAND_ORIENTATION_COLORS = {
     "unknown": "#6C6C6C",
 }
 FOLDBACK_HIGHLIGHT_COLOR = "#C51B29"
+HAPLOTYPE_COLORS = {"HP1": "#D62728", "HP2": "#1F77B4", "mixed_HP": "#737373"}
 
 
 def _clean_text(value: object) -> str:
@@ -87,6 +88,50 @@ def _row_predicted_classes(row: pd.Series) -> list[str]:
 def _prediction_label(row: pd.Series) -> str:
     classes = _row_predicted_classes(row)
     return ";".join(classes) if classes else "none"
+
+
+def _bool_value(value: object) -> bool | None:
+    text = _clean_text(value).lower()
+    if text in {"true", "1", "yes", "y", "t"}:
+        return True
+    if text in {"false", "0", "no", "n", "f"}:
+        return False
+    return None
+
+
+def _display_haplotype_tag(value: object) -> str:
+    tag = _clean_text(value)
+    if not tag:
+        return ""
+    normalized = tag.lower().replace("-", "_")
+    if normalized in {"bilateral", "mixed_hp"}:
+        return "mixed_HP"
+    if normalized == "hp1":
+        return "HP1"
+    if normalized == "hp2":
+        return "HP2"
+    return tag
+
+
+def _plot_correctness_bucket(row: pd.Series) -> str:
+    is_labeled = _bool_value(row.get("is_labeled", ""))
+    if is_labeled is True:
+        exact = _bool_value(row.get("class_exact_match", ""))
+        return "correct_preds" if exact is True else "incorrect_preds"
+
+    is_background = _bool_value(row.get("is_background_chromosome", ""))
+    if is_background is True:
+        called = _bool_value(row.get("called_complex_sv", ""))
+        return "incorrect_preds" if called is True else "correct_preds"
+
+    objectness_correct = _bool_value(row.get("objectness_correct", ""))
+    if objectness_correct is not None:
+        return "correct_preds" if objectness_correct else "incorrect_preds"
+
+    exact = _bool_value(row.get("class_exact_match", ""))
+    if exact is not None:
+        return "correct_preds" if exact else "incorrect_preds"
+    return ""
 
 
 def _region_label(chrom: object, arm: object) -> str:
@@ -222,27 +267,41 @@ def read_manifest(path: str | Path) -> pd.DataFrame:
     return df
 
 
-def select_predicted_chromosomes(distances: pd.DataFrame) -> pd.DataFrame:
+def select_predicted_chromosomes(distances: pd.DataFrame, plot_scope: str = "unlabeled-called") -> pd.DataFrame:
     if distances.empty:
         return pd.DataFrame()
-    required = {"sample_id", "chrom", "predicted_class", "sv_class"}
+    required = {"sample_id", "chrom"}
     missing = sorted(required.difference(distances.columns))
     if missing:
-        raise ValueError(f"Prototype distance table missing columns: {missing}")
+        raise ValueError(f"Prediction table missing columns: {missing}")
 
     df = distances.copy().fillna("")
-    if "evidence" in df.columns:
-        df = df[df["evidence"].astype(str).isin(SCAN_EVIDENCE_VALUES)].copy()
-    df = df[df["sv_class"].map(_is_empty)].copy()
-    df = df[df.apply(lambda row: bool(_row_predicted_classes(row)), axis=1)].copy()
+    scope = str(plot_scope or "unlabeled-called").strip().lower().replace("_", "-")
+    if scope == "test":
+        if "split" not in df.columns:
+            raise ValueError("--plot_scope test requires a split column in the prediction table")
+        df = df[df["split"].astype(str) == "test"].copy()
+    elif scope == "unlabeled-called":
+        if "evidence" in df.columns:
+            df = df[df["evidence"].astype(str).isin(SCAN_EVIDENCE_VALUES)].copy()
+        if "sv_class" in df.columns:
+            df = df[df["sv_class"].map(_is_empty)].copy()
+        df = df[df.apply(lambda row: bool(_row_predicted_classes(row)), axis=1)].copy()
+    elif scope == "called":
+        df = df[df.apply(lambda row: bool(_row_predicted_classes(row)), axis=1)].copy()
+    elif scope == "all":
+        pass
+    else:
+        raise ValueError("plot_scope must be one of: unlabeled-called, called, all, test")
+
     if df.empty:
         return df
 
-    for col in ["start_bp", "end_bp", "nearest_prototype_distance", "prototype_confidence"]:
+    for col in ["start_bp", "end_bp", "nearest_prototype_distance", "prototype_confidence", "objectness_prob"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df["_pred_sort"] = df.apply(_prediction_label, axis=1)
-    sort_cols = [col for col in ["_pred_sort", "sample_id", "chrom", "arm", "nearest_prototype_distance"] if col in df.columns]
+    sort_cols = [col for col in ["split", "sample_id", "chrom", "arm", "start_bp", "nearest_prototype_distance", "_pred_sort"] if col in df.columns]
     return df.sort_values(sort_cols).drop(columns=["_pred_sort"], errors="ignore").reset_index(drop=True)
 
 
@@ -627,7 +686,7 @@ def plot_chromosome_prediction(
     highlight_label = _clean_text(row.get("highlight_label", ""))
     if not highlight_label and ("highlight_start_bp" in row or "highlight_end_bp" in row):
         highlight_label = f"{chrom}:{_format_bp(highlight_start_bp)}-{_format_bp(highlight_end_bp)}"
-    haplotype_tag = _clean_text(row.get("haplotype", ""))
+    haplotype_tag = _display_haplotype_tag(row.get("haplotype", ""))
     haplotype_conf = _numeric(row, "haplotype_confidence", np.nan)
 
     segs = _subset_segments(wakhan_df, chrom, start_bp, end_bp)
@@ -644,7 +703,14 @@ def plot_chromosome_prediction(
     highlight_color = {"HIGH": "#C83232", "LOW": "#D89021"}.get(confidence.upper(), class_color)
     score_text = _format_score_text(row, pred_classes)
     count_text = f"{len(segs)} CN segments, {len(sv_chr)} SV records"
-    title_lines = [f"{sample_id} {region}: predicted {pred}"]
+    true_label = _clean_text(row.get("true_classes", row.get("sv_classes", row.get("sv_class", ""))))
+    if not true_label:
+        true_label = "empty"
+    split_label = _clean_text(row.get("split", ""))
+    title_prefix = f"{sample_id} {region}: predicted {pred} | true {true_label}"
+    if split_label:
+        title_prefix = f"{title_prefix} | split {split_label}"
+    title_lines = [title_prefix]
     if highlight_label:
         shatterseek_label = "ShatterSeek" + (f" {confidence}" if confidence else "")
         title_lines.append(f"{shatterseek_label}: {highlight_label}")
@@ -679,18 +745,20 @@ def plot_chromosome_prediction(
     _plot_breakpoint_panel(axes[2], segs, severus_df, sv_chr, chrom, start_bp, end_bp)
 
     if haplotype_tag:
-        _HAP_COLORS = {"HP1": "#4E79A7", "HP2": "#E15759", "bilateral": "#76B7B2"}
-        hap_color = _HAP_COLORS.get(haplotype_tag, "#999999")
+        hap_color = HAPLOTYPE_COLORS.get(haplotype_tag, "#737373")
         hap_text = haplotype_tag
         if np.isfinite(haplotype_conf):
             hap_text = f"{haplotype_tag} ({haplotype_conf:.2f})"
-        axes[0].annotate(
+        fig.text(
+            0.985,
+            0.985,
             hap_text,
-            xy=(1.0, 1.0), xycoords="axes fraction",
-            xytext=(-4, -4), textcoords="offset points",
-            ha="right", va="top",
-            fontsize=8, fontweight="bold", color="white",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor=hap_color, edgecolor="none", alpha=0.88),
+            ha="right",
+            va="top",
+            fontsize=9,
+            fontweight="bold",
+            color="white",
+            bbox=dict(boxstyle="round,pad=0.32", facecolor=hap_color, edgecolor="none", alpha=0.92),
             zorder=25,
         )
 
@@ -706,7 +774,7 @@ def run(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     manifest = read_manifest(args.manifest)
     distances = pd.read_csv(args.prototype_distances, sep="\t").fillna("")
-    selected = select_predicted_chromosomes(distances)
+    selected = select_predicted_chromosomes(distances, plot_scope=args.plot_scope)
     if args.max_plots is not None:
         selected = selected.head(int(args.max_plots)).copy()
 
@@ -727,6 +795,9 @@ def run(args: argparse.Namespace) -> None:
         sample_id = canonical_sample_id(str(row["sample_id"]))
         if sample_id not in manifest_by_sample:
             out_row = row.to_dict()
+            if "haplotype" in out_row:
+                out_row["haplotype"] = _display_haplotype_tag(out_row.get("haplotype", ""))
+            out_row["plot_correctness"] = _plot_correctness_bucket(row)
             out_row["plot_status"] = "missing_manifest_sample"
             out_row["plot_path"] = ""
             summary_rows.append(out_row)
@@ -746,7 +817,8 @@ def run(args: argparse.Namespace) -> None:
             data_cache[sample_id] = (wakhan_df, severus_df)
 
         pred = _prediction_label(row)
-        class_dir = output_dir / _safe_name(pred)
+        correctness_bucket = _plot_correctness_bucket(row)
+        class_dir = output_dir / correctness_bucket / _safe_name(pred) if correctness_bucket else output_dir / _safe_name(pred)
         chrom = _clean_text(row["chrom"])
         arm = _clean_text(row.get("arm", ""))
         region = _region_label(chrom, arm)
@@ -762,6 +834,9 @@ def run(args: argparse.Namespace) -> None:
         plot_path = class_dir / plot_name
 
         out_row = row.to_dict()
+        if "haplotype" in out_row:
+            out_row["haplotype"] = _display_haplotype_tag(out_row.get("haplotype", ""))
+        out_row["plot_correctness"] = correctness_bucket
         try:
             wakhan_df, severus_df = data_cache[sample_id]
             plot_chromosome_prediction(row, wakhan_df, severus_df, plot_path, dpi=args.dpi)
@@ -785,6 +860,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prototype_distances", required=True, help="prototype_distances.tsv from chromosome-scale inference.")
     parser.add_argument("--output_dir", default=None, help="Output directory. Defaults to <prototype_distances parent>/predicted_chromosome_plots.")
     parser.add_argument("--max_plots", type=int, default=None, help="Optional cap for quick previews/tests.")
+    parser.add_argument(
+        "--plot_scope",
+        choices=("unlabeled-called", "called", "all", "test"),
+        default="unlabeled-called",
+        help="Rows to plot from the prediction table. Use all for held-out candidate-region tables.",
+    )
     parser.add_argument("--dpi", type=int, default=180)
     return parser.parse_args(argv)
 

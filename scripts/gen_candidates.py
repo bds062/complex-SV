@@ -26,6 +26,22 @@ from process_vcfs import (  # noqa: E402
 
 REQUIRED_MANIFEST_COLUMNS = {"sample_id", "wakhan_root", "severus_vcf"}
 EVENT_CLASS_COLUMNS = ["ecDNA", "Seismic_Amplification", "chromothripsis", "BFB"]
+LABEL_COLUMNS = [
+    "label_id",
+    "sample_id",
+    "wakhan_sample_id",
+    "wakhan_root",
+    "severus_vcf",
+    "chrom",
+    "arm",
+    "start_bp",
+    "end_bp",
+    "sv_class",
+    "validated",
+    "label_scope",
+    "source",
+    "notes",
+]
 EVENT_CLASS_LABELS = {
     "ecDNA": "ecDNA",
     "Seismic_Amplification": "Seismic Amplification",
@@ -124,6 +140,77 @@ def _print_class_summary(candidate_df: pd.DataFrame) -> None:
 def _safe_name(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     return cleaned.strip("._") or "sample"
+
+
+def _safe_label_id(*parts: object) -> str:
+    text = "_".join(_clean_text(part) for part in parts if _clean_text(part))
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    return cleaned.strip("._") or "label"
+
+
+def _candidate_sv_class(
+    event_column: str,
+    value: object,
+    base_labels: bool = False,
+) -> str | None:
+    if not _has_class_call(value):
+        return None
+
+    if base_labels:
+        return event_column
+
+    if event_column == "ecDNA":
+        return "ecDNA"
+
+    subtype = _clean_text(value)
+    return f"{event_column}_{subtype}" if subtype else event_column
+
+
+def candidate_calls_to_labels(
+    candidate_df: pd.DataFrame,
+    base_labels: bool = False,
+) -> pd.DataFrame:
+    rows = []
+    for _, candidate in candidate_df.iterrows():
+        sample_id = _clean_text(candidate.get("sample_id", ""))
+        candidate_id = _clean_text(candidate.get("candidate_id", ""))
+        chrom = _clean_text(candidate.get("chrom", ""))
+        arm = _clean_text(candidate.get("arm", ""))
+        start_bp = int(candidate.get("start", candidate.get("start_bp", 0)))
+        end_bp = int(candidate.get("end", candidate.get("end_bp", 0)))
+
+        for event_column in EVENT_CLASS_COLUMNS:
+            if event_column not in candidate.index:
+                continue
+            raw_value = candidate[event_column]
+            sv_class = _candidate_sv_class(event_column, raw_value, base_labels=base_labels)
+            if sv_class is None:
+                continue
+
+            rows.append(
+                {
+                    "label_id": _safe_label_id(candidate_id, sv_class),
+                    "sample_id": sample_id,
+                    "wakhan_sample_id": _clean_text(candidate.get("wakhan_sample_id", "")),
+                    "wakhan_root": _clean_text(candidate.get("wakhan_root", "")),
+                    "severus_vcf": _clean_text(candidate.get("severus_vcf", "")),
+                    "chrom": chrom,
+                    "arm": arm,
+                    "start_bp": start_bp,
+                    "end_bp": end_bp,
+                    "sv_class": sv_class,
+                    "validated": False,
+                    "label_scope": "region",
+                    "source": "gen_candidates",
+                    "notes": (
+                        f"candidate_id={candidate_id};"
+                        f"event={event_column};"
+                        f"subtype={_clean_text(raw_value)}"
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows, columns=LABEL_COLUMNS)
 
 
 def read_manifest(path: str | Path) -> pd.DataFrame:
@@ -308,6 +395,11 @@ def run(args: argparse.Namespace) -> None:
     merged.to_csv(merged_path, index=False)
     print(f"Wrote merged CSV with {len(merged)} rows to {merged_path}")
 
+    labels = candidate_calls_to_labels(merged, base_labels=args.base_labels)
+    labels_path = out_dir / args.labels_name
+    labels.to_csv(labels_path, sep="\t", index=False)
+    print(f"Wrote labels TSV with {len(labels)} rows to {labels_path}")
+
     if failures:
         failures_path = out_dir / "failed_samples.csv"
         pd.DataFrame(failures).to_csv(failures_path, index=False)
@@ -321,6 +413,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("manifest", type=Path, help="Complex-SV manifest TSV")
     parser.add_argument("--out_dir", "--output_dir", dest="out_dir", type=Path, required=True)
     parser.add_argument("--merged-name", default="merged_candidate_regions.csv")
+    parser.add_argument("--labels-name", default="complex_sv_labels.tsv")
+    parser.add_argument(
+        "--base_labels",
+        "--base-labels",
+        action="store_true",
+        help="Write base event classes in the labels TSV instead of subtype-specific labels.",
+    )
     parser.add_argument("--centromeres", type=Path, default=DEFAULT_CENTROMERES)
     parser.add_argument("--window-size", type=int, default=50_000_000)
     parser.add_argument("--step-size", type=int, default=10_000_000)

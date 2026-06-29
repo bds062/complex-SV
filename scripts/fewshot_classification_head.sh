@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-BASE="${BASE:-../results/pipeline7}"
+BASE="${BASE:-../results/pipeline9}"
 MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
 LABELS="${LABELS:-$BASE/complex_sv_labels.tsv}"
 USE_LABELS="${USE_LABELS:-1}"
