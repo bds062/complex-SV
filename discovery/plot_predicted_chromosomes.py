@@ -707,7 +707,11 @@ def plot_chromosome_prediction(
     if not true_label:
         true_label = "empty"
     split_label = _clean_text(row.get("split", ""))
-    title_prefix = f"{sample_id} {region}: predicted {pred} | true {true_label}"
+    cluster_title = _clean_text(row.get("plot_title", "")) or _clean_text(row.get("outgroup_name", ""))
+    if cluster_title:
+        title_prefix = f"{cluster_title}: {sample_id} {region} | predicted {pred} | true {true_label}"
+    else:
+        title_prefix = f"{sample_id} {region}: predicted {pred} | true {true_label}"
     if split_label:
         title_prefix = f"{title_prefix} | split {split_label}"
     title_lines = [title_prefix]
@@ -818,7 +822,13 @@ def run(args: argparse.Namespace) -> None:
 
         pred = _prediction_label(row)
         correctness_bucket = _plot_correctness_bucket(row)
-        class_dir = output_dir / correctness_bucket / _safe_name(pred) if correctness_bucket else output_dir / _safe_name(pred)
+        group_value = _clean_text(row.get(args.group_by_column, "")) if args.group_by_column else ""
+        if group_value:
+            class_dir = output_dir / _safe_name(group_value)
+        elif args.no_correctness_dirs:
+            class_dir = output_dir / _safe_name(pred)
+        else:
+            class_dir = output_dir / correctness_bucket / _safe_name(pred) if correctness_bucket else output_dir / _safe_name(pred)
         chrom = _clean_text(row["chrom"])
         arm = _clean_text(row.get("arm", ""))
         region = _region_label(chrom, arm)
@@ -867,6 +877,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Rows to plot from the prediction table. Use all for held-out candidate-region tables.",
     )
     parser.add_argument("--dpi", type=int, default=180)
+    parser.add_argument("--group_by_column", default="", help="Optional prediction-table column used as the output subdirectory instead of correctness/predicted-class buckets.")
+    parser.add_argument("--no_correctness_dirs", action="store_true", help="Do not create correct_preds/incorrect_preds output directories when group_by_column is not set.")
     return parser.parse_args(argv)
 
 

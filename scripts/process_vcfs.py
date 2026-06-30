@@ -844,15 +844,11 @@ def _summarize_candidate_intervals(
         rows.append(row)
 
     result = pd.DataFrame(rows)
-    if result.empty or "n_FB" not in result.columns:
+    if result.empty:
         return result
     min_region_length = 2_000_000
     region_length = result["component_length"]
     result = result[region_length >= min_region_length]
-    contains_fb = result["n_FB"].fillna(0) > 0
-    has_high_tcn = result["ecDNA"].fillna(False).astype(bool)
-    enough_segments = contains_fb | has_high_tcn | (result["n_segments_ge_100kb"] >= 4)
-    result = result[enough_segments]
     return _natural_sort_dataframe(result, ["start", "end"])
 
 

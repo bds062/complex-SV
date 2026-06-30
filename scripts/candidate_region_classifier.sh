@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-BASE="${BASE:-../results/pipeline9}"
+BASE="${BASE:-../results/pipeline10}"
 MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
 CANDIDATE_REGIONS="${CANDIDATE_REGIONS:-$BASE/merged_candidate_regions.csv}"
 OUTPUT_DIR="${OUTPUT_DIR:-$BASE/candidate_region_classifier}"
