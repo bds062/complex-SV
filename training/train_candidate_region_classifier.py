@@ -139,6 +139,147 @@ def _has_class_call(value: object) -> bool:
     return text not in {"", "0", "false", "f", "no", "n", "none", "nan", "<na>"}
 
 
+SUBTYPE_TARGET_VALUES = {
+    "canonical": 1.0,
+    "true": 1.0,
+    "t": 1.0,
+    "1": 1.0,
+    "yes": 1.0,
+    "y": 1.0,
+    "noncanonical": 0.5,
+    "noncanonicalb": 0.25,
+}
+SUBTYPE_DISPLAY = {
+    "canonical": "canonical",
+    "noncanonical": "noncanonical",
+    "noncanonicalb": "noncanonicalB",
+}
+SUBTYPE_LEVELS = ["canonical", "noncanonical", "noncanonicalB"]
+SUBTYPE_LEVEL_VALUES = {"canonical": 1.0, "noncanonical": 0.5, "noncanonicalB": 0.25}
+
+
+def _subtype_key(value: object) -> str:
+    return _clean_text(value).replace("_", "").replace("-", "").lower()
+
+
+def _subtype_value(value: object) -> float:
+    key = _subtype_key(value)
+    if key in SUBTYPE_TARGET_VALUES:
+        return float(SUBTYPE_TARGET_VALUES[key])
+    return 1.0 if _has_class_call(value) else 0.0
+
+
+def _subtype_display(value: object) -> str:
+    key = _subtype_key(value)
+    return SUBTYPE_DISPLAY.get(key, _clean_text(value))
+
+
+def _split_raw_class_tokens(value: object) -> list[str]:
+    text = _clean_text(value)
+    if not text or text.lower() in {"none", "nan", "<na>"}:
+        return []
+    return [part.strip() for part in text.replace(",", ";").split(";") if part.strip() and part.strip().lower() != "none"]
+
+
+def _raw_token_base(token: object) -> str:
+    return _clean_text(token).split(":", 1)[0].strip()
+
+
+def _raw_token_subtype(token: object) -> str:
+    text = _clean_text(token)
+    if ":" not in text:
+        return ""
+    return text.split(":", 1)[1].strip()
+
+
+def _format_raw_class(class_name: str, subtype: object = "") -> str:
+    subtype_text = _subtype_display(subtype)
+    return f"{class_name}:{subtype_text}" if subtype_text else class_name
+
+
+def _uses_binary_subtype_targets(subtype_targets: object) -> bool:
+    target_mode = str(subtype_targets or "specific").lower()
+    return target_mode in {"general", "binary", "base", "merged", "presence"}
+
+
+def _base_class_label(value: object) -> str:
+    bases: list[str] = []
+    for token in _split_raw_class_tokens(value):
+        base = _raw_token_base(token)
+        if base and base not in bases:
+            bases.append(base)
+    return ";".join(bases)
+
+
+def _normalize_base_class_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    for column in columns:
+        if column in df.columns:
+            df[column] = df[column].map(_base_class_label)
+    return df
+
+
+def _raw_class_targets_from_row(
+    row: pd.Series | dict[str, Any],
+    class_names: list[str],
+    subtype_targets: str = "specific",
+) -> dict[str, float]:
+    values = {name: 0.0 for name in class_names}
+    use_binary_subtype_targets = _uses_binary_subtype_targets(subtype_targets)
+    raw = row.get("raw_sv_classes", "") if isinstance(row, dict) else row.get("raw_sv_classes", "")
+    tokens = _split_raw_class_tokens(raw)
+    if tokens:
+        for token in tokens:
+            base = _raw_token_base(token)
+            if base not in values:
+                continue
+            subtype = _raw_token_subtype(token)
+            target_value = 1.0 if use_binary_subtype_targets else _subtype_value(subtype or "canonical")
+            values[base] = max(values[base], target_value)
+        return values
+    # Fallback for older metadata that only has base-class strings.
+    base = row.get("sv_classes", row.get("sv_class", "")) if isinstance(row, dict) else row.get("sv_classes", row.get("sv_class", ""))
+    for token in _split_raw_class_tokens(base):
+        class_name = _raw_token_base(token)
+        if class_name in values:
+            values[class_name] = 1.0
+    return values
+
+
+def _multi_hot_targets(metadata: pd.DataFrame, class_names: list[str], subtype_targets: str = "specific") -> np.ndarray:
+    arr = np.zeros((len(metadata), len(class_names)), dtype=np.float32)
+    for row_i, row in enumerate(metadata.to_dict("records")):
+        values = _raw_class_targets_from_row(row, class_names, subtype_targets=subtype_targets)
+        arr[row_i, :] = [float(values.get(name, 0.0)) for name in class_names]
+    return arr
+
+
+def _class_counts(targets: np.ndarray, class_names: list[str]) -> dict[str, int]:
+    values = np.asarray(targets, dtype=np.float32)
+    return {name: int((values[:, i] > 0).sum()) for i, name in enumerate(class_names)}
+
+
+def _smooth_binary_targets(targets: torch.Tensor, smoothing: float) -> torch.Tensor:
+    eps = float(smoothing)
+    if eps <= 0:
+        return targets
+    return targets * (1.0 - eps) + 0.5 * eps
+
+
+def _pos_weight(targets: np.ndarray, type_mask: np.ndarray, weighting: str, device: torch.device) -> torch.Tensor | None:
+    mode = str(weighting).lower()
+    if mode in {"", "none", "off", "0"}:
+        return None
+    y = np.asarray(targets, dtype=np.float32)[np.asarray(type_mask, dtype=bool)] > 0
+    if y.size == 0:
+        return None
+    pos = np.clip(y.sum(axis=0).astype(np.float32), 1.0, None)
+    neg = np.clip(y.shape[0] - pos, 1.0, None)
+    weight = neg / pos
+    if mode == "inverse_sqrt":
+        weight = np.sqrt(weight)
+    return torch.as_tensor(weight, dtype=torch.float32, device=device)
+
+
 def _split_csv(value: str | None) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
@@ -204,6 +345,138 @@ def choose_type_thresholds_from_predictions(
                 best = row
         thresholds[class_name] = float(best["type_tau"]) if best is not None and int(y.sum()) > 0 else 0.5
     return thresholds, pd.DataFrame(rows)
+
+
+def choose_subtype_thresholds_from_predictions(
+    predictions: pd.DataFrame,
+    class_names: list[str],
+    type_thresholds: dict[str, float],
+    tau_grid: np.ndarray,
+    tie_break: str = "low",
+) -> tuple[dict[str, dict[str, float]], pd.DataFrame]:
+    labeled_df = predictions[predictions["is_labeled"].astype(bool)].copy()
+    thresholds: dict[str, dict[str, float]] = {}
+    rows: list[dict[str, Any]] = []
+    prefer_higher_tau = str(tie_break).lower() == "high"
+    if labeled_df.empty:
+        return {
+            name: {"canonical": 0.9, "noncanonical": 0.6, "noncanonicalB": float(type_thresholds.get(name, 0.5))}
+            for name in class_names
+        }, pd.DataFrame()
+
+    target_values = np.zeros((len(labeled_df), len(class_names)), dtype=np.float32)
+    for row_i, row in enumerate(labeled_df.to_dict("records")):
+        raw_values = _raw_class_targets_from_row(row, class_names)
+        target_values[row_i, :] = [raw_values.get(name, 0.0) for name in class_names]
+
+    raw_token_rows = [
+        _split_raw_class_tokens(value)
+        for value in labeled_df.get("raw_true_classes", labeled_df.get("true_classes", pd.Series([""] * len(labeled_df)))).tolist()
+    ]
+    for class_i, class_name in enumerate(class_names):
+        score = labeled_df[f"type_probability_{class_name}"].astype(float).to_numpy()
+        class_presence_tau = float(type_thresholds.get(class_name, 0.5))
+        class_has_explicit_subtypes = any(
+            _raw_token_base(token) == class_name and bool(_raw_token_subtype(token))
+            for tokens in raw_token_rows
+            for token in tokens
+        )
+        if not class_has_explicit_subtypes:
+            thresholds[class_name] = {
+                "noncanonicalB": class_presence_tau,
+                "noncanonical": 1.01,
+                "canonical": 1.01,
+                "has_subtypes": 0.0,
+            }
+            continue
+        class_thresholds = {"noncanonicalB": class_presence_tau, "has_subtypes": 1.0}
+        for level_name, level_value in [("noncanonical", 0.5), ("canonical", 1.0)]:
+            y = target_values[:, class_i] >= float(level_value)
+            best: dict[str, Any] | None = None
+            for tau in tau_grid:
+                tau_f = float(tau)
+                pred = score >= tau_f
+                tp = int((y & pred).sum())
+                fp = int(((~y) & pred).sum())
+                fn = int((y & (~pred)).sum())
+                tn = int(((~y) & (~pred)).sum())
+                precision = tp / (tp + fp) if tp + fp else 1.0
+                recall = tp / (tp + fn) if tp + fn else 0.0
+                f1 = (2 * precision * recall / (precision + recall)) if precision + recall else 0.0
+                row = {
+                    "class_name": class_name,
+                    "subtype_level": level_name,
+                    "subtype_value_min": float(level_value),
+                    "subtype_tau": tau_f,
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1,
+                    "tp": tp,
+                    "fp": fp,
+                    "fn": fn,
+                    "tn": tn,
+                }
+                rows.append(row)
+                tie_tau = tau_f if prefer_higher_tau else -tau_f
+                best_tie_tau = float(best["subtype_tau"]) if (best is not None and prefer_higher_tau) else (-float(best["subtype_tau"]) if best is not None else None)
+                if best is None or (f1, precision, recall, tie_tau) > (best["f1"], best["precision"], best["recall"], best_tie_tau):
+                    best = row
+            if best is None or int(y.sum()) == 0:
+                class_thresholds[level_name] = 1.01
+            else:
+                class_thresholds[level_name] = max(float(best["subtype_tau"]), class_presence_tau)
+        class_thresholds["noncanonical"] = max(float(class_thresholds["noncanonical"]), class_presence_tau)
+        class_thresholds["canonical"] = max(float(class_thresholds["canonical"]), float(class_thresholds["noncanonical"]), class_presence_tau)
+        thresholds[class_name] = class_thresholds
+    return thresholds, pd.DataFrame(rows)
+
+
+def _subtype_for_probability(class_name: str, probability: float, subtype_thresholds: dict[str, dict[str, float]] | None) -> str:
+    if not subtype_thresholds or class_name not in subtype_thresholds:
+        return ""
+    thresholds = subtype_thresholds[class_name]
+    if float(thresholds.get("has_subtypes", 1.0)) <= 0.0:
+        return ""
+    if float(probability) >= float(thresholds.get("canonical", 1.01)):
+        return "canonical"
+    if float(probability) >= float(thresholds.get("noncanonical", 1.01)):
+        return "noncanonical"
+    return "noncanonicalB"
+
+
+def _decorate_predicted_raw_classes(
+    pred_classes: list[str],
+    row: pd.Series,
+    subtype_thresholds: dict[str, dict[str, float]] | None,
+) -> list[str]:
+    raw: list[str] = []
+    for class_name in pred_classes:
+        probability = float(row.get(f"type_probability_{class_name}", 0.0))
+        subtype = _subtype_for_probability(class_name, probability, subtype_thresholds)
+        raw.append(_format_raw_class(class_name, subtype))
+    return raw
+
+
+def _base_set_from_tokens(value: object) -> set[str]:
+    return {_raw_token_base(token) for token in _split_raw_class_tokens(value)}
+
+
+def _raw_set_from_tokens(value: object) -> set[str]:
+    return set(_split_raw_class_tokens(value))
+
+
+def _prediction_correctness_label(true_raw: object, pred_raw: object) -> str:
+    true_set = _raw_set_from_tokens(true_raw)
+    pred_set = _raw_set_from_tokens(pred_raw)
+    true_base = _base_set_from_tokens(true_raw)
+    pred_base = _base_set_from_tokens(pred_raw)
+    if true_set == pred_set:
+        return "exact"
+    if true_base == pred_base and true_base:
+        return "wrong_level"
+    if bool(true_base & pred_base):
+        return "partial_class"
+    return "wrong"
 
 
 def _chrom_key(chrom: object) -> str:
@@ -519,6 +792,7 @@ def embed_candidate_table(
                 "candidate_id": str(candidate["candidate_id"]),
                 "label_id": str(candidate.get("label_id", "")),
                 "sample_id": sample_id,
+                "cluster_id": str(row.get("cluster_id", "")),
                 "arm": str(row.get("arm", "")),
                 "sv_class": str(row.get("sv_classes", "")),
                 "sv_classes": str(row.get("sv_classes", "")),
@@ -564,17 +838,36 @@ def embed_candidate_table(
 
 def select_test_samples(samples: np.ndarray, required: str, explicit: list[str], n_test_samples: int, seed: int) -> list[str]:
     available = sorted(pd.unique(samples).tolist())
-    if required and required not in available:
-        raise ValueError(f"Required test sample {required!r} is absent from candidate regions; available examples={available[:10]}")
+    available_set = set(available)
+    required_samples = _split_csv(required)
+    missing_required = [sample for sample in required_samples if sample not in available_set]
+    if missing_required:
+        log.warning(
+            "Skipping requested test sample(s) absent from candidate regions: %s; available examples=%s",
+            ",".join(missing_required),
+            available[:10],
+        )
+
     selected: list[str] = []
+    requested_unique: list[str] = []
+    for sample in explicit + required_samples:
+        if sample not in requested_unique:
+            requested_unique.append(sample)
+
     for sample in explicit:
-        if sample not in available:
+        if sample not in available_set:
             raise ValueError(f"Explicit test sample {sample!r} is absent from candidate regions")
         if sample not in selected:
             selected.append(sample)
-    if required and required not in selected:
-        selected.insert(0, required)
-    target_n = min(max(int(n_test_samples), len(selected)), len(available))
+    for required_sample in reversed([sample for sample in required_samples if sample in available_set]):
+        if required_sample not in selected:
+            selected.insert(0, required_sample)
+
+    requested_target_n = len(requested_unique)
+    if requested_target_n and int(n_test_samples) <= requested_target_n:
+        target_n = len(selected)
+    else:
+        target_n = min(max(int(n_test_samples), len(selected)), len(available))
     remaining = [sample for sample in available if sample not in set(selected)]
     rng = np.random.default_rng(int(seed))
     rng.shuffle(remaining)
@@ -604,8 +897,17 @@ def annotate_predictions_with_secondary(
     rescue_type_tau: float | None = None,
     rescue_objectness_floor: float | None = None,
     rescue_margin: float | None = None,
+    subtype_thresholds: dict[str, dict[str, float]] | None = None,
+    subtype_targets: str = "specific",
 ) -> pd.DataFrame:
     out = predictions.copy()
+    use_base_only_subtypes = _uses_binary_subtype_targets(subtype_targets)
+    active_subtype_thresholds = None if use_base_only_subtypes else subtype_thresholds
+    if use_base_only_subtypes:
+        _normalize_base_class_columns(
+            out,
+            ["raw_sv_classes", "raw_true_classes", "sv_classes", "sv_class", "true_classes"],
+        )
     out["objectness_tau"] = float(objectness_tau)
     use_secondary = secondary_min is not None and secondary_delta is not None
     use_rescue = rescue_type_tau is not None and rescue_objectness_floor is not None and rescue_margin is not None
@@ -622,6 +924,7 @@ def annotate_predictions_with_secondary(
         out[f"secondary_threshold_{class_name}"] = max(primary + float(secondary_delta), float(secondary_min)) if use_secondary else primary
 
     pred_lists: list[list[str]] = []
+    raw_pred_lists: list[list[str]] = []
     primary_classes: list[str] = []
     prediction_sources: list[str] = []
     rescued_flags: list[bool] = []
@@ -648,12 +951,15 @@ def annotate_predictions_with_secondary(
                 and margin >= float(rescue_margin)
             )
             if can_rescue:
-                pred_lists.append([top_class])
+                selected_classes = [top_class]
+                pred_lists.append(selected_classes)
+                raw_pred_lists.append(_decorate_predicted_raw_classes(selected_classes, row, active_subtype_thresholds))
                 primary_classes.append(top_class)
                 prediction_sources.append("rescued_type_confidence")
                 rescued_flags.append(True)
             else:
                 pred_lists.append([])
+                raw_pred_lists.append([])
                 primary_classes.append("none")
                 prediction_sources.append("none_objectness")
                 rescued_flags.append(False)
@@ -662,6 +968,7 @@ def annotate_predictions_with_secondary(
         primary_pass = [class_name for class_name in class_names if probs[class_name] >= float(type_thresholds.get(class_name, 0.5))]
         if not primary_pass:
             pred_lists.append([])
+            raw_pred_lists.append([])
             primary_classes.append("none")
             prediction_sources.append("none_type_threshold")
             rescued_flags.append(False)
@@ -679,7 +986,9 @@ def annotate_predictions_with_secondary(
                     selected.add(class_name)
         else:
             selected.update(primary_pass)
-        pred_lists.append([class_name for class_name in class_names if class_name in selected])
+        selected_classes = [class_name for class_name in class_names if class_name in selected]
+        pred_lists.append(selected_classes)
+        raw_pred_lists.append(_decorate_predicted_raw_classes(selected_classes, row, active_subtype_thresholds))
         primary_classes.append(primary)
         prediction_sources.append("objectness_type_threshold")
         rescued_flags.append(False)
@@ -692,21 +1001,54 @@ def annotate_predictions_with_secondary(
     out["rescue_type_margin"] = rescue_margins
     out["predicted_classes"] = [";".join(values) for values in pred_lists]
     out["predicted_class"] = out["predicted_classes"].mask(out["predicted_classes"].astype(str) == "", "none")
+    out["predicted_raw_classes"] = [";".join(values) for values in raw_pred_lists]
+    if use_base_only_subtypes:
+        _normalize_base_class_columns(out, ["predicted_raw_classes"])
+    out["predicted_raw_class"] = out["predicted_raw_classes"].mask(out["predicted_raw_classes"].astype(str) == "", "none")
     out["called_complex_sv"] = out["predicted_classes"].astype(str) != ""
 
     exact: list[bool] = []
     any_match: list[bool] = []
-    for true_value, pred_value, is_labeled in zip(out["true_classes"].tolist(), out["predicted_classes"].tolist(), out["is_labeled"].astype(bool).tolist()):
+    base_exact: list[bool] = []
+    wrong_level: list[bool] = []
+    partial_class: list[bool] = []
+    correctness_labels: list[str] = []
+    true_raw_values = out["raw_true_classes"].tolist() if "raw_true_classes" in out else out["true_classes"].tolist()
+    for true_raw, true_value, pred_raw, pred_value, is_labeled in zip(
+        true_raw_values,
+        out["true_classes"].tolist(),
+        out["predicted_raw_classes"].tolist(),
+        out["predicted_classes"].tolist(),
+        out["is_labeled"].astype(bool).tolist(),
+    ):
         if not is_labeled:
             exact.append(False)
             any_match.append(False)
+            base_exact.append(False)
+            wrong_level.append(False)
+            partial_class.append(False)
+            correctness_labels.append("background")
             continue
         true_set = set(_split_class_tokens(true_value))
         pred_set = set(_split_class_tokens(pred_value))
-        exact.append(true_set == pred_set)
-        any_match.append(bool(true_set & pred_set))
+        true_raw_set = _raw_set_from_tokens(true_raw)
+        pred_raw_set = _raw_set_from_tokens(pred_raw)
+        exact_flag = true_raw_set == pred_raw_set
+        any_flag = bool(true_set & pred_set)
+        base_exact_flag = true_set == pred_set
+        correctness = _prediction_correctness_label(true_raw, pred_raw)
+        exact.append(exact_flag)
+        any_match.append(any_flag)
+        base_exact.append(base_exact_flag)
+        wrong_level.append(correctness == "wrong_level")
+        partial_class.append(correctness == "partial_class")
+        correctness_labels.append(correctness)
     out["class_exact_match"] = exact
     out["class_any_match"] = any_match
+    out["class_base_exact_match"] = base_exact
+    out["class_wrong_level_match"] = wrong_level
+    out["class_partial_class_match"] = partial_class
+    out["class_correctness"] = correctness_labels
     out["objectness_correct"] = (out["called_complex_sv"] == out["is_labeled"].astype(bool)) | ((~out["called_complex_sv"]) & out["is_background_chromosome"].astype(bool))
     out["n_predicted_classes"] = [len(values) for values in pred_lists]
     return out
@@ -770,6 +1112,8 @@ def choose_rescue_thresholds(
     objectness_tau: float,
     type_thresholds: dict[str, float],
     class_names: list[str],
+    subtype_thresholds: dict[str, dict[str, float]] | None,
+    subtype_targets: str,
     type_tau_grid: np.ndarray,
     objectness_floor_grid: np.ndarray,
     margin_grid: np.ndarray,
@@ -791,6 +1135,8 @@ def choose_rescue_thresholds(
                     rescue_type_tau=float(rescue_type_tau),
                     rescue_objectness_floor=float(rescue_objectness_floor),
                     rescue_margin=float(rescue_margin),
+                    subtype_thresholds=subtype_thresholds,
+                    subtype_targets=subtype_targets,
                 )
                 rows.append(
                     rescue_threshold_metrics(
@@ -843,6 +1189,7 @@ def choose_rescue_thresholding(
     type_thresholds: dict[str, float],
     class_names: list[str],
     args: argparse.Namespace,
+    subtype_thresholds: dict[str, dict[str, float]] | None = None,
 ) -> tuple[float | None, float | None, float | None, pd.DataFrame]:
     mode = str(args.rescue_thresholding).lower()
     if mode == "off":
@@ -860,6 +1207,8 @@ def choose_rescue_thresholding(
         float(objectness_tau),
         type_thresholds,
         class_names,
+        subtype_thresholds,
+        str(args.subtype_targets),
         type_grid,
         floor_grid,
         margin_grid,
@@ -931,6 +1280,8 @@ def choose_secondary_thresholds(
     objectness_tau: float,
     type_thresholds: dict[str, float],
     class_names: list[str],
+    subtype_thresholds: dict[str, dict[str, float]] | None,
+    subtype_targets: str,
     min_grid: np.ndarray,
     delta_grid: np.ndarray,
     min_recall: float,
@@ -954,6 +1305,8 @@ def choose_secondary_thresholds(
                 rescue_type_tau=rescue_type_tau,
                 rescue_objectness_floor=rescue_objectness_floor,
                 rescue_margin=rescue_margin,
+                subtype_thresholds=subtype_thresholds,
+                subtype_targets=subtype_targets,
             )
             rows.append(secondary_threshold_metrics(annotated, class_names, float(secondary_min), float(secondary_delta)))
     sweep = pd.DataFrame(rows)
@@ -995,6 +1348,7 @@ def choose_secondary_thresholding(
     type_thresholds: dict[str, float],
     class_names: list[str],
     args: argparse.Namespace,
+    subtype_thresholds: dict[str, dict[str, float]] | None = None,
     rescue_type_tau: float | None = None,
     rescue_objectness_floor: float | None = None,
     rescue_margin: float | None = None,
@@ -1011,6 +1365,8 @@ def choose_secondary_thresholding(
         float(objectness_tau),
         type_thresholds,
         class_names,
+        subtype_thresholds,
+        str(args.subtype_targets),
         min_grid,
         delta_grid,
         min_recall=float(args.secondary_min_recall),
@@ -1189,7 +1545,7 @@ def _train_model(
     log_prefix: str = "train",
 ) -> tuple[CandidateRegionTabularClassifierHead, pd.DataFrame]:
     set_seed(int(args.seed) + int(seed_offset))
-    targets_np = _multi_hot_targets(metadata, class_names)
+    targets_np = _multi_hot_targets(metadata, class_names, subtype_targets=str(args.subtype_targets))
     labeled, background = _label_background_masks(metadata)
     usable_mask = train_mask & (labeled | background)
     train_idx = np.where(usable_mask)[0]
@@ -1242,7 +1598,7 @@ def _train_model(
             obj_acc = float(((objectness_prob >= 0.5) == objectness_targets.bool()).float().mean().item())
             if type_mask.any():
                 type_prob = torch.sigmoid(type_logits[type_mask])
-                exact = ((type_prob >= 0.5) == type_targets[type_mask].bool()).all(dim=1).float().mean().item()
+                exact = ((type_prob >= 0.5) == (type_targets[type_mask] > 0)).all(dim=1).float().mean().item()
             else:
                 exact = 0.0
         loss_value = float(loss.detach().cpu().item())
@@ -1293,6 +1649,7 @@ def predict_model(
     class_names: list[str],
     device: torch.device,
     batch_size: int = 512,
+    subtype_targets: str = "specific",
 ) -> pd.DataFrame:
     model.eval()
     obj_logits: list[np.ndarray] = []
@@ -1312,12 +1669,14 @@ def predict_model(
     type_prob_np = 1.0 / (1.0 + np.exp(-type_logit_np))
     out = metadata.copy()
     labeled, background = _label_background_masks(out)
-    targets = _multi_hot_targets(out, class_names)
+    targets = _multi_hot_targets(out, class_names, subtype_targets=subtype_targets)
     out["is_labeled"] = labeled.astype(int)
     out["is_background_chromosome"] = background.astype(int)
     if "raw_sv_classes" in out:
         out["raw_true_classes"] = out["raw_sv_classes"].astype(str)
     out["true_classes"] = [";".join([class_names[i] for i, flag in enumerate(row) if flag > 0]) for row in targets]
+    if _uses_binary_subtype_targets(subtype_targets):
+        _normalize_base_class_columns(out, ["raw_sv_classes", "raw_true_classes", "sv_classes", "sv_class", "true_classes"])
     out["objectness_logit"] = objectness_logit_np.astype(float)
     out["objectness_prob"] = objectness_prob_np.astype(float)
     max_idx = np.argmax(type_prob_np, axis=1)
@@ -1328,6 +1687,85 @@ def predict_model(
         out[f"type_logit_{class_name}"] = type_logit_np[:, i].astype(float)
         out[f"type_probability_{class_name}"] = type_prob_np[:, i].astype(float)
     return out
+
+
+def apply_cluster_aggregation(predictions: pd.DataFrame, class_names: list[str], mode: str = "max") -> pd.DataFrame:
+    mode_text = str(mode or "off").lower()
+    out = predictions.copy()
+    if mode_text in {"", "off", "none", "0"} or "cluster_id" not in out.columns:
+        out["cluster_aggregation"] = "off"
+        out["cluster_key"] = [str(cid) for cid in out.get("candidate_id", pd.Series(range(len(out)))).tolist()]
+        out["cluster_size"] = 1
+        return out
+    if mode_text != "max":
+        raise ValueError("--cluster_aggregation currently supports off or max")
+
+    sample_values = out["sample_id"].astype(str) if "sample_id" in out.columns else pd.Series(["sample"] * len(out), index=out.index)
+    cluster_values = out["cluster_id"].astype(str).replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    fallback = out["candidate_id"].astype(str) if "candidate_id" in out.columns else pd.Series([str(i) for i in range(len(out))], index=out.index)
+    out["cluster_key"] = sample_values + ":" + cluster_values.fillna(fallback).astype(str)
+    out["cluster_size"] = out.groupby("cluster_key")["cluster_key"].transform("size").astype(int)
+    out["cluster_aggregation"] = "max"
+
+    for _, idx in out.groupby("cluster_key").groups.items():
+        idx_list = list(idx)
+        obj_logit = pd.to_numeric(out.loc[idx_list, "objectness_logit"], errors="coerce").astype(float).max()
+        out.loc[idx_list, "objectness_logit"] = float(obj_logit)
+        out.loc[idx_list, "objectness_prob"] = float(1.0 / (1.0 + np.exp(-obj_logit)))
+        type_logits: list[float] = []
+        type_probs: list[float] = []
+        for class_name in class_names:
+            logit_col = f"type_logit_{class_name}"
+            prob_col = f"type_probability_{class_name}"
+            class_logit = pd.to_numeric(out.loc[idx_list, logit_col], errors="coerce").astype(float).max()
+            class_prob = float(1.0 / (1.0 + np.exp(-class_logit)))
+            out.loc[idx_list, logit_col] = float(class_logit)
+            out.loc[idx_list, prob_col] = class_prob
+            type_logits.append(float(class_logit))
+            type_probs.append(class_prob)
+        if type_probs:
+            max_i = int(np.argmax(np.asarray(type_probs)))
+            out.loc[idx_list, "top_type_class"] = class_names[max_i]
+            out.loc[idx_list, "max_type_probability"] = type_probs[max_i]
+            out.loc[idx_list, "max_type_logit"] = type_logits[max_i]
+    return out
+
+
+def cluster_prediction_table(predictions: pd.DataFrame, class_names: list[str]) -> pd.DataFrame:
+    if predictions.empty or "cluster_key" not in predictions.columns:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for cluster_key, group in predictions.groupby("cluster_key", sort=False):
+        first = group.iloc[0]
+        row = {
+            "cluster_key": cluster_key,
+            "sample_id": first.get("sample_id", ""),
+            "cluster_id": first.get("cluster_id", ""),
+            "n_rows": int(len(group)),
+            "candidate_ids": ";".join(group.get("candidate_id", pd.Series(dtype=str)).astype(str).tolist()),
+            "chroms": ";".join(sorted(set(group.get("chrom", pd.Series(dtype=str)).astype(str).tolist()))),
+            "arms": ";".join(sorted(set(group.get("arm", pd.Series(dtype=str)).astype(str).tolist()))),
+            "start_bp_min": int(pd.to_numeric(group.get("start_bp", pd.Series(dtype=float)), errors="coerce").min()) if "start_bp" in group else np.nan,
+            "end_bp_max": int(pd.to_numeric(group.get("end_bp", pd.Series(dtype=float)), errors="coerce").max()) if "end_bp" in group else np.nan,
+            "true_classes": first.get("true_classes", ""),
+            "raw_true_classes": first.get("raw_true_classes", ""),
+            "predicted_classes": first.get("predicted_classes", ""),
+            "predicted_raw_classes": first.get("predicted_raw_classes", ""),
+            "predicted_class": first.get("predicted_class", ""),
+            "predicted_raw_class": first.get("predicted_raw_class", ""),
+            "called_complex_sv": first.get("called_complex_sv", ""),
+            "class_exact_match": first.get("class_exact_match", ""),
+            "class_any_match": first.get("class_any_match", ""),
+            "class_correctness": first.get("class_correctness", ""),
+            "objectness_prob": float(first.get("objectness_prob", np.nan)),
+            "top_type_class": first.get("top_type_class", ""),
+            "max_type_probability": float(first.get("max_type_probability", np.nan)),
+            "split": first.get("split", ""),
+        }
+        for class_name in class_names:
+            row[f"type_probability_{class_name}"] = float(first.get(f"type_probability_{class_name}", np.nan))
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def run_train_logo_calibration(
@@ -1392,7 +1830,17 @@ def run_train_logo_calibration(
         metrics["calibration_split"] = "logo"
         metric_rows.append(metrics)
 
-        pred = predict_model(model, embeddings, tabular_features, metadata, class_names, device=device, batch_size=int(args.batch_size))
+        pred = predict_model(
+            model,
+            embeddings,
+            tabular_features,
+            metadata,
+            class_names,
+            device=device,
+            batch_size=int(args.batch_size),
+            subtype_targets=str(args.subtype_targets),
+        )
+        pred = apply_cluster_aggregation(pred, class_names, mode=str(args.cluster_aggregation))
         fold = pred.loc[eval_mask].copy()
         fold["held_out_sample"] = held_sample
         fold["calibration_split"] = "logo"
@@ -1532,7 +1980,7 @@ def run(args: argparse.Namespace) -> None:
     write_tabular_feature_table(metadata, tabular_features, tabular_feature_names, output_dir)
     log.info("Using %d safe tabular feature(s): %s", len(tabular_feature_names), ",".join(tabular_feature_names) if tabular_feature_names else "none")
 
-    targets = _multi_hot_targets(metadata, class_names)
+    targets = _multi_hot_targets(metadata, class_names, subtype_targets=str(args.subtype_targets))
     labeled, background = _label_background_masks(metadata)
     class_counts = _class_counts(targets, class_names)
     samples = metadata["sample_id"].astype(str).to_numpy()
@@ -1578,6 +2026,7 @@ def run(args: argparse.Namespace) -> None:
     threshold_calibration = str(args.threshold_calibration).lower()
     objectness_tau_df = pd.DataFrame()
     type_threshold_sweep = pd.DataFrame()
+    subtype_threshold_sweep = pd.DataFrame()
     calibration_raw = pd.DataFrame()
     calibration_annotated = pd.DataFrame()
     calibration_training_metrics = pd.DataFrame()
@@ -1585,6 +2034,7 @@ def run(args: argparse.Namespace) -> None:
     secondary_threshold_sweep = pd.DataFrame()
     selected_objectness_tau: float | None = None
     type_thresholds: dict[str, float] = {}
+    subtype_thresholds: dict[str, dict[str, float]] = {}
     selected_rescue_type_tau: float | None = None
     selected_rescue_objectness_floor: float | None = None
     selected_rescue_margin: float | None = None
@@ -1621,12 +2071,24 @@ def run(args: argparse.Namespace) -> None:
                 type_grid,
                 tie_break=str(args.threshold_tie_break),
             )
+        if str(args.subtype_thresholding).lower() == "optimize" and not _uses_binary_subtype_targets(args.subtype_targets):
+            subtype_thresholds, subtype_threshold_sweep = choose_subtype_thresholds_from_predictions(
+                calibration_raw,
+                class_names,
+                type_thresholds,
+                type_grid,
+                tie_break=str(args.threshold_tie_break),
+            )
+        else:
+            subtype_thresholds = {}
+            subtype_threshold_sweep = pd.DataFrame()
         selected_rescue_type_tau, selected_rescue_objectness_floor, selected_rescue_margin, rescue_threshold_sweep = choose_rescue_thresholding(
             calibration_raw,
             float(selected_objectness_tau),
             type_thresholds,
             class_names,
             args,
+            subtype_thresholds=subtype_thresholds,
         )
         selected_secondary_min, selected_secondary_delta, secondary_threshold_sweep = choose_secondary_thresholding(
             calibration_raw,
@@ -1634,6 +2096,7 @@ def run(args: argparse.Namespace) -> None:
             type_thresholds,
             class_names,
             args,
+            subtype_thresholds=subtype_thresholds,
             rescue_type_tau=selected_rescue_type_tau,
             rescue_objectness_floor=selected_rescue_objectness_floor,
             rescue_margin=selected_rescue_margin,
@@ -1648,6 +2111,8 @@ def run(args: argparse.Namespace) -> None:
             rescue_type_tau=selected_rescue_type_tau,
             rescue_objectness_floor=selected_rescue_objectness_floor,
             rescue_margin=selected_rescue_margin,
+            subtype_thresholds=subtype_thresholds,
+            subtype_targets=str(args.subtype_targets),
         )
         if rescue_threshold_sweep.empty:
             rescue_threshold_sweep = rescue_sweep_table_for_selected(
@@ -1671,6 +2136,8 @@ def run(args: argparse.Namespace) -> None:
         objectness_tau_df.to_csv(output_dir / "objectness_tau_sweep_calibration.tsv", sep="\t", index=False)
         type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_logo.tsv", sep="\t", index=False)
         type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_calibration.tsv", sep="\t", index=False)
+        subtype_threshold_sweep.to_csv(output_dir / "subtype_threshold_sweep_logo.tsv", sep="\t", index=False)
+        subtype_threshold_sweep.to_csv(output_dir / "subtype_threshold_sweep_calibration.tsv", sep="\t", index=False)
         rescue_threshold_sweep.to_csv(output_dir / "rescue_threshold_sweep_logo.tsv", sep="\t", index=False)
         rescue_threshold_sweep.to_csv(output_dir / "rescue_threshold_sweep_calibration.tsv", sep="\t", index=False)
         secondary_threshold_sweep.to_csv(output_dir / "secondary_threshold_sweep_logo.tsv", sep="\t", index=False)
@@ -1706,7 +2173,19 @@ def run(args: argparse.Namespace) -> None:
     training_metrics.to_csv(output_dir / "training_metrics.tsv", sep="\t", index=False)
     _plot_training(training_metrics, output_dir / "training_curves.png")
 
-    raw_predictions = predict_model(final_model, embeddings, tabular_features, metadata, class_names, device=device, batch_size=int(args.batch_size))
+    row_raw_predictions = predict_model(
+        final_model,
+        embeddings,
+        tabular_features,
+        metadata,
+        class_names,
+        device=device,
+        batch_size=int(args.batch_size),
+        subtype_targets=str(args.subtype_targets),
+    )
+    row_raw_predictions.to_csv(output_dir / "row_raw_predictions.tsv", sep="\t", index=False)
+    raw_predictions = apply_cluster_aggregation(row_raw_predictions, class_names, mode=str(args.cluster_aggregation))
+    raw_predictions.to_csv(output_dir / "cluster_aggregated_raw_predictions.tsv", sep="\t", index=False)
     train_raw = raw_predictions.loc[train_mask].copy()
     train_objectness_tau_df = sweep_objectness_tau(train_raw, objectness_grid)
     train_objectness_tau_df.to_csv(output_dir / "objectness_tau_sweep_in_sample_train.tsv", sep="\t", index=False)
@@ -1717,6 +2196,17 @@ def run(args: argparse.Namespace) -> None:
         tie_break=str(args.threshold_tie_break),
     )
     train_type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_in_sample_train.tsv", sep="\t", index=False)
+    if str(args.subtype_thresholding).lower() == "optimize" and not _uses_binary_subtype_targets(args.subtype_targets):
+        train_subtype_thresholds, train_subtype_threshold_sweep = choose_subtype_thresholds_from_predictions(
+            train_raw,
+            class_names,
+            train_type_thresholds,
+            type_grid,
+            tie_break=str(args.threshold_tie_break),
+        )
+    else:
+        train_subtype_thresholds, train_subtype_threshold_sweep = {}, pd.DataFrame()
+    train_subtype_threshold_sweep.to_csv(output_dir / "subtype_threshold_sweep_in_sample_train.tsv", sep="\t", index=False)
 
     if threshold_calibration == "train":
         objectness_tau_df = train_objectness_tau_df
@@ -1731,12 +2221,28 @@ def run(args: argparse.Namespace) -> None:
         else:
             type_thresholds = train_type_thresholds
             type_threshold_sweep = train_type_threshold_sweep
+        if str(args.subtype_thresholding).lower() == "optimize" and not _uses_binary_subtype_targets(args.subtype_targets):
+            if args.type_tau is not None:
+                subtype_thresholds, subtype_threshold_sweep = choose_subtype_thresholds_from_predictions(
+                    train_raw,
+                    class_names,
+                    type_thresholds,
+                    type_grid,
+                    tie_break=str(args.threshold_tie_break),
+                )
+            else:
+                subtype_thresholds = train_subtype_thresholds
+                subtype_threshold_sweep = train_subtype_threshold_sweep
+        else:
+            subtype_thresholds = {}
+            subtype_threshold_sweep = pd.DataFrame()
         selected_rescue_type_tau, selected_rescue_objectness_floor, selected_rescue_margin, rescue_threshold_sweep = choose_rescue_thresholding(
             train_raw,
             float(selected_objectness_tau),
             type_thresholds,
             class_names,
             args,
+            subtype_thresholds=subtype_thresholds,
         )
         selected_secondary_min, selected_secondary_delta, secondary_threshold_sweep = choose_secondary_thresholding(
             train_raw,
@@ -1744,6 +2250,7 @@ def run(args: argparse.Namespace) -> None:
             type_thresholds,
             class_names,
             args,
+            subtype_thresholds=subtype_thresholds,
             rescue_type_tau=selected_rescue_type_tau,
             rescue_objectness_floor=selected_rescue_objectness_floor,
             rescue_margin=selected_rescue_margin,
@@ -1758,6 +2265,8 @@ def run(args: argparse.Namespace) -> None:
             rescue_type_tau=selected_rescue_type_tau,
             rescue_objectness_floor=selected_rescue_objectness_floor,
             rescue_margin=selected_rescue_margin,
+            subtype_thresholds=subtype_thresholds,
+            subtype_targets=str(args.subtype_targets),
         )
         if rescue_threshold_sweep.empty:
             rescue_threshold_sweep = rescue_sweep_table_for_selected(
@@ -1780,6 +2289,8 @@ def run(args: argparse.Namespace) -> None:
         objectness_tau_df.to_csv(output_dir / "objectness_tau_sweep_calibration.tsv", sep="\t", index=False)
         type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_train.tsv", sep="\t", index=False)
         type_threshold_sweep.to_csv(output_dir / "type_threshold_sweep_calibration.tsv", sep="\t", index=False)
+        subtype_threshold_sweep.to_csv(output_dir / "subtype_threshold_sweep_train.tsv", sep="\t", index=False)
+        subtype_threshold_sweep.to_csv(output_dir / "subtype_threshold_sweep_calibration.tsv", sep="\t", index=False)
         rescue_threshold_sweep.to_csv(output_dir / "rescue_threshold_sweep_train.tsv", sep="\t", index=False)
         rescue_threshold_sweep.to_csv(output_dir / "rescue_threshold_sweep_calibration.tsv", sep="\t", index=False)
         secondary_threshold_sweep.to_csv(output_dir / "secondary_threshold_sweep_train.tsv", sep="\t", index=False)
@@ -1799,12 +2310,16 @@ def run(args: argparse.Namespace) -> None:
         rescue_type_tau=selected_rescue_type_tau,
         rescue_objectness_floor=selected_rescue_objectness_floor,
         rescue_margin=selected_rescue_margin,
+        subtype_thresholds=subtype_thresholds,
+        subtype_targets=str(args.subtype_targets),
     )
     predictions["split"] = np.where(test_mask, "test", "train")
     predictions.to_csv(output_dir / "classification_predictions.tsv", sep="\t", index=False)
     predictions.loc[train_mask].to_csv(output_dir / "train_predictions.tsv", sep="\t", index=False)
     predictions.loc[test_mask].to_csv(output_dir / "test_predictions.tsv", sep="\t", index=False)
     predictions[predictions["called_complex_sv"].astype(bool)].to_csv(output_dir / "predicted_complex_sv.tsv", sep="\t", index=False)
+    cluster_predictions = cluster_prediction_table(predictions, class_names)
+    cluster_predictions.to_csv(output_dir / "cluster_predictions.tsv", sep="\t", index=False)
     pd.DataFrame(
         [
             {
@@ -1819,6 +2334,19 @@ def run(args: argparse.Namespace) -> None:
             for name in class_names
         ]
     ).to_csv(output_dir / "type_thresholds.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        [
+            {
+                "class_name": name,
+                "has_subtypes": bool(float(subtype_thresholds.get(name, {}).get("has_subtypes", 0.0)) > 0.0),
+                "noncanonicalB_threshold": float(subtype_thresholds.get(name, {}).get("noncanonicalB", type_thresholds.get(name, 0.5))),
+                "noncanonical_threshold": float(subtype_thresholds.get(name, {}).get("noncanonical", 1.01)),
+                "canonical_threshold": float(subtype_thresholds.get(name, {}).get("canonical", 1.01)),
+                "type_threshold": float(type_thresholds.get(name, 0.5)),
+            }
+            for name in class_names
+        ]
+    ).to_csv(output_dir / "subtype_thresholds.tsv", sep="\t", index=False)
 
     overall_tables: list[pd.DataFrame] = []
     per_class_tables: list[pd.DataFrame] = []
@@ -1862,6 +2390,13 @@ def run(args: argparse.Namespace) -> None:
         "class_names": class_names,
         "selected_objectness_tau": float(selected_objectness_tau),
         "type_thresholds": {name: float(value) for name, value in type_thresholds.items()},
+        "subtype_targets": str(args.subtype_targets),
+        "subtype_thresholding": str(args.subtype_thresholding),
+        "subtype_thresholds": {
+            name: {level: float(value) for level, value in levels.items()}
+            for name, levels in subtype_thresholds.items()
+        },
+        "cluster_aggregation": str(args.cluster_aggregation),
         "threshold_calibration": threshold_calibration,
         "threshold_tie_break": str(args.threshold_tie_break),
         "rescue_thresholding": str(args.rescue_thresholding),
@@ -1872,7 +2407,7 @@ def run(args: argparse.Namespace) -> None:
         "selected_secondary_min": None if selected_secondary_min is None else float(selected_secondary_min),
         "selected_secondary_delta": None if selected_secondary_delta is None else float(selected_secondary_delta),
         "calibration_n_candidates": int(len(calibration_raw)),
-        "class_counts_train": _class_counts(_multi_hot_targets(metadata.loc[train_mask].reset_index(drop=True), class_names), class_names),
+        "class_counts_train": _class_counts(_multi_hot_targets(metadata.loc[train_mask].reset_index(drop=True), class_names, subtype_targets=str(args.subtype_targets)), class_names),
         "class_counts_all": class_counts,
         "test_samples": test_samples,
         "embedding_mode": "candidate_region_with_context",
@@ -1886,6 +2421,13 @@ def run(args: argparse.Namespace) -> None:
         "class_counts_all": class_counts,
         "selected_objectness_tau": float(selected_objectness_tau),
         "type_thresholds": {name: float(value) for name, value in type_thresholds.items()},
+        "subtype_targets": str(args.subtype_targets),
+        "subtype_thresholding": str(args.subtype_thresholding),
+        "subtype_thresholds": {
+            name: {level: float(value) for level, value in levels.items()}
+            for name, levels in subtype_thresholds.items()
+        },
+        "cluster_aggregation": str(args.cluster_aggregation),
         "threshold_calibration": threshold_calibration,
         "threshold_tie_break": str(args.threshold_tie_break),
         "rescue_thresholding": str(args.rescue_thresholding),
@@ -1924,9 +2466,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--graph_checkpoint", default=None)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--class_names", default=DEFAULT_CLASS_NAMES)
-    parser.add_argument("--required_test_sample", default="H1395")
+    parser.add_argument("--required_test_sample", default="H1395,H1437,ME180,SCC154,ZR7530,SNU1245")
     parser.add_argument("--test_samples", default="", help="Comma-separated explicit held-out samples; required_test_sample is added if missing")
-    parser.add_argument("--n_test_samples", type=int, default=5)
+    parser.add_argument("--n_test_samples", type=int, default=6)
     parser.add_argument("--reuse_embeddings", action="store_true", help="Reuse output_dir embeddings.npz and candidate_embeddings.tsv if present")
     parser.add_argument("--embedding_features", choices=("full", "coords"), default="full", help="Embedding feature subset for the model branch: full 1214D local/context/diff/coords or coords-only 8D.")
     parser.add_argument("--embedding_normalization", choices=embed_corpus.EMBEDDING_NORMALIZATION_CHOICES, default="sample_residual")
@@ -1958,6 +2500,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--type_tau_max", type=float, default=0.95)
     parser.add_argument("--type_tau_steps", type=int, default=91)
     parser.add_argument("--type_tau", type=float, default=None)
+    parser.add_argument("--subtype_targets", choices=("general", "specific"), default="specific", help="Use binary base-class targets or subtype-strength targets for type BCE.")
+    parser.add_argument("--subtype_thresholding", choices=("off", "optimize"), default="optimize", help="Calibrate class-specific subtype levels from type probabilities.")
+    parser.add_argument("--cluster_aggregation", choices=("off", "max"), default="max", help="Aggregate logits across rows with the same sample_id and cluster_id before thresholding.")
     parser.add_argument("--rescue_thresholding", choices=("off", "fixed", "optimize"), default="optimize", help="Use high type confidence to rescue low-objectness single-label calls.")
     parser.add_argument("--rescue_type_tau", type=float, default=0.85, help="Fixed type-confidence rescue threshold when --rescue_thresholding=fixed.")
     parser.add_argument("--rescue_objectness_floor", type=float, default=0.0, help="Fixed minimum objectness for type-confidence rescue when --rescue_thresholding=fixed.")

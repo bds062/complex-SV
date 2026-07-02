@@ -16,6 +16,7 @@ SAMPLE_COLUMNS = ["TCN", "CN1", "CN2"]
 __all__ = [
     "assign_linked_cluster_ids",
     "calculate_ploidy",
+    "classify_linked_clusters",
     "count_cna_segments_in_windows",
     "count_breakpoints_in_candidate_windows",
     "find_small_segment_candidate_intervals",
@@ -38,6 +39,7 @@ SV_TYPE_COLORS = {
     "INV_LIKE": "#2ca02c",
     "sBND": "#8c564b",
 }
+FIXED_SV_TYPES = tuple(SV_TYPE_COLORS.keys())
 
 REGION_COLORS = [
     "#4e79a7",
@@ -412,7 +414,7 @@ def _filter_cna_by_components(
     pieces = []
     for start, end in components:
         overlap = cna_df[
-            (cna_df["chrom"] == chrom) & (cna_df["start"] <= end) & (cna_df["end"] >= start)
+            (cna_df["chrom"] == chrom) & (cna_df["start"] < end) & (cna_df["end"] > start)
         ]
         pieces.append(overlap)
     if not pieces:
@@ -424,13 +426,16 @@ def _filter_breakpoints_by_components(
     breakpoints_df: pd.DataFrame,
     chrom: str,
     components: list[tuple[int, int]],
+    padding: int = 0,
 ) -> pd.DataFrame:
     pieces = []
     for start, end in components:
+        padded_start = max(0, start - padding)
+        padded_end = end + padding
         overlap = breakpoints_df[
             (breakpoints_df["chrom"] == chrom)
-            & (breakpoints_df["pos"] >= start)
-            & (breakpoints_df["pos"] <= end)
+            & (breakpoints_df["pos"] >= padded_start)
+            & (breakpoints_df["pos"] <= padded_end)
         ]
         pieces.append(overlap)
     if not pieces:
@@ -449,7 +454,7 @@ def _classification_cna_segments(
     if cna_df.empty:
         return cna_df.copy()
     segment_lengths = cna_df["end"].astype(int) - cna_df["start"].astype(int) + 1
-    return cna_df[segment_lengths >= min_segment_size].copy()
+    return cna_df[segment_lengths > min_segment_size].copy()
 
 
 def _breakpoints_matching_cna_boundaries(
@@ -775,13 +780,16 @@ def _summarize_candidate_intervals(
     intervals_df: pd.DataFrame,
     cna_df: pd.DataFrame,
     breakpoints_df: pd.DataFrame,
+    sample_ploidy: float | None = None,
 ) -> pd.DataFrame:
     if intervals_df.empty:
         return intervals_df
 
     cna_df = cna_df.copy()
     breakpoints_df = breakpoints_df.copy()
-    sv_types = sorted(breakpoints_df["SV_TYPE"].dropna().unique())
+    if sample_ploidy is None:
+        sample_ploidy = calculate_ploidy(cna_df)
+    sv_types = sorted(set(FIXED_SV_TYPES).union(breakpoints_df["SV_TYPE"].dropna().unique()))
     rows = []
 
     for interval in intervals_df.to_dict("records"):
@@ -792,7 +800,12 @@ def _summarize_candidate_intervals(
         component_intervals = _component_intervals_to_string(components)
 
         cna_overlap = _filter_cna_by_components(cna_df, chrom, components)
-        bp_overlap = _filter_breakpoints_by_components(breakpoints_df, chrom, components)
+        bp_overlap = _filter_breakpoints_by_components(
+            breakpoints_df,
+            chrom,
+            components,
+            padding=100,
+        )
         bp_overlap = _breakpoints_matching_cna_boundaries(bp_overlap, cna_overlap)
 
         row = {
@@ -810,6 +823,7 @@ def _summarize_candidate_intervals(
         row["segment_frequency"] = row["n_segments"] / interval_length
         row["cand"] = True
         row["ploidy"] = _calculate_ploidy_for_components(cna_df, chrom, components)
+        row["sample_ploidy"] = sample_ploidy
         segment_lengths = cna_overlap["end"] - cna_overlap["start"] + 1
         row["segment_len_q25"] = segment_lengths.quantile(0.25) if len(segment_lengths) else pd.NA
         row["segment_len_q50"] = segment_lengths.quantile(0.50) if len(segment_lengths) else pd.NA
@@ -846,9 +860,18 @@ def _summarize_candidate_intervals(
     result = pd.DataFrame(rows)
     if result.empty:
         return result
+    for sv_type in FIXED_SV_TYPES:
+        column = f"n_{sv_type}"
+        if column not in result.columns:
+            result[column] = 0
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0).astype(int)
     min_region_length = 2_000_000
     region_length = result["component_length"]
     result = result[region_length >= min_region_length]
+    contains_fb = result["n_FB"].fillna(0) > 0
+    has_high_tcn = result["ecDNA"].fillna(False).astype(bool)
+    enough_segments = contains_fb | has_high_tcn | (result["n_segments_ge_100kb"] >= 4)
+    result = result[enough_segments]
     return _natural_sort_dataframe(result, ["start", "end"])
 
 
@@ -874,9 +897,13 @@ def _classify_candidate_event(
         (classification_cna["TCN"] < 7).all()
     )
     multiple_cn_states = cna_overlap["TCN"].nunique(dropna=True) > 1
-    seismic_tcn_threshold = 7 if row["ploidy"] < 3.5 else 9
+    sample_ploidy = row.get("sample_ploidy", pd.NA)
+    ploidy_for_threshold = row.get("ploidy") if pd.isna(sample_ploidy) else sample_ploidy
+    seismic_tcn_threshold = _seismic_tcn_threshold(ploidy_for_threshold)
+    ecdna_tcn_threshold = _ecdna_tcn_threshold(sample_ploidy)
     multiple_high_cn_segments = int((cna_overlap["TCN"] >= seismic_tcn_threshold).sum()) > 1
-    seismic = multiple_cn_states and multiple_high_cn_segments
+    seismic_segment_spacing = _seismic_segment_spacing_passes(row)
+    seismic = multiple_cn_states and multiple_high_cn_segments and seismic_segment_spacing
     n_segments = len(classification_cna)
     interchromosomal_sv_limit = 3 if n_segments > 7 else 2
     canonical_interchromosomal_sv_count = (
@@ -929,7 +956,7 @@ def _classify_candidate_event(
         bfb = pd.NA
 
     return {
-        "ecDNA": bool((cna_overlap["TCN"] > 20).any()),
+        "ecDNA": bool((cna_overlap["TCN"] > ecdna_tcn_threshold).any()),
         "Seismic_Amplification": (
             _canonical_label(is_single_chromosome) if seismic else pd.NA
         ),
@@ -938,8 +965,151 @@ def _classify_candidate_event(
     }
 
 
+def _aggregate_cluster_for_classification(
+    cluster_rows: pd.DataFrame,
+    cna_df: pd.DataFrame,
+    breakpoints_df: pd.DataFrame,
+    sample_ploidy: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    cna_pieces = []
+    bp_pieces = []
+    for _, region in cluster_rows.iterrows():
+        chrom = region["chrom"]
+        components = _component_intervals_from_row(region)
+        cna_overlap = _filter_cna_by_components(cna_df, chrom, components)
+        cna_pieces.append(cna_overlap)
+
+        bp_overlap = _filter_breakpoints_by_components(
+            breakpoints_df,
+            chrom,
+            components,
+            padding=100,
+        )
+        bp_overlap = _breakpoints_matching_cna_boundaries(bp_overlap, cna_overlap)
+        bp_pieces.append(bp_overlap)
+
+    cna_overlap = (
+        pd.concat(cna_pieces)
+        .drop_duplicates(subset=["chrom", "start", "end", "TCN", "CN1", "CN2"])
+        .pipe(_natural_sort_dataframe, ["start", "end"])
+        if cna_pieces
+        else cna_df.iloc[0:0].copy()
+    )
+    bp_overlap = (
+        pd.concat(bp_pieces)
+        .drop_duplicates(subset=["chrom", "pos", "sv_id", "SV_TYPE", "st"])
+        .pipe(_natural_sort_dataframe, ["pos", "sv_id"])
+        if bp_pieces
+        else breakpoints_df.iloc[0:0].copy()
+    )
+
+    segment_lengths = cna_overlap["end"] - cna_overlap["start"] + 1
+    component_length = int(cluster_rows["component_length"].sum()) if "component_length" in cluster_rows else int(segment_lengths.sum())
+    n_segments = len(cna_overlap)
+    row = {
+        "chrom": cluster_rows.iloc[0]["chrom"],
+        "ploidy": _calculate_ploidy_for_cluster(cna_overlap),
+        "sample_ploidy": sample_ploidy,
+        "n_segments": n_segments,
+        "n_segments_ge_100kb": len(_classification_cna_segments(cna_overlap)),
+        "component_length": component_length,
+        "segment_frequency": n_segments / component_length if component_length else pd.NA,
+        "segment_len_q50": segment_lengths.quantile(0.50) if len(segment_lengths) else pd.NA,
+        "n_breakpoints": len(bp_overlap),
+        "n_interchromosomal_SV": _count_interchromosomal_svs(bp_overlap, breakpoints_df),
+    }
+    row.update(_two_state_oscillation(cna_overlap))
+
+    sv_type_counts = bp_overlap["SV_TYPE"].value_counts()
+    for sv_type in sorted(set(FIXED_SV_TYPES).union(breakpoints_df["SV_TYPE"].dropna().unique())):
+        row[f"n_{sv_type}"] = int(sv_type_counts.get(sv_type, 0))
+
+    ordered_bp = _natural_sort_dataframe(bp_overlap, ["pos", "sv_id"]).reset_index(drop=True)
+    fb_positions = ordered_bp.index[ordered_bp["SV_TYPE"] == "FB"] + 1
+    fb_low_cn_positions = _fb_low_cn_indices(
+        ordered_bp,
+        cna_df,
+        min_region_size=2_000_000,
+    )
+    row["n_FB"] = int(sv_type_counts.get("FB", 0))
+    row["n_FB_lowCN_2Mb"] = len(fb_low_cn_positions)
+    row["FB_lowCN_first_index"] = (
+        int(min(fb_low_cn_positions)) if fb_low_cn_positions else pd.NA
+    )
+    row["FB_lowCN_last_index"] = (
+        int(max(fb_low_cn_positions)) if fb_low_cn_positions else pd.NA
+    )
+    row["FB_first_index"] = int(fb_positions.min()) if len(fb_positions) else pd.NA
+    row["FB_last_index"] = int(fb_positions.max()) if len(fb_positions) else pd.NA
+    return cna_overlap, bp_overlap, row
+
+
+def _calculate_ploidy_for_cluster(cna_overlap: pd.DataFrame) -> float:
+    if cna_overlap.empty:
+        return float("nan")
+    lengths = cna_overlap["end"] - cna_overlap["start"] + 1
+    total_length = lengths.sum()
+    if total_length == 0:
+        return float("nan")
+    return float((lengths * cna_overlap["TCN"]).sum() / total_length)
+
+
+def classify_linked_clusters(
+    candidate_df: pd.DataFrame,
+    cna_df: pd.DataFrame,
+    breakpoints_df: pd.DataFrame,
+    sample_ploidy: float | None = None,
+) -> pd.DataFrame:
+    """Classify linked candidate rows together and propagate shared annotations."""
+    if candidate_df.empty or "cluster_id" not in candidate_df.columns:
+        return candidate_df
+
+    if sample_ploidy is None:
+        sample_ploidy = calculate_ploidy(cna_df)
+
+    result = candidate_df.copy()
+    annotation_columns = ["ecDNA", "Seismic_Amplification", "chromothripsis", "BFB"]
+    for cluster_id, cluster_rows in result.groupby("cluster_id", sort=False):
+        cna_overlap, bp_overlap, cluster_row = _aggregate_cluster_for_classification(
+            cluster_rows,
+            cna_df,
+            breakpoints_df,
+            sample_ploidy,
+        )
+        annotations = _classify_candidate_event(
+            cna_overlap,
+            bp_overlap,
+            breakpoints_df,
+            cluster_row,
+        )
+        cluster_mask = result["cluster_id"] == cluster_id
+        for column in annotation_columns:
+            result.loc[cluster_mask, column] = annotations[column]
+    return result
+
+
 def _canonical_label(is_canonical: bool) -> str:
     return "canonical" if is_canonical else "noncanonical"
+
+
+def _seismic_tcn_threshold(ploidy: float | None) -> int:
+    if ploidy is None or pd.isna(ploidy):
+        return 7
+    return 7 if float(ploidy) < 3.5 else 8
+
+
+def _seismic_segment_spacing_passes(row: dict | pd.Series) -> bool:
+    component_length = row.get("component_length", pd.NA)
+    n_segments = row.get("n_segments", pd.NA)
+    if pd.isna(component_length) or pd.isna(n_segments) or n_segments == 0:
+        return False
+    return (float(component_length) / float(n_segments)) < 1_500_000
+
+
+def _ecdna_tcn_threshold(sample_ploidy: float | None) -> float:
+    if sample_ploidy is None or pd.isna(sample_ploidy):
+        return 20
+    return 10 * float(sample_ploidy)
 
 
 def _count_interchromosomal_svs(bp_overlap: pd.DataFrame, breakpoints_df: pd.DataFrame) -> int:
@@ -1250,7 +1420,12 @@ def assign_linked_cluster_ids(
         chrom = region["chrom"]
         components = _component_intervals_from_row(region)
         cna_overlap = _filter_cna_by_components(cna_df, chrom, components)
-        bp_overlap = _filter_breakpoints_by_components(breakpoints_df, chrom, components)
+        bp_overlap = _filter_breakpoints_by_components(
+            breakpoints_df,
+            chrom,
+            components,
+            padding=100,
+        )
         bp_overlap = _breakpoints_matching_cna_boundaries(bp_overlap, cna_overlap)
         region_sv_ids.append(set(bp_overlap["sv_id"].dropna()))
 
@@ -1325,6 +1500,7 @@ def merge_sv_cna_candidate_segments(
     region_merge_distance: int = 10_000_000,
 ) -> pd.DataFrame:
     """Return merged candidate intervals with CNA and SV summary columns."""
+    sample_ploidy = calculate_ploidy(cna_df)
     if method == "sliding":
         windows_df = count_cna_segments_in_windows(
             cna_df,
@@ -1343,7 +1519,12 @@ def merge_sv_cna_candidate_segments(
     else:
         raise ValueError("method must be 'sliding' or 'small_segments'")
 
-    candidate_df = _summarize_candidate_intervals(intervals_df, cna_df, breakpoints_df)
+    candidate_df = _summarize_candidate_intervals(
+        intervals_df,
+        cna_df,
+        breakpoints_df,
+        sample_ploidy=sample_ploidy,
+    )
     if candidate_df.empty:
         return candidate_df
 
@@ -1352,8 +1533,20 @@ def merge_sv_cna_candidate_segments(
         breakpoints_df,
         max_distance=region_merge_distance,
     )
-    final_df = _summarize_candidate_intervals(merged_intervals, cna_df, breakpoints_df)
-    return assign_linked_cluster_ids(final_df, cna_df, breakpoints_df)
+    final_df = _summarize_candidate_intervals(
+        merged_intervals,
+        cna_df,
+        breakpoints_df,
+        sample_ploidy=sample_ploidy,
+    )
+    final_df = assign_linked_cluster_ids(final_df, cna_df, breakpoints_df)
+    final_df = classify_linked_clusters(
+        final_df,
+        cna_df,
+        breakpoints_df,
+        sample_ploidy=sample_ploidy,
+    )
+    return final_df
 
 
 def get_bps(vcf_file):
@@ -1519,29 +1712,47 @@ def _region_x_offsets(
     return offsets
 
 
-def _component_x_position(pos: int, components: list[tuple[int, int]], offset: int) -> int | None:
+def _component_x_position(
+    pos: int,
+    components: list[tuple[int, int]],
+    offset: int,
+    wiggle: int = 0,
+) -> int | None:
     current = offset
     for start, end in components:
         if start <= pos <= end:
             return current + pos - start
+        if wiggle and start - wiggle <= pos < start:
+            return current
+        if wiggle and end < pos <= end + wiggle:
+            return current + end - start
         current += end - start + 1
     return None
 
 
-def _breakpoint_in_components(row: pd.Series, chrom: str, components: list[tuple[int, int]]) -> bool:
+def _breakpoint_in_components(
+    row: pd.Series,
+    chrom: str,
+    components: list[tuple[int, int]],
+    wiggle: int = 0,
+) -> bool:
     if row["chrom"] != chrom:
         return False
     pos = int(row["pos"])
-    return any(start <= pos <= end for start, end in components)
+    return any(start - wiggle <= pos <= end + wiggle for start, end in components)
 
 
 def _single_breakpoint_mate_label(
     original_sv_rows: pd.DataFrame,
     chrom: str,
     components: list[tuple[int, int]],
+    wiggle: int = 100,
 ) -> str:
     mate_rows = original_sv_rows[
-        ~original_sv_rows.apply(lambda row: _breakpoint_in_components(row, chrom, components), axis=1)
+        ~original_sv_rows.apply(
+            lambda row: _breakpoint_in_components(row, chrom, components, wiggle=wiggle),
+            axis=1,
+        )
     ]
     if mate_rows.empty:
         return "unpaired"
@@ -1573,22 +1784,42 @@ def _component_x_ranges(
     return ranges
 
 
-def _event_labels_for_plot(region: pd.Series) -> list[tuple[str, int]]:
+EVENT_TYPE_COLORS = {
+    "ecDNA": "#e15759",
+    "Seismic": "#f28e2b",
+    "Chromothripsis": "#4e79a7",
+    "BFB": "#59a14f",
+}
+
+EVENT_LABEL_SYMBOLS = {
+    "canonical": "circle",
+    "noncanonical": "diamond",
+    "noncanonicalB": "x",
+    "noncanonical_B": "x",
+    "ecDNA": "square",
+}
+
+
+def _event_marker_symbol(event_label: str) -> str:
+    return EVENT_LABEL_SYMBOLS.get(event_label, "circle")
+
+
+def _event_labels_for_plot(region: pd.Series) -> list[tuple[str, int, str]]:
     labels = []
     if bool(region.get("ecDNA", False)):
-        labels.append(("ecDNA", 1))
+        labels.append(("ecDNA", 1, "ecDNA"))
 
     seismic = region.get("Seismic_Amplification", pd.NA)
     if not pd.isna(seismic):
-        labels.append((str(seismic), 2))
+        labels.append((str(seismic), 2, "Seismic"))
 
     chromothripsis = region.get("chromothripsis", pd.NA)
     if not pd.isna(chromothripsis):
-        labels.append((str(chromothripsis), 3))
+        labels.append((str(chromothripsis), 3, "Chromothripsis"))
 
     bfb = region.get("BFB", pd.NA)
     if not pd.isna(bfb):
-        labels.append((str(bfb), 4))
+        labels.append((str(bfb), 4, "BFB"))
 
     return labels
 
@@ -1616,6 +1847,14 @@ def generate_candidate_plot(
         row_heights=[0.48, 0.34, 0.18],
         subplot_titles=("SV arcs", "Total copy number", "Event classes"),
     )
+    sample_ploidy_values = (
+        candidate_df["sample_ploidy"].dropna().unique()
+        if "sample_ploidy" in candidate_df.columns
+        else []
+    )
+    sample_ploidy_label = (
+        f"{float(sample_ploidy_values[0]):.3f}" if len(sample_ploidy_values) else "NA"
+    )
 
     offsets = _region_x_offsets(candidate_df, cna_df=cna_df, flank_size=PLOT_FLANK_SIZE)
     legend_seen = set()
@@ -1630,6 +1869,38 @@ def generate_candidate_plot(
         cluster_id: REGION_COLORS[index % len(REGION_COLORS)]
         for index, cluster_id in enumerate(cluster_order)
     }
+    for event_type, event_color in EVENT_TYPE_COLORS.items():
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker={"size": 10, "color": event_color, "symbol": "circle"},
+                name=f"{event_type} event",
+                legendgroup="event-type",
+                showlegend=True,
+            ),
+            row=3,
+            col=1,
+        )
+    for event_label, event_symbol in [
+        ("canonical", "circle"),
+        ("noncanonical", "diamond"),
+        ("noncanonicalB", "x"),
+    ]:
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker={"size": 10, "color": "#555555", "symbol": event_symbol},
+                name=event_label,
+                legendgroup="event-shape",
+                showlegend=True,
+            ),
+            row=3,
+            col=1,
+        )
 
     for region_index, region in candidate_df.iterrows():
         chrom = region["chrom"]
@@ -1645,8 +1916,14 @@ def generate_candidate_plot(
         cluster_id = str(region.get("cluster_id", region_index))
         region_color = cluster_colors.get(cluster_id, REGION_COLORS[region_index % len(REGION_COLORS)])
         region_label = f"{chrom}:{start}-{end}"
+        region_ploidy = region.get("ploidy", pd.NA)
+        region_ploidy_label = "NA" if pd.isna(region_ploidy) else f"{float(region_ploidy):.3f}"
+        row_sample_ploidy = region.get("sample_ploidy", pd.NA)
+        row_sample_ploidy_label = (
+            "NA" if pd.isna(row_sample_ploidy) else f"{float(row_sample_ploidy):.3f}"
+        )
         region_tick_positions.append(event_offset + component_length / 2)
-        region_tick_labels.append(region_label)
+        region_tick_labels.append(f"{region_label}<br>ploidy={region_ploidy_label}")
 
         for flank_intervals, flank_base_offset, flank_label in [
             (left_flank, offset, "5' flank"),
@@ -1686,6 +1963,8 @@ def generate_candidate_plot(
                                 f"{region_label}<br>{flank_label}<br>"
                                 f"{segment['chrom']}:{int(segment['start'])}-{int(segment['end'])}<br>"
                                 f"length={segment_length:,} bp<br>"
+                                f"region ploidy={region_ploidy_label}<br>"
+                                f"sample ploidy={row_sample_ploidy_label}<br>"
                                 f"TCN={segment['TCN']}<extra></extra>"
                             ),
                             showlegend=False,
@@ -1712,7 +1991,8 @@ def generate_candidate_plot(
 
         event_calls = _event_labels_for_plot(region)
         if event_calls:
-            for event_label, event_y in event_calls:
+            for event_label, event_y, event_type in event_calls:
+                event_color = EVENT_TYPE_COLORS[event_type]
                 fig.add_trace(
                     go.Scatter(
                         x=[event_offset + component_length / 2],
@@ -1720,13 +2000,19 @@ def generate_candidate_plot(
                         mode="markers+text",
                         marker={
                             "size": 14,
-                            "color": region_color,
+                            "color": event_color,
+                            "symbol": _event_marker_symbol(event_label),
                             "line": {"color": "#333333", "width": 1},
                         },
                         text=[event_label],
                         textposition="middle right",
                         textfont={"size": 11},
-                        hovertemplate=f"{region_label}<br>{event_label}<extra></extra>",
+                        hovertemplate=(
+                            f"{region_label}<br>"
+                            f"region ploidy={region_ploidy_label}<br>"
+                            f"sample ploidy={row_sample_ploidy_label}<br>"
+                            f"{event_type}: {event_label}<extra></extra>"
+                        ),
                         showlegend=False,
                     ),
                     row=3,
@@ -1753,6 +2039,8 @@ def generate_candidate_plot(
                             f"{region_label}<br>"
                             f"{segment['chrom']}:{int(segment['start'])}-{int(segment['end'])}<br>"
                             f"length={segment_length:,} bp<br>"
+                            f"region ploidy={region_ploidy_label}<br>"
+                            f"sample ploidy={row_sample_ploidy_label}<br>"
                             f"TCN={segment['TCN']}<extra></extra>"
                         ),
                         showlegend=False,
@@ -1761,14 +2049,25 @@ def generate_candidate_plot(
                     col=1,
                 )
 
-        bp_in_region = _filter_breakpoints_by_components(breakpoints_df, chrom, components)
+        bp_in_region = _filter_breakpoints_by_components(
+            breakpoints_df,
+            chrom,
+            components,
+            padding=100,
+        )
         bp_in_region = _breakpoints_matching_cna_boundaries(bp_in_region, cna_overlap)
         for sv_id, sv_rows in bp_in_region.groupby("sv_id", sort=False):
             original_sv_rows = breakpoints_df[breakpoints_df["sv_id"] == sv_id].sort_values(
                 ["chrom", "pos"]
             )
-            boundary_sv_rows = _breakpoints_matching_cna_boundaries(
+            padded_sv_rows = _filter_breakpoints_by_components(
                 original_sv_rows,
+                chrom,
+                components,
+                padding=100,
+            )
+            boundary_sv_rows = _breakpoints_matching_cna_boundaries(
+                padded_sv_rows,
                 cna_overlap,
             ).sort_values("pos")
             sv_type = str(sv_rows.iloc[0]["SV_TYPE"])
@@ -1777,7 +2076,7 @@ def generate_candidate_plot(
             legend_seen.add(sv_type)
 
             local_positions = [
-                _component_x_position(int(row["pos"]), components, event_offset)
+                _component_x_position(int(row["pos"]), components, event_offset, wiggle=100)
                 for _, row in boundary_sv_rows.iterrows()
                 if row["chrom"] == chrom
             ]
@@ -1856,7 +2155,10 @@ def generate_candidate_plot(
         col=1,
     )
     fig.update_layout(
-        title="Candidate regions: SV arcs, total copy number, and event classes",
+        title=(
+            "Candidate regions: SV arcs, total copy number, and event classes"
+            f" (sample ploidy={sample_ploidy_label})"
+        ),
         template="plotly_white",
         height=max(850, 120 + 32 * len(candidate_df)),
         hovermode="closest",

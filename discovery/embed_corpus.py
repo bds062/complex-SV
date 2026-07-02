@@ -459,73 +459,6 @@ def _predict_haplotype(segs: pd.DataFrame, sub_df: pd.DataFrame | None) -> dict[
     }
 
 
-def _localize_from_signals(
-    sv_pos: list[int],
-    sv_end: list[int],
-    sv_weights: np.ndarray | None,
-    cn_bin_relevance: np.ndarray | None,
-    start_bp: int,
-    end_bp: int,
-) -> dict[str, Any]:
-    """Compute sub-arm localized interval from SV attention span and/or CN bin relevance.
-
-    Priority: SV span (most precise) → CN attention → full candidate window.
-    Returns localized_start_bp, localized_end_bp, localization_method,
-    localization_confidence, localization_span_fraction.
-    """
-    span = max(end_bp - start_bp, 1)
-    loc_start, loc_end, method, confidence = start_bp, end_bp, "candidate_window", 0.0
-
-    # SV-span: use attention-weighted top-50% of SV nodes
-    if sv_pos and sv_weights is not None and len(sv_weights) == len(sv_pos):
-        w = np.asarray(sv_weights, dtype=float)
-        threshold = float(np.percentile(w, 50))
-        hot = w >= threshold
-        hot_pos = [sv_pos[i] for i in range(len(sv_pos)) if hot[i]]
-        hot_end = [sv_end[i] for i in range(len(sv_end)) if hot[i]]
-        if hot_pos:
-            loc_start = max(start_bp, min(hot_pos))
-            loc_end = min(end_bp, max(hot_end))
-            if loc_end > loc_start:
-                method = "sv_attention"
-                concentration = float(1.0 - np.exp(-(w.max() / (w.mean() + 1e-9) - 1)))
-                confidence = float(min(1.0, max(0.3, concentration)))
-    elif sv_pos:
-        loc_start = max(start_bp, min(sv_pos))
-        loc_end = min(end_bp, max(sv_end))
-        if loc_end > loc_start:
-            method = "sv_span"
-            confidence = 0.5
-
-    # CN bin attention: refine or replace when SV span not available
-    if cn_bin_relevance is not None and len(cn_bin_relevance) > 0 and method == "candidate_window":
-        n_bins = len(cn_bin_relevance)
-        bin_starts = np.linspace(start_bp, end_bp, n_bins + 1)[:-1].astype(int)
-        bin_ends = np.linspace(start_bp, end_bp, n_bins + 1)[1:].astype(int)
-        rel = np.abs(cn_bin_relevance)
-        threshold = float(np.percentile(rel, 70))
-        hot = rel >= threshold
-        if hot.any():
-            hot_idx = np.where(hot)[0]
-            loc_start = int(bin_starts[hot_idx[0]])
-            loc_end = int(bin_ends[hot_idx[-1]])
-            if loc_end > loc_start:
-                method = "cn_attention"
-                concentration = float(rel[hot].mean() / (rel.mean() + 1e-9))
-                confidence = float(min(0.7, max(0.2, concentration / 5.0)))
-
-    loc_start = max(start_bp, min(loc_start, end_bp))
-    loc_end = max(loc_start + 1, min(loc_end, end_bp))
-    span_fraction = round((loc_end - loc_start) / span, 4)
-
-    return {
-        "localized_start_bp": int(loc_start),
-        "localized_end_bp": int(loc_end),
-        "localization_method": method,
-        "localization_confidence": round(confidence, 4),
-        "localization_span_fraction": span_fraction,
-    }
-
 
 def embed_candidate(
     candidate: dict[str, Any],
@@ -542,18 +475,11 @@ def embed_candidate(
     cn_tensor = region_to_tensor(segs, start_bp, end_bp, n_bins=cn_cfg.n_bins_region).unsqueeze(0).to(device)
     cn_mask = torch.zeros(cn_tensor.shape[:2], dtype=torch.bool, device=device)
 
-    cn_bin_relevance: np.ndarray | None = None
-    sv_pos: list[int] = []
-    sv_end: list[int] = []
-    sv_weights: np.ndarray | None = None
     sub_df: pd.DataFrame | None = None
 
     with torch.no_grad():
-        _cn_recon, cn_cls, cn_bin_embs = cn_model(cn_tensor, cn_mask)
-        # Per-bin relevance: alignment of each bin embedding with the CLS token
+        _cn_recon, cn_cls, _cn_bin_embs = cn_model(cn_tensor, cn_mask)
         cn_cls_vec = cn_cls.squeeze(0)
-        cn_bin_embs_2d = cn_bin_embs.squeeze(0)  # [n_bins, d_model]
-        cn_bin_relevance = (cn_bin_embs_2d @ cn_cls_vec).cpu().numpy().astype(np.float32)
 
         def normalize_block(x: torch.Tensor) -> torch.Tensor:
             return l2_normalize(x, dim=0)
@@ -585,15 +511,9 @@ def embed_candidate(
             mask = torch.zeros(region_graph["sv"].x.shape[0], dtype=torch.bool, device=device)
             _graph_recon, node_h = graph_model(region_graph, mask)
             local_indices = list(range(region_graph["sv"].x.shape[0]))
-            graph_regional, attn_weights = graph_model.regional_embed_with_weights(node_h, local_indices)
+            graph_regional = graph_model.regional_embed(node_h, local_indices)
             graph_global = graph_model.global_embed(node_h)
             parts.extend([normalize_block(graph_regional), normalize_block(graph_global)])
-            # Capture SV genomic positions and attention weights for localization
-            if "pos" in sub_df.columns and "end" in sub_df.columns:
-                sv_pos = pd.to_numeric(sub_df["pos"], errors="coerce").fillna(start_bp).astype(int).tolist()
-                sv_end = pd.to_numeric(sub_df["end"], errors="coerce").fillna(end_bp).astype(int).tolist()
-            if attn_weights is not None:
-                sv_weights = attn_weights.cpu().numpy().astype(np.float32)
         else:
             embed_dim = int(getattr(getattr(graph_model, "cfg", None), "embed_dim", 64)) if graph_model is not None else 64
             parts.extend(
@@ -607,7 +527,6 @@ def embed_candidate(
         parts.append(normalize_block(stats))
         embedding = l2_normalize(torch.cat(parts, dim=0), dim=0)
 
-    loc = _localize_from_signals(sv_pos, sv_end, sv_weights, cn_bin_relevance, start_bp, end_bp)
     hap = _predict_haplotype(segs, sub_df)
 
     metadata: dict[str, Any] = {
@@ -626,7 +545,6 @@ def embed_candidate(
         "n_sv_nodes": int(original_n_sv),
         "encoded_sv_nodes": int(len(sv_indices)),
         "embedding_mode": "encoder_concat",
-        **loc,
         **hap,
     }
     return embedding.detach().cpu().numpy().astype(np.float32), metadata
@@ -1112,9 +1030,12 @@ def _split_class_set(value: object) -> list[str]:
 
 
 def _row_predicted_classes(row: pd.Series) -> list[str]:
-    if "predicted_classes" in row and str(row.get("predicted_classes", "")).strip():
-        return _split_class_set(row.get("predicted_classes", ""))
-    return _split_class_set(row.get("predicted_class", ""))
+    for column in ["predicted_raw_classes", "predicted_classes", "predicted_raw_class", "predicted_class"]:
+        if column in row and str(row.get(column, "")).strip():
+            values = _split_class_set(row.get(column, ""))
+            if values:
+                return values
+    return []
 
 
 def _prediction_label(row: pd.Series) -> str:
@@ -1385,12 +1306,10 @@ def _summary_class_order(values: pd.Series) -> list[str]:
 
 
 def _summary_gt_class(row: pd.Series) -> str:
-    classes = _split_class_set(row.get("sv_class", ""))
-    if classes:
-        return ";".join(classes)
-    classes = _split_class_set(row.get("true_classes", ""))
-    if classes:
-        return ";".join(classes)
+    for column in ["raw_sv_classes", "raw_true_classes", "sv_class", "true_classes"]:
+        classes = _split_class_set(row.get(column, ""))
+        if classes:
+            return ";".join(classes)
 
     evidence = str(row.get("evidence", "")).strip()
     label_scope = str(row.get("label_scope", "")).strip()
@@ -1407,6 +1326,36 @@ def _summary_class_set(label: object) -> set[str]:
     return set(_split_class_set(text))
 
 
+def _summary_base_class_set(label: object) -> set[str]:
+    return {part.split(":", 1)[0].strip() for part in _summary_class_set(label) if part.split(":", 1)[0].strip()}
+
+
+def _summary_base_label(label: object) -> str:
+    text = str(label).strip()
+    if not text or text.lower() == "none":
+        return "none"
+    bases: list[str] = []
+    for part in _split_class_set(text):
+        base = part.split(":", 1)[0].strip()
+        if base and base not in bases:
+            bases.append(base)
+    return ";".join(bases) if bases else "none"
+
+
+def _summary_correctness_category(true_label: object, pred_label: object) -> str:
+    true_raw = _summary_class_set(true_label)
+    pred_raw = _summary_class_set(pred_label)
+    true_base = _summary_base_class_set(true_label)
+    pred_base = _summary_base_class_set(pred_label)
+    if true_raw == pred_raw:
+        return "exact"
+    if true_base == pred_base and true_base:
+        return "wrong_level"
+    if bool(true_base & pred_base):
+        return "partial_class"
+    return "wrong"
+
+
 def _plot_anchor_prediction_summary(
     distances: pd.DataFrame,
     output_path: Path,
@@ -1416,19 +1365,34 @@ def _plot_anchor_prediction_summary(
     if distances.empty or "predicted_class" not in distances:
         return
     gt = distances.copy()
-    gt["_gt_class"] = gt.apply(_summary_gt_class, axis=1)
-    gt = gt[gt["_gt_class"].astype(str) != ""].copy()
+    gt["_gt_raw_class"] = gt.apply(_summary_gt_class, axis=1)
+    gt = gt[gt["_gt_raw_class"].astype(str) != ""].copy()
     if gt.empty:
         return
 
-    gt["_predicted_class"] = gt.apply(_prediction_label, axis=1)
-    gt["correct"] = [
-        _summary_class_set(true_value) == _summary_class_set(pred_value)
-        for true_value, pred_value in zip(gt["_gt_class"].tolist(), gt["_predicted_class"].tolist())
+    gt["_gt_class"] = gt["_gt_raw_class"].map(_summary_base_label)
+    gt["_predicted_raw_class"] = gt.apply(_prediction_label, axis=1)
+    gt["_predicted_class"] = gt["_predicted_raw_class"].map(_summary_base_label)
+    gt["correctness_category"] = [
+        _summary_correctness_category(true_value, pred_value)
+        for true_value, pred_value in zip(gt["_gt_raw_class"].tolist(), gt["_predicted_raw_class"].tolist())
     ]
     class_order = _summary_class_order(gt["_gt_class"].astype(str))
-    correct_counts = [int(gt[(gt["_gt_class"] == cls) & gt["correct"]].shape[0]) for cls in class_order]
-    incorrect_counts = [int(gt[(gt["_gt_class"] == cls) & ~gt["correct"]].shape[0]) for cls in class_order]
+    category_order = [
+        ("exact", "Exact", "#59A14F"),
+        ("wrong_level", "Wrong subtype", "#F28E2B"),
+        ("partial_class", "Partial class", "#9467BD"),
+        ("wrong", "Wrong", "#E15759"),
+    ]
+    category_counts = {
+        category: [int(gt[(gt["_gt_class"] == cls) & (gt["correctness_category"] == category)].shape[0]) for cls in class_order]
+        for category, _label, _color in category_order
+    }
+    category_order = [
+        (category, label, color)
+        for category, label, color in category_order
+        if sum(category_counts.get(category, [])) > 0
+    ]
 
     pred_order = list(class_order)
     for pred in _summary_class_order(gt["_predicted_class"].astype(str)):
@@ -1442,11 +1406,13 @@ def _plot_anchor_prediction_summary(
 
     suffix = f" - {title_suffix}" if title_suffix else ""
     x = np.arange(len(class_order))
-    axes[0].bar(x, correct_counts, color="#59A14F", label="Correct")
-    axes[0].bar(x, incorrect_counts, bottom=correct_counts, color="#E15759", label="Incorrect")
-    for i, (correct, incorrect) in enumerate(zip(correct_counts, incorrect_counts)):
-        total = correct + incorrect
-        axes[0].text(i, total + 0.05, str(total), ha="center", va="bottom", fontsize=9)
+    bottom = np.zeros(len(class_order), dtype=float)
+    for category, label, color in category_order:
+        counts = np.asarray(category_counts[category], dtype=float)
+        axes[0].bar(x, counts, bottom=bottom, color=color, label=label)
+        bottom += counts
+    for i, total in enumerate(bottom):
+        axes[0].text(i, total + 0.05, str(int(total)), ha="center", va="bottom", fontsize=9)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels([_display_class(cls) for cls in class_order], rotation=25, ha="right")
     axes[0].set_ylabel("GT region count")

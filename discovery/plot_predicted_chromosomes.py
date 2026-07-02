@@ -59,6 +59,8 @@ STRAND_ORIENTATION_COLORS = {
 }
 FOLDBACK_HIGHLIGHT_COLOR = "#C51B29"
 HAPLOTYPE_COLORS = {"HP1": "#D62728", "HP2": "#1F77B4", "mixed_HP": "#737373"}
+DEFAULT_CENTROMERE_BED = PROJECT_ROOT.parent / "results" / "grch38.cen_coord.curated.bed"
+CENTROMERE_COLOR = "#9A9A9A"
 
 
 def _clean_text(value: object) -> str:
@@ -116,6 +118,9 @@ def _display_haplotype_tag(value: object) -> str:
 def _plot_correctness_bucket(row: pd.Series) -> str:
     is_labeled = _bool_value(row.get("is_labeled", ""))
     if is_labeled is True:
+        any_match = _bool_value(row.get("class_any_match", ""))
+        if any_match is not None:
+            return "correct_preds" if any_match else "incorrect_preds"
         exact = _bool_value(row.get("class_exact_match", ""))
         return "correct_preds" if exact is True else "incorrect_preds"
 
@@ -194,6 +199,78 @@ def _numeric(row: pd.Series, key: str, default: float = 0.0) -> float:
     return float(default if pd.isna(value) else value)
 
 
+def read_centromeres(path: str | Path | None) -> pd.DataFrame:
+    if path is None or not str(path).strip():
+        return pd.DataFrame(columns=["chrom", "start", "end"])
+    bed_path = Path(path)
+    if not bed_path.exists():
+        log.warning("Centromere BED not found: %s", bed_path)
+        return pd.DataFrame(columns=["chrom", "start", "end"])
+    df = pd.read_csv(
+        bed_path,
+        sep="\t",
+        comment="#",
+        header=None,
+        names=["chrom", "start", "end"],
+        usecols=[0, 1, 2],
+    )
+    df["start"] = pd.to_numeric(df["start"], errors="coerce")
+    df["end"] = pd.to_numeric(df["end"], errors="coerce")
+    df = df.dropna(subset=["chrom", "start", "end"]).copy()
+    df = df[df["end"] > df["start"]].copy()
+    df["start"] = df["start"].astype(int)
+    df["end"] = df["end"].astype(int)
+    return df.reset_index(drop=True)
+
+
+def _subset_centromeres(centromeres: pd.DataFrame, chrom: str, start_bp: int, end_bp: int) -> pd.DataFrame:
+    if centromeres.empty:
+        return pd.DataFrame(columns=["chrom", "start", "end", "plot_start", "plot_end"])
+    mask = (
+        centromeres["chrom"].map(lambda value: _chrom_equal(value, chrom))
+        & (pd.to_numeric(centromeres["end"], errors="coerce") > start_bp)
+        & (pd.to_numeric(centromeres["start"], errors="coerce") < end_bp)
+    )
+    out = centromeres.loc[mask].copy()
+    if out.empty:
+        return pd.DataFrame(columns=["chrom", "start", "end", "plot_start", "plot_end"])
+    out["plot_start"] = pd.to_numeric(out["start"], errors="coerce").clip(lower=start_bp, upper=end_bp).astype(int)
+    out["plot_end"] = pd.to_numeric(out["end"], errors="coerce").clip(lower=start_bp, upper=end_bp).astype(int)
+    out = out[out["plot_end"] > out["plot_start"]].copy()
+    return out.reset_index(drop=True)
+
+
+def _format_centromere_intervals(centromeres: pd.DataFrame) -> str:
+    if centromeres.empty:
+        return ""
+    return ";".join(f"{int(row.plot_start)}-{int(row.plot_end)}" for row in centromeres.itertuples())
+
+
+def _draw_centromere_annotations(axes: np.ndarray, centromeres: pd.DataFrame) -> None:
+    if centromeres.empty:
+        return
+    for _, row in centromeres.iterrows():
+        cen_start = int(row["plot_start"]) / 1e6
+        cen_end = int(row["plot_end"]) / 1e6
+        cen_mid = (cen_start + cen_end) / 2.0
+        for ax in axes:
+            ax.axvspan(cen_start, cen_end, color=CENTROMERE_COLOR, alpha=0.16, linewidth=0, zorder=0)
+            ax.axvline(cen_start, color=CENTROMERE_COLOR, linestyle="--", linewidth=0.8, alpha=0.7, zorder=1)
+            ax.axvline(cen_end, color=CENTROMERE_COLOR, linestyle="--", linewidth=0.8, alpha=0.7, zorder=1)
+        axes[0].text(
+            cen_mid,
+            0.96,
+            "centromere",
+            transform=axes[0].get_xaxis_transform(),
+            ha="center",
+            va="top",
+            fontsize=8,
+            color="#555555",
+            bbox=dict(boxstyle="round,pad=0.18", facecolor="white", edgecolor="none", alpha=0.75),
+            zorder=22,
+        )
+
+
 def _format_bp(value: int | float) -> str:
     try:
         return f"{int(round(float(value))):,}"
@@ -201,21 +278,33 @@ def _format_bp(value: int | float) -> str:
         return str(value)
 
 
-def _highlight_interval(row: pd.Series, start_bp: int, end_bp: int) -> tuple[int, int]:
-    # Prefer explicit ShatterSeek highlight; fall back to model-predicted localization
-    has_explicit = np.isfinite(_numeric(row, "highlight_start_bp", np.nan)) or np.isfinite(_numeric(row, "highlight_end_bp", np.nan))
-    if not has_explicit and np.isfinite(_numeric(row, "localized_start_bp", np.nan)):
-        highlight_start = int(_numeric(row, "localized_start_bp", start_bp))
-        highlight_end = int(_numeric(row, "localized_end_bp", end_bp))
-    else:
-        highlight_start = int(_numeric(row, "highlight_start_bp", start_bp))
-        highlight_end = int(_numeric(row, "highlight_end_bp", end_bp))
+def _plot_window_interval(row: pd.Series, candidate_start_bp: int, candidate_end_bp: int) -> tuple[int, int]:
+    context_start = _numeric(row, "context_start_bp", np.nan)
+    context_end = _numeric(row, "context_end_bp", np.nan)
+    if np.isfinite(context_start) and np.isfinite(context_end) and int(context_end) > int(context_start):
+        return int(context_start), int(context_end)
+    return candidate_start_bp, candidate_end_bp
+
+
+def _highlight_interval(
+    row: pd.Series,
+    plot_start_bp: int,
+    plot_end_bp: int,
+    candidate_start_bp: int,
+    candidate_end_bp: int,
+) -> tuple[int, int]:
+    # Candidate-region plots show the full arm/chromosome context, with the merged
+    # candidate interval highlighted. Only explicit external highlights override it.
+    highlight_start = int(_numeric(row, "highlight_start_bp", candidate_start_bp))
+    highlight_end = int(_numeric(row, "highlight_end_bp", candidate_end_bp))
     if highlight_end < highlight_start:
         highlight_start, highlight_end = highlight_end, highlight_start
-    highlight_start = max(start_bp, min(highlight_start, end_bp))
-    highlight_end = max(start_bp, min(highlight_end, end_bp))
+    highlight_start = max(plot_start_bp, min(highlight_start, plot_end_bp))
+    highlight_end = max(plot_start_bp, min(highlight_end, plot_end_bp))
     if highlight_end <= highlight_start:
-        highlight_start, highlight_end = start_bp, end_bp
+        highlight_start, highlight_end = candidate_start_bp, candidate_end_bp
+        highlight_start = max(plot_start_bp, min(highlight_start, plot_end_bp))
+        highlight_end = max(plot_start_bp, min(highlight_end, plot_end_bp))
     return highlight_start, highlight_end
 
 
@@ -660,6 +749,7 @@ def plot_chromosome_prediction(
     row: pd.Series,
     wakhan_df: pd.DataFrame,
     severus_df: pd.DataFrame,
+    centromeres: pd.DataFrame,
     output_path: Path,
     dpi: int,
 ) -> None:
@@ -670,18 +760,21 @@ def plot_chromosome_prediction(
     pred_classes = _row_predicted_classes(row)
     pred = ";".join(pred_classes) if pred_classes else _clean_text(row.get("predicted_class", "predicted"))
     top_pred = pred_classes[0] if pred_classes else pred
-    start_bp = int(_numeric(row, "start_bp", 0))
-    end_bp = int(_numeric(row, "end_bp", start_bp + 1))
+    candidate_start_bp = int(_numeric(row, "start_bp", 0))
+    candidate_end_bp = int(_numeric(row, "end_bp", candidate_start_bp + 1))
 
-    if end_bp <= start_bp:
+    if candidate_end_bp <= candidate_start_bp:
         chrom_segs = wakhan_df[wakhan_df["chrom"].map(lambda value: _chrom_equal(value, chrom))].copy() if not wakhan_df.empty else pd.DataFrame()
         if not chrom_segs.empty:
-            start_bp = int(pd.to_numeric(chrom_segs["start"], errors="coerce").min())
-            end_bp = int(pd.to_numeric(chrom_segs["end"], errors="coerce").max())
+            candidate_start_bp = int(pd.to_numeric(chrom_segs["start"], errors="coerce").min())
+            candidate_end_bp = int(pd.to_numeric(chrom_segs["end"], errors="coerce").max())
         else:
-            end_bp = start_bp + 1
+            candidate_end_bp = candidate_start_bp + 1
 
-    highlight_start_bp, highlight_end_bp = _highlight_interval(row, start_bp, end_bp)
+    start_bp, end_bp = _plot_window_interval(row, candidate_start_bp, candidate_end_bp)
+    if end_bp <= start_bp:
+        start_bp, end_bp = candidate_start_bp, candidate_end_bp
+    highlight_start_bp, highlight_end_bp = _highlight_interval(row, start_bp, end_bp, candidate_start_bp, candidate_end_bp)
     confidence = _clean_text(row.get("confidence", ""))
     highlight_label = _clean_text(row.get("highlight_label", ""))
     if not highlight_label and ("highlight_start_bp" in row or "highlight_end_bp" in row):
@@ -691,6 +784,7 @@ def plot_chromosome_prediction(
 
     segs = _subset_segments(wakhan_df, chrom, start_bp, end_bp)
     sv_chr = _subset_sv_on_chrom(severus_df, chrom, start_bp, end_bp)
+    cen_chr = _subset_centromeres(centromeres, chrom, start_bp, end_bp)
 
     fig, axes = plt.subplots(
         3,
@@ -699,8 +793,7 @@ def plot_chromosome_prediction(
         sharex=True,
         gridspec_kw={"height_ratios": [1.55, 2.05, 1.15], "hspace": 0.08},
     )
-    class_color = CLASS_COLORS.get(top_pred, "#4E79A7")
-    highlight_color = {"HIGH": "#C83232", "LOW": "#D89021"}.get(confidence.upper(), class_color)
+    highlight_color = "#2F6BFF"
     score_text = _format_score_text(row, pred_classes)
     count_text = f"{len(segs)} CN segments, {len(sv_chr)} SV records"
     true_label = _clean_text(row.get("true_classes", row.get("sv_classes", row.get("sv_class", ""))))
@@ -727,6 +820,7 @@ def plot_chromosome_prediction(
     title = "\n".join(title_lines)
     fig.suptitle(title, x=0.5, y=0.985, fontsize=12, color="black")
     fig.patch.set_facecolor("white")
+    _draw_centromere_annotations(axes, cen_chr)
     for ax in axes:
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
@@ -778,6 +872,9 @@ def run(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     manifest = read_manifest(args.manifest)
     distances = pd.read_csv(args.prototype_distances, sep="\t").fillna("")
+    centromeres = read_centromeres(args.centromeres)
+    if not centromeres.empty:
+        log.info("Loaded %d centromere interval(s) from %s", len(centromeres), args.centromeres)
     selected = select_predicted_chromosomes(distances, plot_scope=args.plot_scope)
     if args.max_plots is not None:
         selected = selected.head(int(args.max_plots)).copy()
@@ -846,10 +943,20 @@ def run(args: argparse.Namespace) -> None:
         out_row = row.to_dict()
         if "haplotype" in out_row:
             out_row["haplotype"] = _display_haplotype_tag(out_row.get("haplotype", ""))
+        candidate_start_bp = int(_numeric(row, "start_bp", 0))
+        candidate_end_bp = int(_numeric(row, "end_bp", candidate_start_bp + 1))
+        plot_start_bp, plot_end_bp = _plot_window_interval(row, candidate_start_bp, candidate_end_bp)
+        highlight_start_bp, highlight_end_bp = _highlight_interval(row, plot_start_bp, plot_end_bp, candidate_start_bp, candidate_end_bp)
+        out_row["plot_start_bp"] = plot_start_bp
+        out_row["plot_end_bp"] = plot_end_bp
+        out_row["highlight_start_bp"] = highlight_start_bp
+        out_row["highlight_end_bp"] = highlight_end_bp
+        plot_cens = _subset_centromeres(centromeres, chrom, plot_start_bp, plot_end_bp)
+        out_row["centromere_intervals"] = _format_centromere_intervals(plot_cens)
         out_row["plot_correctness"] = correctness_bucket
         try:
             wakhan_df, severus_df = data_cache[sample_id]
-            plot_chromosome_prediction(row, wakhan_df, severus_df, plot_path, dpi=args.dpi)
+            plot_chromosome_prediction(row, wakhan_df, severus_df, centromeres, plot_path, dpi=args.dpi)
             out_row["plot_status"] = "ok"
             out_row["plot_path"] = str(plot_path)
             log.info("Wrote %s (%d/%d)", plot_path, i + 1, len(selected))
@@ -877,6 +984,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Rows to plot from the prediction table. Use all for held-out candidate-region tables.",
     )
     parser.add_argument("--dpi", type=int, default=180)
+    parser.add_argument("--centromeres", default=str(DEFAULT_CENTROMERE_BED), help="BED file with centromere intervals to annotate; set empty to disable.")
     parser.add_argument("--group_by_column", default="", help="Optional prediction-table column used as the output subdirectory instead of correctness/predicted-class buckets.")
     parser.add_argument("--no_correctness_dirs", action="store_true", help="Do not create correct_preds/incorrect_preds output directories when group_by_column is not set.")
     return parser.parse_args(argv)

@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-BASE="${BASE:-../results/pipeline10}"
+BASE="${BASE:-../results/pipeline11}"
 MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
 CANDIDATE_REGIONS="${CANDIDATE_REGIONS:-$BASE/merged_candidate_regions.csv}"
 OUTPUT_DIR="${OUTPUT_DIR:-$BASE/candidate_region_classifier}"
@@ -26,13 +26,13 @@ PLOT_DPI="${PLOT_DPI:-180}"
 PLOT_MAX_PLOTS="${PLOT_MAX_PLOTS:-}"
 
 CLASS_NAMES="${CLASS_NAMES:-ecDNA,Seismic_Amplification,chromothripsis,BFB}"
-REQUIRED_TEST_SAMPLE="${REQUIRED_TEST_SAMPLE:-H1395}"
+REQUIRED_TEST_SAMPLE="${REQUIRED_TEST_SAMPLE:-H1395,H1437,ME180,SCC154,ZR7530,SNU1245}"
 TEST_SAMPLES="${TEST_SAMPLES:-}"
-N_TEST_SAMPLES="${N_TEST_SAMPLES:-5}"
+N_TEST_SAMPLES="${N_TEST_SAMPLES:-6}"
 SEED="${SEED:-42}"
 REUSE_EMBEDDINGS="${REUSE_EMBEDDINGS:-0}"
 
-EMBEDDING_NORMALIZATION="${EMBEDDING_NORMALIZATION:-sample_residual}"
+EMBEDDING_NORMALIZATION="${EMBEDDING_NORMALIZATION:-none}"
 EMBEDDING_FEATURES="${EMBEDDING_FEATURES:-full}"
 SAMPLE_BASELINE_MIN_CANDIDATES="${SAMPLE_BASELINE_MIN_CANDIDATES:-3}"
 HIDDEN_DIMS="${HIDDEN_DIMS:-128}"
@@ -59,6 +59,9 @@ TAU_STEPS="${TAU_STEPS:-91}"
 TYPE_TAU_MIN="${TYPE_TAU_MIN:-0.05}"
 TYPE_TAU_MAX="${TYPE_TAU_MAX:-0.95}"
 TYPE_TAU_STEPS="${TYPE_TAU_STEPS:-91}"
+SUBTYPE_TARGETS="${SUBTYPE_TARGETS:-specific}"
+SUBTYPE_THRESHOLDING="${SUBTYPE_THRESHOLDING:-optimize}"
+CLUSTER_AGGREGATION="${CLUSTER_AGGREGATION:-max}"
 RESCUE_THRESHOLDING="${RESCUE_THRESHOLDING:-optimize}"
 RESCUE_TYPE_TAU="${RESCUE_TYPE_TAU:-0.85}"
 RESCUE_OBJECTNESS_FLOOR="${RESCUE_OBJECTNESS_FLOOR:-0.0}"
@@ -119,7 +122,7 @@ echo "[candidate_region_classifier] class_names=$CLASS_NAMES"
 echo "[candidate_region_classifier] required_test_sample=$REQUIRED_TEST_SAMPLE test_samples=$TEST_SAMPLES n_test_samples=$N_TEST_SAMPLES seed=$SEED"
 echo "[candidate_region_classifier] embedding_normalization=$EMBEDDING_NORMALIZATION embedding_features=$EMBEDDING_FEATURES reuse_embeddings=$REUSE_EMBEDDINGS"
 echo "[candidate_region_classifier] epochs=$EPOCHS patience=$PATIENCE hidden_dims=$HIDDEN_DIMS tabular_features=$TABULAR_FEATURES tabular_hidden_dim=$TABULAR_HIDDEN_DIM device=$DEVICE"
-echo "[candidate_region_classifier] threshold_calibration=$THRESHOLD_CALIBRATION threshold_tie_break=$THRESHOLD_TIE_BREAK logo_epochs=$LOGO_EPOCHS logo_patience=$LOGO_PATIENCE"
+echo "[candidate_region_classifier] threshold_calibration=$THRESHOLD_CALIBRATION threshold_tie_break=$THRESHOLD_TIE_BREAK subtype_targets=$SUBTYPE_TARGETS subtype_thresholding=$SUBTYPE_THRESHOLDING cluster_aggregation=$CLUSTER_AGGREGATION logo_epochs=$LOGO_EPOCHS logo_patience=$LOGO_PATIENCE"
 echo "[candidate_region_classifier] rescue_thresholding=$RESCUE_THRESHOLDING type_tau=$RESCUE_TYPE_TAU floor=$RESCUE_OBJECTNESS_FLOOR margin=$RESCUE_MARGIN recall_constraint=$RESCUE_MIN_RECALL precision_constraint=$RESCUE_MIN_PRECISION max_empty_fp_rate=$RESCUE_MAX_EMPTY_FP_RATE"
 echo "[candidate_region_classifier] secondary_thresholding=$SECONDARY_THRESHOLDING min=$SECONDARY_MIN delta=$SECONDARY_DELTA recall_constraint=$SECONDARY_MIN_RECALL precision_constraint=$SECONDARY_MIN_PRECISION"
 echo "[candidate_region_classifier] plot_test_genomes=$PLOT_TEST_GENOMES plot_dir=$PLOT_DIR"
@@ -158,6 +161,9 @@ CMD=(
     --type_tau_min "$TYPE_TAU_MIN"
     --type_tau_max "$TYPE_TAU_MAX"
     --type_tau_steps "$TYPE_TAU_STEPS"
+    --subtype_targets "$SUBTYPE_TARGETS"
+    --subtype_thresholding "$SUBTYPE_THRESHOLDING"
+    --cluster_aggregation "$CLUSTER_AGGREGATION"
     --rescue_thresholding "$RESCUE_THRESHOLDING"
     --rescue_type_tau "$RESCUE_TYPE_TAU"
     --rescue_objectness_floor "$RESCUE_OBJECTNESS_FLOOR"
@@ -242,11 +248,15 @@ for expected_output in \
     "$OUTPUT_DIR/classification_predictions.tsv" \
     "$OUTPUT_DIR/train_predictions.tsv" \
     "$OUTPUT_DIR/test_predictions.tsv" \
+    "$OUTPUT_DIR/cluster_predictions.tsv" \
+    "$OUTPUT_DIR/row_raw_predictions.tsv" \
+    "$OUTPUT_DIR/cluster_aggregated_raw_predictions.tsv" \
     "$OUTPUT_DIR/metrics_summary.tsv" \
     "$OUTPUT_DIR/per_class_metrics.tsv" \
     "$OUTPUT_DIR/sample_splits.tsv" \
     "$OUTPUT_DIR/training_summary.json" \
     "$OUTPUT_DIR/type_thresholds.tsv" \
+    "$OUTPUT_DIR/subtype_thresholds.tsv" \
     "$OUTPUT_DIR/tabular_features.tsv" \
     "$OUTPUT_DIR/tabular_feature_names.txt" \
     "$OUTPUT_DIR/tabular_features.npz" \
@@ -254,10 +264,12 @@ for expected_output in \
     "$OUTPUT_DIR/embedding_features.txt" \
     "$OUTPUT_DIR/objectness_tau_sweep_calibration.tsv" \
     "$OUTPUT_DIR/type_threshold_sweep_calibration.tsv" \
+    "$OUTPUT_DIR/subtype_threshold_sweep_calibration.tsv" \
     "$OUTPUT_DIR/rescue_threshold_sweep_calibration.tsv" \
     "$OUTPUT_DIR/secondary_threshold_sweep_calibration.tsv" \
     "$OUTPUT_DIR/objectness_tau_sweep_in_sample_train.tsv" \
     "$OUTPUT_DIR/type_threshold_sweep_in_sample_train.tsv" \
+    "$OUTPUT_DIR/subtype_threshold_sweep_in_sample_train.tsv" \
     "$OUTPUT_DIR/training_curves.png" \
     "$OUTPUT_DIR/split_metrics.png" \
     "$OUTPUT_DIR/per_class_metrics.png" \
@@ -272,7 +284,7 @@ for expected_output in \
 done
 
 if [[ "$THRESHOLD_CALIBRATION" == "logo" ]]; then
-    for expected_logo_output in         "$OUTPUT_DIR/logo_calibration_raw.tsv"         "$OUTPUT_DIR/logo_calibration_predictions.tsv"         "$OUTPUT_DIR/logo_training_metrics.tsv"         "$OUTPUT_DIR/logo_metrics_summary.tsv"         "$OUTPUT_DIR/logo_per_class_metrics.tsv"         "$OUTPUT_DIR/objectness_tau_sweep_logo.tsv"         "$OUTPUT_DIR/type_threshold_sweep_logo.tsv"         "$OUTPUT_DIR/rescue_threshold_sweep_logo.tsv"         "$OUTPUT_DIR/secondary_threshold_sweep_logo.tsv"; do
+    for expected_logo_output in         "$OUTPUT_DIR/logo_calibration_raw.tsv"         "$OUTPUT_DIR/logo_calibration_predictions.tsv"         "$OUTPUT_DIR/logo_training_metrics.tsv"         "$OUTPUT_DIR/logo_metrics_summary.tsv"         "$OUTPUT_DIR/logo_per_class_metrics.tsv"         "$OUTPUT_DIR/objectness_tau_sweep_logo.tsv"         "$OUTPUT_DIR/type_threshold_sweep_logo.tsv"         "$OUTPUT_DIR/subtype_threshold_sweep_logo.tsv"         "$OUTPUT_DIR/rescue_threshold_sweep_logo.tsv"         "$OUTPUT_DIR/secondary_threshold_sweep_logo.tsv"; do
         if [[ ! -f "$expected_logo_output" ]]; then
             echo "[candidate_region_classifier] ERROR: expected LOGO output not found: $expected_logo_output" >&2
             exit 1

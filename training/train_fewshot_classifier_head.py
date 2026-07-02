@@ -956,61 +956,6 @@ def _plot_haplotype_summary(predictions: pd.DataFrame, output_path: Path) -> Non
     plt.close(fig)
 
 
-def _plot_localization_summary(predictions: pd.DataFrame, output_path: Path) -> None:
-    if "localized_start_bp" not in predictions.columns:
-        return
-    called = predictions[predictions.get("called_complex_sv", pd.Series(dtype=bool)).astype(bool)].copy()
-    if called.empty:
-        return
-    method_colors = {
-        "sv_attention": "#59A14F",
-        "sv_span": "#4E79A7",
-        "cn_attention": "#F28E2B",
-        "candidate_window": "#BAB0AC",
-    }
-    classes = sorted(called["type_predicted_class"].astype(str).unique())
-    fig, axes = plt.subplots(1, 2, figsize=(11, max(3.5, 0.55 * len(classes) + 2.0)))
-
-    if "localization_span_fraction" in called.columns:
-        fracs = called["localization_span_fraction"].astype(float)
-        methods = called["localization_method"].astype(str) if "localization_method" in called else pd.Series(["candidate_window"] * len(called))
-        mc = [method_colors.get(str(m), "#BAB0AC") for m in methods]
-        axes[0].scatter(
-            fracs,
-            np.random.default_rng(1).uniform(-0.4, 0.4, len(fracs)),
-            c=mc, s=22, alpha=0.8, linewidths=0,
-        )
-        axes[0].set_xlabel("Localized span / arm span")
-        axes[0].set_yticks([])
-        axes[0].set_xlim(-0.02, 1.02)
-        axes[0].set_title("Localization Span Fraction")
-        axes[0].grid(axis="x", alpha=0.2)
-        handles = [plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=c, markersize=7, label=m)
-                   for m, c in method_colors.items()]
-        axes[0].legend(handles=handles, fontsize=7)
-
-    if "localization_span_fraction" in called.columns:
-        class_fracs = (
-            called.groupby("type_predicted_class")["localization_span_fraction"]
-            .apply(list)
-        )
-        y_pos = np.arange(len(classes))
-        for i, cls in enumerate(classes):
-            if cls in class_fracs.index:
-                vals = [float(v) for v in class_fracs[cls]]
-                axes[1].scatter(vals, [i] * len(vals), s=18, alpha=0.7, color="#4E79A7", linewidths=0)
-                axes[1].plot([np.mean(vals)], [i], marker="|", color="black", markersize=10, markeredgewidth=2)
-        axes[1].set_yticks(y_pos)
-        axes[1].set_yticklabels(classes, fontsize=8)
-        axes[1].set_xlabel("Localized span fraction")
-        axes[1].set_xlim(-0.02, 1.02)
-        axes[1].set_title("Span Fraction by Class\n(bar = mean)")
-        axes[1].grid(axis="x", alpha=0.2)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
-    plt.close(fig)
-
 
 def _write_prediction_view(predictions: pd.DataFrame, class_names: list[str], output_path: Path) -> None:
     rows: list[dict[str, Any]] = []
@@ -1112,7 +1057,6 @@ def run(args: argparse.Namespace) -> None:
         _plot_validation_confusion(cv_annotated, class_names, out_dir / "held_out_prediction_summary.png")
         _plot_objectness_scores(cv_annotated, out_dir / "held_out_distance_scores.png", selected_distance_tau)
         _plot_haplotype_summary(cv_annotated, out_dir / "held_out_haplotype_summary.png")
-        _plot_localization_summary(cv_annotated, out_dir / "held_out_localization_summary.png")
 
     targets = _type_targets(metadata, class_names)
     projected_labeled = project_embeddings(final_model, embeddings[labeled_mask], device=device, batch_size=int(args.batch_size))
@@ -1142,7 +1086,6 @@ def run(args: argparse.Namespace) -> None:
     called.to_csv(out_dir / "predicted_complex_sv.tsv", sep="\t", index=False)
     _write_prediction_view(predictions, class_names, out_dir / "predictions.tsv")
     _plot_haplotype_summary(predictions, out_dir / "haplotype_summary.png")
-    _plot_localization_summary(predictions, out_dir / "localization_summary.png")
 
     compatibility_distances = fewshot_predictions_to_distance_table(predictions, class_names)
     compatibility_distances.to_csv(out_dir / "prototype_distances.tsv", sep="\t", index=False)
