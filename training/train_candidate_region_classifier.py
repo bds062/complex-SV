@@ -54,6 +54,7 @@ EVENT_CLASS_COLUMNS = ["ecDNA", "Seismic_Amplification", "chromothripsis", "BFB"
 DEFAULT_CLASS_NAMES = "ecDNA,Seismic_Amplification,chromothripsis,BFB"
 EMPTY_EVIDENCE = "candidate_region_empty"
 POSITIVE_EVIDENCE = "candidate_region_label"
+UNLABELED_EVIDENCE = "candidate_region_unlabeled"
 SAFE_TABULAR_FEATURES = [
     "n_windows",
     "n_segments",
@@ -492,17 +493,20 @@ def _clean_arm(value: object) -> str:
     return text if text in {"p", "q"} else text
 
 
-def read_candidate_regions(path: str | Path, class_names: list[str]) -> pd.DataFrame:
+def read_candidate_regions(path: str | Path, class_names: list[str], allow_unlabeled: bool = False) -> pd.DataFrame:
     df = pd.read_csv(path).fillna("")
     required = {"sample_id", "candidate_id", "chrom", "arm", "start", "end"}
     missing = sorted(required.difference(df.columns))
     if missing:
         raise ValueError(f"Candidate regions file missing columns: {missing}")
     missing_classes = sorted(set(class_names).difference(df.columns))
-    if missing_classes:
+    if missing_classes and not allow_unlabeled:
         raise ValueError(f"Candidate regions file missing class columns: {missing_classes}")
 
     out = df.copy()
+    if allow_unlabeled:
+        for class_name in missing_classes:
+            out[class_name] = ""
     out["start_bp"] = pd.to_numeric(out["start"], errors="coerce").fillna(0).astype(int)
     out["end_bp"] = pd.to_numeric(out["end"], errors="coerce").fillna(0).astype(int)
     bad_span = out["end_bp"] <= out["start_bp"]
@@ -525,13 +529,15 @@ def read_candidate_regions(path: str | Path, class_names: list[str]) -> pd.DataF
             raw_parts.append(class_name if raw_value in {"", "True", "true", "1"} else f"{class_name}:{raw_value}")
         sv_classes.append(";".join(classes))
         raw_sv_classes.append(";".join(raw_parts))
-        evidence.append(POSITIVE_EVIDENCE if classes else EMPTY_EVIDENCE)
+        evidence.append(UNLABELED_EVIDENCE if allow_unlabeled else (POSITIVE_EVIDENCE if classes else EMPTY_EVIDENCE))
 
     out["sv_class"] = sv_classes
     out["sv_classes"] = sv_classes
     out["raw_sv_classes"] = raw_sv_classes
     out["evidence"] = evidence
-    out["label_scope"] = np.where(out["sv_classes"].astype(str) != "", "region", "empty_candidate_region")
+    out["label_scope"] = (
+        "unlabeled_candidate_region" if allow_unlabeled else np.where(out["sv_classes"].astype(str) != "", "region", "empty_candidate_region")
+    )
     out["candidate_scope"] = "candidate_region"
     out["label_id"] = np.where(out["sv_classes"].astype(str) != "", out["candidate_id"].astype(str), "")
     return out
@@ -1261,10 +1267,24 @@ def secondary_threshold_metrics(predictions: pd.DataFrame, class_names: list[str
     pred_counts = [len(pred) for pred in pred_sets]
     n_empty = int(row.get("n_empty", 0) or 0)
     fp = int(row.get("fp", 0) or 0)
+    label_tp = label_fp = label_fn = 0
+    for true, pred in zip(true_sets, pred_sets):
+        for class_name in class_names:
+            in_true = class_name in true
+            in_pred = class_name in pred
+            label_tp += int(in_true and in_pred)
+            label_fp += int((not in_true) and in_pred)
+            label_fn += int(in_true and (not in_pred))
+    label_precision = label_tp / (label_tp + label_fp) if label_tp + label_fp else 1.0
+    label_recall = label_tp / (label_tp + label_fn) if label_tp + label_fn else 0.0
+    label_f1 = 2 * label_precision * label_recall / (label_precision + label_recall) if label_precision + label_recall else 0.0
     row.update(
         {
             "secondary_min": float(secondary_min),
             "secondary_delta": float(secondary_delta),
+            "label_precision_labeled": float(label_precision),
+            "label_recall_labeled": float(label_recall),
+            "label_f1_labeled": float(label_f1),
             "mean_predicted_labels_labeled": float(np.mean(pred_counts)) if pred_counts else 0.0,
             "multicall_rate_labeled": float(np.mean([count > 1 for count in pred_counts])) if pred_counts else 0.0,
             "mean_extra_labels_labeled": float(np.mean(extra_counts)) if extra_counts else 0.0,
@@ -1286,6 +1306,7 @@ def choose_secondary_thresholds(
     delta_grid: np.ndarray,
     min_recall: float,
     min_precision: float,
+    objective: str = "recall",
     rescue_type_tau: float | None = None,
     rescue_objectness_floor: float | None = None,
     rescue_margin: float | None = None,
@@ -1316,17 +1337,15 @@ def choose_secondary_thresholds(
     candidates = sweep[sweep["meets_constraints"]].copy()
     if candidates.empty:
         candidates = sweep.copy()
-    sweep["secondary_objective"] = (
-        sweep["class_any_match_labeled"].astype(float)
-        + 0.35 * sweep["class_exact_match_labeled"].astype(float)
-        - 0.25 * sweep["mean_extra_labels_labeled"].astype(float)
-        - 0.10 * sweep["multicall_rate_labeled"].astype(float)
-    )
-    candidates = sweep[sweep["meets_constraints"]].copy()
-    if candidates.empty:
-        candidates = sweep.copy()
-    best = candidates.sort_values(
-        [
+    objective = str(objective or "recall").lower()
+    if objective == "conservative":
+        sweep["secondary_objective"] = (
+            sweep["class_any_match_labeled"].astype(float)
+            + 0.35 * sweep["class_exact_match_labeled"].astype(float)
+            - 0.25 * sweep["mean_extra_labels_labeled"].astype(float)
+            - 0.10 * sweep["multicall_rate_labeled"].astype(float)
+        )
+        sort_cols = [
             "secondary_objective",
             "class_any_match_labeled",
             "objectness_recall",
@@ -1336,9 +1355,35 @@ def choose_secondary_thresholds(
             "objectness_precision",
             "secondary_min",
             "secondary_delta",
-        ],
-        ascending=[False, False, False, True, True, False, False, False, False],
-    ).iloc[0]
+        ]
+        ascending = [False, False, False, True, True, False, False, False, False]
+    elif objective == "recall":
+        sweep["secondary_objective"] = (
+            1.20 * sweep["label_f1_labeled"].astype(float)
+            + 0.80 * sweep["label_recall_labeled"].astype(float)
+            + 0.40 * sweep["class_exact_match_labeled"].astype(float)
+            + 0.20 * sweep["class_any_match_labeled"].astype(float)
+            - 0.25 * sweep["mean_extra_labels_labeled"].astype(float)
+            - 0.05 * sweep["multicall_rate_labeled"].astype(float)
+        )
+        sort_cols = [
+            "secondary_objective",
+            "label_recall_labeled",
+            "label_f1_labeled",
+            "class_exact_match_labeled",
+            "mean_extra_labels_labeled",
+            "multicall_rate_labeled",
+            "secondary_min",
+            "secondary_delta",
+        ]
+        ascending = [False, False, False, False, True, True, True, True]
+    else:
+        raise ValueError(f"Unknown secondary objective: {objective!r}")
+    sweep["secondary_objective_mode"] = objective
+    candidates = sweep[sweep["meets_constraints"]].copy()
+    if candidates.empty:
+        candidates = sweep.copy()
+    best = candidates.sort_values(sort_cols, ascending=ascending).iloc[0]
     return float(best["secondary_min"]), float(best["secondary_delta"]), sweep
 
 
@@ -1371,6 +1416,7 @@ def choose_secondary_thresholding(
         delta_grid,
         min_recall=float(args.secondary_min_recall),
         min_precision=float(args.secondary_min_precision),
+        objective=str(getattr(args, "secondary_objective", "recall")),
         rescue_type_tau=rescue_type_tau,
         rescue_objectness_floor=rescue_objectness_floor,
         rescue_margin=rescue_margin,
@@ -1945,7 +1991,7 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--class_names must include at least one class")
 
     manifest = embed_corpus.read_manifest(args.manifest)
-    candidates_df = read_candidate_regions(args.candidate_regions, class_names)
+    candidates_df = read_candidate_regions(args.candidate_regions, class_names, allow_unlabeled=bool(args.unlabeled_candidates))
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     log.info("Using device=%s; candidates=%d classes=%s", device, len(candidates_df), class_names)
 
@@ -1979,6 +2025,23 @@ def run(args: argparse.Namespace) -> None:
     tabular_features = make_tabular_features(metadata, tabular_feature_names)
     write_tabular_feature_table(metadata, tabular_features, tabular_feature_names, output_dir)
     log.info("Using %d safe tabular feature(s): %s", len(tabular_feature_names), ",".join(tabular_feature_names) if tabular_feature_names else "none")
+
+    if bool(args.embeddings_only):
+        summary = {
+            "class_names": class_names,
+            "n_candidates": int(len(metadata)),
+            "embedding_mode": "candidate_region_with_context",
+            "embedding_features": selected_embedding_features,
+            "embedding_dim": int(embeddings.shape[1]),
+            "tabular_dim": int(tabular_features.shape[1]),
+            "tabular_feature_names": tabular_feature_names,
+            "config": _jsonable_config(args),
+            "status": "embeddings_only",
+        }
+        with (output_dir / "training_summary.json").open("w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2)
+        log.info("Prepared candidate embeddings and tabular features in %s", output_dir)
+        return
 
     targets = _multi_hot_targets(metadata, class_names, subtype_targets=str(args.subtype_targets))
     labeled, background = _label_background_masks(metadata)
@@ -2404,6 +2467,7 @@ def run(args: argparse.Namespace) -> None:
         "selected_rescue_objectness_floor": None if selected_rescue_objectness_floor is None else float(selected_rescue_objectness_floor),
         "selected_rescue_margin": None if selected_rescue_margin is None else float(selected_rescue_margin),
         "secondary_thresholding": str(args.secondary_thresholding),
+        "secondary_objective": str(args.secondary_objective),
         "selected_secondary_min": None if selected_secondary_min is None else float(selected_secondary_min),
         "selected_secondary_delta": None if selected_secondary_delta is None else float(selected_secondary_delta),
         "calibration_n_candidates": int(len(calibration_raw)),
@@ -2435,6 +2499,7 @@ def run(args: argparse.Namespace) -> None:
         "selected_rescue_objectness_floor": None if selected_rescue_objectness_floor is None else float(selected_rescue_objectness_floor),
         "selected_rescue_margin": None if selected_rescue_margin is None else float(selected_rescue_margin),
         "secondary_thresholding": str(args.secondary_thresholding),
+        "secondary_objective": str(args.secondary_objective),
         "selected_secondary_min": None if selected_secondary_min is None else float(selected_secondary_min),
         "selected_secondary_delta": None if selected_secondary_delta is None else float(selected_secondary_delta),
         "calibration_n_candidates": int(len(calibration_raw)),
@@ -2470,6 +2535,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test_samples", default="", help="Comma-separated explicit held-out samples; required_test_sample is added if missing")
     parser.add_argument("--n_test_samples", type=int, default=6)
     parser.add_argument("--reuse_embeddings", action="store_true", help="Reuse output_dir embeddings.npz and candidate_embeddings.tsv if present")
+    parser.add_argument("--embeddings_only", action="store_true", help="Prepare embeddings and tabular features, then stop before model training.")
+    parser.add_argument("--unlabeled_candidates", action="store_true", help="Allow candidate tables without class columns for embedding-only deployment inference.")
     parser.add_argument("--embedding_features", choices=("full", "coords"), default="full", help="Embedding feature subset for the model branch: full 1214D local/context/diff/coords or coords-only 8D.")
     parser.add_argument("--embedding_normalization", choices=embed_corpus.EMBEDDING_NORMALIZATION_CHOICES, default="sample_residual")
     parser.add_argument("--sample_baseline_min_candidates", type=int, default=3)
@@ -2518,6 +2585,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rescue_min_precision", type=float, default=0.60, help="Calibration precision constraint for type-confidence rescue sweep.")
     parser.add_argument("--rescue_max_empty_fp_rate", type=float, default=0.75, help="Maximum empty-candidate false-positive rate allowed during rescue sweep.")
     parser.add_argument("--secondary_thresholding", choices=("off", "fixed", "optimize"), default="optimize", help="Use a stricter threshold for non-primary labels to reduce multicalls.")
+    parser.add_argument("--secondary_objective", choices=("recall", "conservative"), default="recall", help="Objective for optimized secondary multi-label thresholds.")
     parser.add_argument("--secondary_min", type=float, default=0.55, help="Fixed secondary minimum threshold when --secondary_thresholding=fixed.")
     parser.add_argument("--secondary_delta", type=float, default=0.15, help="Fixed extra threshold above each class threshold when --secondary_thresholding=fixed.")
     parser.add_argument("--secondary_min_min", type=float, default=0.30)

@@ -118,11 +118,11 @@ def _display_haplotype_tag(value: object) -> str:
 def _plot_correctness_bucket(row: pd.Series) -> str:
     is_labeled = _bool_value(row.get("is_labeled", ""))
     if is_labeled is True:
-        any_match = _bool_value(row.get("class_any_match", ""))
-        if any_match is not None:
-            return "correct_preds" if any_match else "incorrect_preds"
         exact = _bool_value(row.get("class_exact_match", ""))
-        return "correct_preds" if exact is True else "incorrect_preds"
+        if exact is not None:
+            return "correct_preds" if exact else "incorrect_preds"
+        any_match = _bool_value(row.get("class_any_match", ""))
+        return "correct_preds" if any_match is True else "incorrect_preds"
 
     is_background = _bool_value(row.get("is_background_chromosome", ""))
     if is_background is True:
@@ -934,9 +934,11 @@ def run(args: argparse.Namespace) -> None:
         suffix = f"obj{objectness_prob:.4g}" if np.isfinite(objectness_prob) else (f"d{distance:.4g}" if np.isfinite(distance) else "scoreNA")
         highlight_start = _numeric(row, "highlight_start_bp", np.nan)
         highlight_end = _numeric(row, "highlight_end_bp", np.nan)
+        name_start = highlight_start if np.isfinite(highlight_start) else _numeric(row, "start_bp", np.nan)
+        name_end = highlight_end if np.isfinite(highlight_end) else _numeric(row, "end_bp", np.nan)
         highlight_tag = ""
-        if np.isfinite(highlight_start) and np.isfinite(highlight_end):
-            highlight_tag = f"_{int(round(highlight_start))}_{int(round(highlight_end))}"
+        if np.isfinite(name_start) and np.isfinite(name_end):
+            highlight_tag = f"_{int(round(name_start))}_{int(round(name_end))}"
         plot_name = f"{_safe_name(sample_id)}_{_safe_name(region)}_{_safe_name(pred)}_{suffix}{highlight_tag}.png"
         plot_path = class_dir / plot_name
 

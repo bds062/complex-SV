@@ -1359,7 +1359,7 @@ def _summary_correctness_category(true_label: object, pred_label: object) -> str
 def _plot_anchor_prediction_summary(
     distances: pd.DataFrame,
     output_path: Path,
-    tau: float,
+    tau: float | None,
     title_suffix: str = "",
 ) -> None:
     if distances.empty or "predicted_class" not in distances:
@@ -1400,44 +1400,64 @@ def _plot_anchor_prediction_summary(
             pred_order.append(pred)
     confusion = pd.crosstab(gt["_gt_class"].astype(str), gt["_predicted_class"].astype(str))
     confusion = confusion.reindex(index=class_order, columns=pred_order, fill_value=0)
+    display_class_order = [_display_class(cls).replace(";", "\n") for cls in class_order]
+    display_pred_order = [_display_class(cls).replace(";", "\n") for cls in pred_order]
 
-    fig_w = max(9.0, 1.25 * max(len(class_order), len(pred_order)) + 6.0)
-    fig, axes = plt.subplots(1, 2, figsize=(fig_w, 4.6), gridspec_kw={"width_ratios": [1.0, 1.25]})
+    fig_w = max(10.5, 1.2 * max(len(class_order), len(pred_order)) + 6.0)
+    fig, axes = plt.subplots(1, 2, figsize=(fig_w, 5.4), gridspec_kw={"width_ratios": [1.0, 1.25]})
 
-    suffix = f" - {title_suffix}" if title_suffix else ""
+    suffix = f"\n{title_suffix}" if title_suffix else ""
     x = np.arange(len(class_order))
     bottom = np.zeros(len(class_order), dtype=float)
     for category, label, color in category_order:
         counts = np.asarray(category_counts[category], dtype=float)
         axes[0].bar(x, counts, bottom=bottom, color=color, label=label)
         bottom += counts
-    for i, total in enumerate(bottom):
-        axes[0].text(i, total + 0.05, str(int(total)), ha="center", va="bottom", fontsize=9)
     axes[0].set_xticks(x)
-    axes[0].set_xticklabels([_display_class(cls) for cls in class_order], rotation=25, ha="right")
+    axes[0].set_xticklabels(
+        [f"{label}\n(n={int(total)})" for label, total in zip(display_class_order, bottom, strict=False)],
+        rotation=20,
+        ha="right",
+        fontsize=9,
+    )
     axes[0].set_ylabel("GT region count")
-    axes[0].set_title(f"GT Region Prediction Accuracy{suffix} (tau={tau:g})")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(axis="y", alpha=0.2)
+    tau_suffix = f" (tau={tau:g})" if tau is not None else ""
+    axes[0].set_title(f"Prediction outcome by GT class{tau_suffix}{suffix}", fontsize=12, pad=10)
+    axes[0].tick_params(axis="y", labelsize=9)
+    axes[0].set_axisbelow(True)
+    axes[0].grid(axis="y", alpha=0.18)
+    axes[0].spines[["top", "right"]].set_visible(False)
 
     matrix = confusion.to_numpy(dtype=int)
     im = axes[1].imshow(matrix, cmap="Blues", vmin=0)
     axes[1].set_xticks(np.arange(len(pred_order)))
     axes[1].set_yticks(np.arange(len(class_order)))
-    axes[1].set_xticklabels([_display_class(cls) for cls in pred_order], rotation=30, ha="right")
-    axes[1].set_yticklabels([_display_class(cls) for cls in class_order])
+    axes[1].set_xticklabels(display_pred_order, rotation=20, ha="right", fontsize=8.5)
+    axes[1].set_yticklabels(display_class_order, fontsize=8.5)
     axes[1].set_xlabel("Predicted class")
     axes[1].set_ylabel("GT class")
-    axes[1].set_title(f"GT vs Thresholded Predicted Class{suffix}")
+    axes[1].set_title(f"GT vs predicted class{suffix}", fontsize=12, pad=10)
     for y in range(matrix.shape[0]):
         for x_i in range(matrix.shape[1]):
             value = int(matrix[y, x_i])
             if value:
                 axes[1].text(x_i, y, str(value), ha="center", va="center", color="black", fontsize=9)
-    fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04, label="Count")
+    cbar = fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+    cbar.set_label("Count", fontsize=10)
+    cbar.ax.tick_params(labelsize=8)
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        frameon=False,
+        ncol=min(4, len(labels)),
+        loc="lower center",
+        bbox_to_anchor=(0.31, 0.015),
+        fontsize=9,
+    )
+    fig.tight_layout(rect=(0, 0.12, 1, 1))
+    fig.savefig(output_path, dpi=220)
     plt.close(fig)
 
 

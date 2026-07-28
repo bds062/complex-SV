@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Evaluate two-centroid few-shot and neural-objectness/few-shot-type hybrid
+# classifiers on both standalone candidate-generator profiles.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+PYTHON_BIN="${PYTHON_BIN:-$PROJECT_DIR/../envs/env2/bin/python}"
+BASE="${BASE:-$PROJECT_DIR/../results/pipeline16}"
+MANIFEST="${MANIFEST:-$BASE/complex_sv_manifest.tsv}"
+CLASS_NAMES="${CLASS_NAMES:-ecDNA,chromothripsis,BFB}"
+FOLD_SIZE="${FOLD_SIZE:-6}"
+DEVICE="${DEVICE:-auto}"
+FAST_THRESHOLDS="${FAST_THRESHOLDS:-0}"
+FORCE="${FORCE:-0}"
+
+EXTRA_ARGS=()
+if [[ "$FAST_THRESHOLDS" == "1" ]]; then
+    EXTRA_ARGS+=(--fast_thresholds)
+fi
+
+is_complete() {
+    local overview="$1/cross_fold_overview.json"
+    [[ -f "$overview" ]] && "$PYTHON_BIN" -c \
+        'import json,sys; d=json.load(open(sys.argv[1])); raise SystemExit(0 if d.get("n_folds", 0) > 0 and d.get("n_ok_folds") == d.get("n_folds") else 1)' \
+        "$overview"
+}
+
+for PROFILE in sensitive balanced; do
+    SOURCE_DIR="$BASE/$PROFILE"
+    FEWSHOT_DIR="$SOURCE_DIR/candidate_region_classifier_fewshot_general"
+    HYBRID_DIR="$SOURCE_DIR/candidate_region_classifier_hybrid_general_fewshot"
+
+    if [[ "$FORCE" == "1" ]] || ! is_complete "$FEWSHOT_DIR"; then
+    "$PYTHON_BIN" "$PROJECT_DIR/training/cross_fold_caller_label_fewshot_study.py" \
+        --source_dir "$SOURCE_DIR" \
+        --manifest "$MANIFEST" \
+        --output_dir "$FEWSHOT_DIR" \
+        --fold_assignments "$SOURCE_DIR/fold_assignments.tsv" \
+        --class_names "$CLASS_NAMES" \
+        --fold_size "$FOLD_SIZE" \
+        --device "$DEVICE" \
+        --containing_prototypes 1 \
+        --min_prototype_members 1 \
+        --min_cluster_members 2 \
+        "${EXTRA_ARGS[@]}"
+    else
+        echo "Skipping complete few-shot experiment: $FEWSHOT_DIR"
+    fi
+
+    if [[ "$FORCE" == "1" ]] || ! is_complete "$HYBRID_DIR"; then
+    "$PYTHON_BIN" "$PROJECT_DIR/training/cross_fold_caller_label_hybrid_study.py" \
+        --source_dir "$SOURCE_DIR" \
+        --manifest "$MANIFEST" \
+        --output_dir "$HYBRID_DIR" \
+        --fold_assignments "$SOURCE_DIR/fold_assignments.tsv" \
+        --fewshot_source_dir "$FEWSHOT_DIR" \
+        --class_names "$CLASS_NAMES" \
+        --fold_size "$FOLD_SIZE" \
+        --device "$DEVICE" \
+        "${EXTRA_ARGS[@]}"
+    else
+        echo "Skipping complete hybrid experiment: $HYBRID_DIR"
+    fi
+done
+
+"$PYTHON_BIN" "$SCRIPT_DIR/summarize_pipeline16_models.py" --base "$BASE"
+
+echo "Pipeline16 few-shot and hybrid experiments complete: $BASE"

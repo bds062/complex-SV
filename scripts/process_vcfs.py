@@ -781,6 +781,7 @@ def _summarize_candidate_intervals(
     cna_df: pd.DataFrame,
     breakpoints_df: pd.DataFrame,
     sample_ploidy: float | None = None,
+    apply_candidate_filter: bool = True,
 ) -> pd.DataFrame:
     if intervals_df.empty:
         return intervals_df
@@ -865,13 +866,14 @@ def _summarize_candidate_intervals(
         if column not in result.columns:
             result[column] = 0
         result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0).astype(int)
-    min_region_length = 2_000_000
-    region_length = result["component_length"]
-    result = result[region_length >= min_region_length]
-    contains_fb = result["n_FB"].fillna(0) > 0
-    has_high_tcn = result["ecDNA"].fillna(False).astype(bool)
-    enough_segments = contains_fb | has_high_tcn | (result["n_segments_ge_100kb"] >= 4)
-    result = result[enough_segments]
+    if apply_candidate_filter:
+        min_region_length = 2_000_000
+        region_length = result["component_length"]
+        result = result[region_length >= min_region_length]
+        contains_fb = result["n_FB"].fillna(0) > 0
+        has_high_tcn = result["ecDNA"].fillna(False).astype(bool)
+        enough_segments = contains_fb | has_high_tcn | (result["n_segments_ge_100kb"] >= 4)
+        result = result[enough_segments]
     return _natural_sort_dataframe(result, ["start", "end"])
 
 

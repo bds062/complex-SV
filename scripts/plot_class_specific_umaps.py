@@ -11,6 +11,7 @@ from typing import Iterable
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.patheffects as path_effects  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
 import pandas as pd
@@ -43,7 +44,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "embedding",
-        help="Classifier output directory containing embeddings.npz, or an embeddings.npz file.",
+        help="Classifier output directory containing embeddings.npz, or an embedding/features NPZ file.",
+    )
+    parser.add_argument(
+        "--embedding-key",
+        default="embeddings",
+        help="NPZ array key to plot. Defaults to embeddings; use features for fewshot_feature_matrix.npz.",
     )
     parser.add_argument(
         "--metadata",
@@ -85,6 +91,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=35,
         help="Maximum highlighted points to annotate per panel when --annotate is set.",
     )
+    parser.add_argument(
+        "--prototype-npz",
+        default=None,
+        help=(
+            "Optional fewshot_prototypes.npz to project and label on the same axes. "
+            "If omitted, a sibling fewshot_prototypes.npz is used when present."
+        ),
+    )
+    parser.add_argument(
+        "--no-prototypes",
+        action="store_true",
+        help="Disable automatic prototype overlay.",
+    )
     return parser.parse_args(argv)
 
 
@@ -109,6 +128,18 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path | None, Path]:
     return embedding_npz, metadata_path, output_dir
 
 
+def resolve_prototype_path(args: argparse.Namespace, embedding_npz: Path) -> Path | None:
+    if bool(args.no_prototypes):
+        return None
+    if args.prototype_npz:
+        prototype_path = Path(args.prototype_npz)
+        if not prototype_path.exists():
+            raise FileNotFoundError(f"Prototype NPZ not found: {prototype_path}")
+        return prototype_path
+    auto_path = embedding_npz.parent / "fewshot_prototypes.npz"
+    return auto_path if auto_path.exists() else None
+
+
 def _decode_array(values: np.ndarray) -> np.ndarray:
     out: list[str] = []
     for value in values:
@@ -122,11 +153,13 @@ def _decode_array(values: np.ndarray) -> np.ndarray:
     return np.asarray(out, dtype=object)
 
 
-def load_inputs(embedding_npz: Path, metadata_path: Path | None) -> tuple[np.ndarray, pd.DataFrame]:
+def load_inputs(embedding_npz: Path, metadata_path: Path | None, embedding_key: str) -> tuple[np.ndarray, pd.DataFrame]:
     arrays = np.load(embedding_npz, allow_pickle=True)
-    if "embeddings" not in arrays:
-        raise KeyError(f"{embedding_npz} does not contain an 'embeddings' array")
-    embeddings = np.asarray(arrays["embeddings"], dtype=np.float32)
+    key = str(embedding_key or "embeddings")
+    if key not in arrays:
+        available = ", ".join(arrays.files)
+        raise KeyError(f"{embedding_npz} does not contain array key {key!r}; available keys: {available}")
+    embeddings = np.asarray(arrays[key], dtype=np.float32)
     if embeddings.ndim != 2:
         raise ValueError(f"Expected 2D embeddings, got shape={embeddings.shape}")
     embeddings = np.nan_to_num(embeddings, nan=0.0, posinf=0.0, neginf=0.0)
@@ -135,12 +168,12 @@ def load_inputs(embedding_npz: Path, metadata_path: Path | None) -> tuple[np.nda
         metadata = pd.read_csv(metadata_path, sep="\t").fillna("")
     else:
         cols: dict[str, np.ndarray] = {}
-        for key in arrays.files:
-            if key == "embeddings":
+        for array_key in arrays.files:
+            if array_key == key:
                 continue
-            values = np.asarray(arrays[key])
+            values = np.asarray(arrays[array_key])
             if values.shape[:1] == embeddings.shape[:1]:
-                cols[key] = _decode_array(values)
+                cols[array_key] = _decode_array(values)
         metadata = pd.DataFrame(cols)
 
     if len(metadata) != embeddings.shape[0]:
@@ -150,35 +183,82 @@ def load_inputs(embedding_npz: Path, metadata_path: Path | None) -> tuple[np.nda
     return embeddings, metadata
 
 
-def reduce_embeddings_2d(embeddings: np.ndarray) -> tuple[np.ndarray, str]:
+def load_prototypes(prototype_npz: Path, embedding_dim: int) -> tuple[np.ndarray, pd.DataFrame]:
+    arrays = np.load(prototype_npz, allow_pickle=True)
+    if "prototypes" not in arrays:
+        available = ", ".join(arrays.files)
+        raise KeyError(f"{prototype_npz} does not contain 'prototypes'; available keys: {available}")
+    prototypes = np.asarray(arrays["prototypes"], dtype=np.float32)
+    if prototypes.ndim != 2:
+        raise ValueError(f"Expected 2D prototypes in {prototype_npz}, got shape={prototypes.shape}")
+    if prototypes.shape[1] != int(embedding_dim):
+        raise ValueError(
+            f"Prototype dimension {prototypes.shape[1]} does not match embedding dimension {embedding_dim}: {prototype_npz}"
+        )
+    n = int(prototypes.shape[0])
+    class_names = _decode_array(np.asarray(arrays["class_names"])) if "class_names" in arrays else np.asarray([""] * n, dtype=object)
+    prototype_names = _decode_array(np.asarray(arrays["prototype_names"])) if "prototype_names" in arrays else np.asarray([f"prototype_{i + 1}" for i in range(n)], dtype=object)
+    prototype_kinds = _decode_array(np.asarray(arrays["prototype_kinds"])) if "prototype_kinds" in arrays else np.asarray(["prototype"] * n, dtype=object)
+    metadata = pd.DataFrame(
+        {
+            "prototype_index": np.arange(n, dtype=int),
+            "class_name": class_names,
+            "prototype_name": prototype_names,
+            "prototype_kind": prototype_kinds,
+        }
+    )
+    return np.nan_to_num(prototypes, nan=0.0, posinf=0.0, neginf=0.0), metadata
+
+
+def reduce_embeddings_2d(
+    embeddings: np.ndarray,
+    prototype_embeddings: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, str]:
     n = int(embeddings.shape[0])
+    prototype_xy: np.ndarray | None = None
     if n == 0:
-        return np.zeros((0, 2), dtype=np.float32), "empty"
+        if prototype_embeddings is not None:
+            prototype_xy = np.zeros((prototype_embeddings.shape[0], 2), dtype=np.float32)
+        return np.zeros((0, 2), dtype=np.float32), prototype_xy, "empty"
     if n == 1:
-        return np.zeros((1, 2), dtype=np.float32), "single point"
+        if prototype_embeddings is not None:
+            prototype_xy = np.zeros((prototype_embeddings.shape[0], 2), dtype=np.float32)
+        return np.zeros((1, 2), dtype=np.float32), prototype_xy, "single point"
 
     if n >= 5:
         try:
             import umap
 
-            xy = umap.UMAP(
+            reducer = umap.UMAP(
                 n_components=2,
                 n_neighbors=min(15, n - 1),
                 min_dist=0.1,
                 metric="cosine",
                 random_state=42,
-            ).fit_transform(embeddings)
-            return np.asarray(xy, dtype=np.float32), "UMAP"
+            )
+            xy = reducer.fit_transform(embeddings)
+            if prototype_embeddings is not None and prototype_embeddings.shape[0] > 0:
+                prototype_xy = reducer.transform(prototype_embeddings)
+            return (
+                np.asarray(xy, dtype=np.float32),
+                None if prototype_xy is None else np.asarray(prototype_xy, dtype=np.float32),
+                "UMAP",
+            )
         except Exception as exc:
             print(f"[plot_class_specific_umaps] UMAP failed, falling back to PCA: {exc}")
 
     from sklearn.decomposition import PCA
 
     n_components = min(2, embeddings.shape[0], embeddings.shape[1])
-    xy_small = PCA(n_components=n_components, random_state=42).fit_transform(embeddings)
+    reducer = PCA(n_components=n_components, random_state=42)
+    xy_small = reducer.fit_transform(embeddings)
     xy = np.zeros((embeddings.shape[0], 2), dtype=np.float32)
     xy[:, :n_components] = xy_small
-    return xy, "PCA"
+    if prototype_embeddings is not None and prototype_embeddings.shape[0] > 0:
+        proto_small = reducer.transform(prototype_embeddings)
+        prototype_xy = np.zeros((prototype_embeddings.shape[0], 2), dtype=np.float32)
+        prototype_xy[:, :n_components] = proto_small
+    return xy, prototype_xy, "PCA"
 
 
 def split_base_classes(value: object) -> list[str]:
@@ -262,6 +342,23 @@ def candidate_label(row: pd.Series) -> str:
     return str(row.get("candidate_id", "")).strip()
 
 
+def prototype_label(row: pd.Series) -> str:
+    class_name = str(row.get("class_name", "")).strip()
+    short_name = {
+        "Seismic_Amplification": "Seismic",
+        "chromothripsis": "CT",
+    }.get(class_name, class_name)
+    kind = str(row.get("prototype_kind", "")).strip()
+    if kind == "only_class":
+        suffix = "only"
+    elif kind == "contains_class":
+        suffix = "contains"
+    else:
+        name = str(row.get("prototype_name", "")).strip()
+        suffix = name.split("__", 1)[-1] if "__" in name else kind or "proto"
+    return f"{short_name} {suffix}".strip()
+
+
 def axis_limits(xy: np.ndarray) -> tuple[tuple[float, float], tuple[float, float]]:
     x_min, x_max = float(np.min(xy[:, 0])), float(np.max(xy[:, 0]))
     y_min, y_max = float(np.min(xy[:, 1])), float(np.max(xy[:, 1]))
@@ -280,6 +377,8 @@ def plot_panel(
     title: str,
     annotate: bool,
     max_annotations: int,
+    prototype_xy: np.ndarray | None = None,
+    prototype_metadata: pd.DataFrame | None = None,
 ) -> None:
     ax.scatter(
         xy[:, 0],
@@ -313,6 +412,50 @@ def plot_panel(
                     textcoords="offset points",
                 )
 
+    if prototype_xy is not None and prototype_metadata is not None and len(prototype_metadata) == prototype_xy.shape[0]:
+        proto_class = prototype_metadata["class_name"].astype(str).to_numpy()
+        class_proto = proto_class == str(class_name)
+        other_proto = ~class_proto
+        if bool(other_proto.any()):
+            ax.scatter(
+                prototype_xy[other_proto, 0],
+                prototype_xy[other_proto, 1],
+                marker="*",
+                c="#6C6F77",
+                s=155,
+                alpha=0.9,
+                edgecolors="white",
+                linewidths=0.7,
+                label="other prototypes",
+                zorder=5,
+            )
+        if bool(class_proto.any()):
+            ax.scatter(
+                prototype_xy[class_proto, 0],
+                prototype_xy[class_proto, 1],
+                marker="*",
+                c=color,
+                s=245,
+                alpha=0.98,
+                edgecolors="black",
+                linewidths=1.05,
+                label=f"{class_name} prototypes",
+                zorder=6,
+            )
+        for proto_i, row in prototype_metadata.reset_index(drop=True).iterrows():
+            is_class_proto = bool(class_proto[int(proto_i)])
+            text = ax.annotate(
+                prototype_label(row),
+                (prototype_xy[int(proto_i), 0], prototype_xy[int(proto_i), 1]),
+                fontsize=7.2,
+                fontweight="bold" if is_class_proto else "normal",
+                xytext=(5, 5),
+                textcoords="offset points",
+                color="#111111" if is_class_proto else "#3D3F45",
+                zorder=7,
+            )
+            text.set_path_effects([path_effects.withStroke(linewidth=2.8, foreground="white")])
+
     ax.set_title(title)
     ax.set_xlabel("Dim 1")
     ax.set_ylabel("Dim 2")
@@ -331,6 +474,8 @@ def plot_class_umap(
     title_prefix: str,
     annotate: bool,
     max_annotations: int,
+    prototype_xy: np.ndarray | None = None,
+    prototype_metadata: pd.DataFrame | None = None,
 ) -> tuple[int, int]:
     contains = np.asarray([class_name in labels for labels in label_sets], dtype=bool)
     only = np.asarray([labels == {class_name} for labels in label_sets], dtype=bool)
@@ -338,7 +483,8 @@ def plot_class_umap(
 
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 5.4), sharex=True, sharey=True)
     prefix = f"{title_prefix.strip()} " if title_prefix.strip() else ""
-    fig.suptitle(f"{prefix}{class_name} embedding projection ({method})", fontsize=13)
+    proto_suffix = "" if prototype_metadata is None else f" + {len(prototype_metadata)} prototypes"
+    fig.suptitle(f"{prefix}{class_name} embedding projection ({method}{proto_suffix})", fontsize=13)
 
     plot_panel(
         axes[0],
@@ -350,6 +496,8 @@ def plot_class_umap(
         f"Contains {class_name}",
         annotate,
         max_annotations,
+        prototype_xy,
+        prototype_metadata,
     )
     plot_panel(
         axes[1],
@@ -361,8 +509,13 @@ def plot_class_umap(
         f"Only {class_name}",
         annotate,
         max_annotations,
+        prototype_xy,
+        prototype_metadata,
     )
-    xlim, ylim = axis_limits(xy)
+    limits_xy = xy
+    if prototype_xy is not None and prototype_xy.shape[0] > 0:
+        limits_xy = np.vstack([xy, prototype_xy])
+    xlim, ylim = axis_limits(limits_xy)
     for ax in axes:
         ax.set_xlim(*xlim)
         ax.set_ylim(*ylim)
@@ -385,16 +538,37 @@ def write_coordinates(
     out.to_csv(output_path, sep="\t", index=False)
 
 
+def write_prototype_coordinates(
+    prototype_xy: np.ndarray | None,
+    prototype_metadata: pd.DataFrame | None,
+    output_path: Path,
+) -> None:
+    if prototype_xy is None or prototype_metadata is None:
+        pd.DataFrame().to_csv(output_path, sep="\t", index=False)
+        return
+    out = prototype_metadata.copy()
+    out.insert(0, "umap_x", prototype_xy[:, 0])
+    out.insert(1, "umap_y", prototype_xy[:, 1])
+    out.to_csv(output_path, sep="\t", index=False)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     embedding_npz, metadata_path, output_dir = resolve_paths(args)
-    embeddings, metadata = load_inputs(embedding_npz, metadata_path)
+    embeddings, metadata = load_inputs(embedding_npz, metadata_path, args.embedding_key)
+    prototype_path = resolve_prototype_path(args, embedding_npz)
+    prototype_embeddings: np.ndarray | None = None
+    prototype_metadata: pd.DataFrame | None = None
+    if prototype_path is not None:
+        prototype_embeddings, prototype_metadata = load_prototypes(prototype_path, embeddings.shape[1])
+        print(f"[plot_class_specific_umaps] Overlaying {len(prototype_metadata)} prototype(s) from {prototype_path}")
     label_column = choose_label_column(metadata, args.label_column)
     label_sets = [set(split_base_classes(value)) for value in metadata[label_column].tolist()]
     classes = infer_classes(label_sets, parse_class_args(args.classes))
 
-    xy, method = reduce_embeddings_2d(embeddings)
+    xy, prototype_xy, method = reduce_embeddings_2d(embeddings, prototype_embeddings)
     write_coordinates(xy, metadata, label_sets, output_dir / "class_specific_umap_coordinates.tsv")
+    write_prototype_coordinates(prototype_xy, prototype_metadata, output_dir / "class_specific_umap_prototypes.tsv")
 
     summary_rows: list[dict[str, object]] = []
     for class_index, class_name in enumerate(classes):
@@ -410,6 +584,8 @@ def main(argv: list[str] | None = None) -> None:
             args.title_prefix,
             args.annotate,
             int(args.max_annotations),
+            prototype_xy,
+            prototype_metadata,
         )
         summary_rows.append(
             {
@@ -417,6 +593,10 @@ def main(argv: list[str] | None = None) -> None:
                 "n_contains_class": n_contains,
                 "n_only_class": n_only,
                 "projection_method": method,
+                "embedding_npz": str(embedding_npz),
+                "embedding_key": str(args.embedding_key),
+                "prototype_npz": "" if prototype_path is None else str(prototype_path),
+                "n_prototypes": 0 if prototype_metadata is None else int(len(prototype_metadata)),
                 "output_png": str(output_path),
             }
         )
