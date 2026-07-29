@@ -1,0 +1,7 @@
+loss_stage	labels
+event_geometry	12
+one_to_one_collision	3
+output_cap	2
+proposal_miss	2
+recovered	53
+score_threshold	36

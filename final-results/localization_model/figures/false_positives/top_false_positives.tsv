@@ -1,0 +1,35 @@
+event_id	representative_candidate_id	sample_id	chrom	cluster_id	cluster_size	original_start	original_end	start	end	score	label	scale	region_mode	nms_mode	_prediction_id	is_true_positive	best_same_class_overlap_coefficient	false_positive_type	class_fp_rank
+SCC152:chr9:C13	SCC152:v3:0040	SCC152	chr9	C13	3	38000001	138394717	38000001	138394717	0.8953044414520264	BFB	1.0	representative	none	110	False	0.0	no same-class overlap	1
+HCC1954:chr17:C36	HCC1954:v3:0059	HCC1954	chr17	C36	7	39450393	39981520	39538029	39893884	0.891945481300354	BFB	0.67	representative	none	63	False	0.0	no same-class overlap	2
+ZR7530:chr8:C9	ZR7530:v3:0052	ZR7530	chr8	C9	13	119509427	121519589	119509427	121519589	0.8871915340423584	BFB	1.0	representative	none	160	False	0.0	no same-class overlap	3
+SUIT:chr8:C14	SUIT:v3:0042	SUIT	chr8	C14	5	22095978	34984208	24222536	32857650	0.886263370513916	BFB	0.67	representative	none	151	False	0.04455577785894577	subthreshold geometry	4
+BT474:chr12:C28	BT474:v3:0022	BT474	chr12	C28	7	79926189	82017130	79926189	82017130	0.8753490447998047	BFB	1.0	representative	containment	14	False	0.0	no same-class overlap	5
+ZR7530:chr17:C9	ZR7530:v3:0011	ZR7530	chr17	C9	10	28000001	83257441	28000001	83257441	0.8720176815986633	BFB	1.0	representative	none	161	False	0.0	no same-class overlap	6
+SKBR3:chr10:C14	SKBR3:v3:0003	SKBR3	chr10	C14	8	42000001	103373068	52126557	93246512	0.8468877077102661	BFB	0.67	representative	none	125	False	0.0	no same-class overlap	7
+CERV186:chr1:C3	CERV186:v3:0003	CERV186	chr1	C3	1	123952425	125958427	124283415	125627437	0.822475254535675	BFB	0.67	representative	none	26	False	0.0	no same-class overlap	8
+SNU682:chr18:C32	SNU682:v3:0029	SNU682	chr18	C32	6	73902509	75902828	74232562	75572775	0.8077045679092407	BFB	0.67	representative	none	142	False	0.0	no same-class overlap	9
+MS751:chr16:C26	MS751:v3:0022	MS751	chr16	C26	1	46000001	46493880	46000001	46493880	0.8022956252098083	BFB	1.0	envelope	none	96	False	0.0	no same-class overlap	10
+MDA_MD_361:chr16:C19	MDA_MD_361:v3:0022	MDA_MD_361	chr16	C19	3	46000001	90338345	53315828	83022518	0.8029587268829346	chromothripsis	0.67	representative	none	82	False	0.0	no same-class overlap	1
+HOS:chr6:C10	HOS:v3:0060	HOS	chr6	C10	5	48527618	50529345	48857903	50199060	0.7722715139389038	chromothripsis	0.67	representative	none	67	False	0.0	no same-class overlap	2
+HCC1954:chr21:C42	HCC1954:v3:0077	HCC1954	chr21	C42	7	13000001	46709983	18562148	41147836	0.766129732131958	chromothripsis	0.67	representative	none	62	False	0.0	no same-class overlap	3
+HOS:chr7:C14	HOS:v3:0064	HOS	chr7	C14	2	63000001	159345973	78897087	143448887	0.7620754241943359	chromothripsis	0.67	representative	none	68	False	0.0	no same-class overlap	4
+SNU1299:chr12:C15	SNU1299:v3:0015	SNU1299	chr12	C15	3	100829877	102853632	101163797	102519712	0.7425681948661804	chromothripsis	0.67	representative	none	136	False	0.0	no same-class overlap	5
+QGU:chr2:C3	QGU:v3:0041	QGU	chr2	C3	1	96000001	242193529	59451619	278741911	0.738959550857544	chromothripsis	1.5	envelope	containment	104	False	0.0	no same-class overlap	6
+DOTC2:chr20:C41	DOTC2:v3:0045	DOTC2	chr20	C41	1	20039636	24999999	20858096	24181539	0.7366859316825867	chromothripsis	0.67	representative	none	50	False	0.0	no same-class overlap	7
+H2009:chr18:C27	H2009:v3:0025	H2009	chr18	C27	2	42112282	44125547	42444471	43793358	0.732354998588562	chromothripsis	0.67	representative	none	57	False	0.0	no same-class overlap	8
+AU565:chr3:C4	AU565:v3:0044	AU565	chr3	C4	5	99431777	198295559	115744301	181983035	0.7281679511070251	chromothripsis	0.67	representative	none	1	False	0.0	no same-class overlap	9
+CERV215:chr8:C10	CERV215:v3:0039	CERV215	chr8	C10	3	37875794	39877100	38206010	39546884	0.7210384607315063	chromothripsis	0.67	representative	none	37	False	0.0	no same-class overlap	10
+BT474:chr15:C33	BT474:v3:0039	BT474	chr15	C33	8	23387297	25389548	23387297	25389548	0.8787134289741516	ecDNA	1.0	representative	none	10	False	0.0	no same-class overlap	1
+AU565:chr8:C15	AU565:v3:0075	AU565	chr8	C15	19	48060821	50060831	48390823	49730829	0.7314596772193909	ecDNA	0.67	representative	none	0	False	0.0	no same-class overlap	2
+SNU1000:chr11:C15	SNU1000:v3:0009	SNU1000	chr11	C15	7	100308147	102913626	100738051	102483722	0.7158772945404053	ecDNA	0.67	representative	none	129	False	0.0	no same-class overlap	3
+BT474:chr17:C35	BT474:v3:0047	BT474	chr17	C35	6	48292659	61866411	48292659	61866411	0.707768976688385	ecDNA	1.0	representative	none	11	False	0.0	no same-class overlap	4
+SNU1299:chr11:C14	SNU1299:v3:0010	SNU1299	chr11	C14	7	102847999	104866342	103181026	104533315	0.6932487487792969	ecDNA	0.67	representative	none	134	False	0.0	no same-class overlap	5
+MDA_MD_361:chr14:C24	MDA_MD_361:v3:0015	MDA_MD_361	chr14	C24	5	20000001	107043718	34362214	92681505	0.6799390912055969	ecDNA	0.67	representative	none	81	False	0.0	no same-class overlap	6
+CaSki:chr11:C20	CaSki:v3:0008	CaSki	chr11	C20	6	98652393	105396307	99765139	104283561	0.6517549753189087	ecDNA	0.67	representative	none	45	False	0.0	no same-class overlap	7
+SUIT:chr8:C14	SUIT:v3:0043	SUIT	chr8	C14	5	31759575	33760770	32089772	33430573	0.6395761370658875	ecDNA	0.67	representative	none	149	False	0.0	no same-class overlap	8
+HCC1954:chr17:C36	HCC1954:v3:0059	HCC1954	chr17	C36	7	39450393	39981520	39538029	39893884	0.6133511662483215	ecDNA	0.67	representative	none	61	False	0.0	no same-class overlap	9
+C4I:chr16:C20	C4I:v3:0013	C4I	chr16	C20	2	46000001	46455427	46075146	46380282	0.6079831719398499	ecDNA	0.67	representative	none	19	False	0.0	no same-class overlap	10
+BT474:chr17:C35	BT474:v3:0049	BT474	chr17	C35	6	64932798	71997176	66098421	70831553	0.9164005517959596	seismic_amplification	0.67	representative	none	17	False	0.0	no same-class overlap	1
+BT474:chr4:C2	BT474:v3:0079	BT474	chr4	C2	5	52000001	191118667	74954581	168164087	0.7823430299758911	seismic_amplification	0.67	representative	none	18	False	0.0	no same-class overlap	2
+MDA_MD_361:chr6:C10	MDA_MD_361:v3:0056	MDA_MD_361	chr6	C10	1	0	52648137	8686943	43961194	0.6814578175544739	seismic_amplification	0.67	representative	none	87	False	0.0	no same-class overlap	3
+MDA_MD_361:chr16:C19	MDA_MD_361:v3:0023	MDA_MD_361	chr16	C19	3	50942546	52943028	51272626	52612948	0.6284529566764832	seismic_amplification	0.67	representative	none	88	False	0.0	no same-class overlap	4

@@ -1,0 +1,4 @@
+test_sample	split	n_samples	n_events	ecDNA	chromothripsis	BFB	seismic_amplification
+HOS	train	43	82	8	30	32	12
+HOS	validation	4	25	5	6	9	5
+HOS	test	1	1	0	0	1	0

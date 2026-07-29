@@ -1,0 +1,7 @@
+region_id	sample_id	chrom	start	end	label	source	source_call_id	source_region	confidence	best_candidate_oc	old_model_recovered	retrained_recovered
+P24U000050	DOTC2	chr1	122026460	245882563	chromothripsis	ShatterSeek3_updated	P24_UPDATED_CHROM:0008	chr1:122026460-245882563	LOW	1.0	False	False
+P24U000052	H1437	chr8	6008888	44033744	chromothripsis	ShatterSeek3_updated	P24_UPDATED_CHROM:0037	chr8:6008888-44033744	LOW	1.0	False	False
+P24U000058	HOS	chrX	473752	58605579	chromothripsis	ShatterSeek3_updated	P24_UPDATED_CHROM:0009	chrX:473752-58605579	LOW	1.0	False	False
+P24U000069	MS751	chr21	23871053	42607895	chromothripsis	ShatterSeek3_updated	P24_UPDATED_CHROM:0018	chr21:23871053-42607895	LOW	1.0	True	True
+P24U000072	QGU	chr2	92188146	234017520	chromothripsis	ShatterSeek3_updated	P24_UPDATED_CHROM:0020	chr2:92188146-234017520	HIGH	0.9731236565062773	True	True
+P24U000083	SW756	chr8	82045980	144388696	chromothripsis	ShatterSeek3_updated	P24_UPDATED_CHROM:0031	chr8:82045980-144388696	LOW	1.0	False	False

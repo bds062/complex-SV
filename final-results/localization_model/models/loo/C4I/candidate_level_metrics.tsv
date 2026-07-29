@@ -1,0 +1,4 @@
+split	n_labels	n_predictions	true_predictions	localization_recall	classified_recall	classified_precision	classified_f1	classified_f2	test_sample
+train	82	204	78	0.9512195121951219	0.9512195121951219	0.38235294117647056	0.5454545454545454	0.7330827067669173	C4I
+validation	25	48	21	0.88	0.84	0.4375	0.5753424657534247	0.7094594594594594	C4I
+test	1	4	1	1.0	1.0	0.25	0.4	0.625	C4I

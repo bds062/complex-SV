@@ -1,0 +1,109 @@
+region_id	sample_id	chrom	truth_start	truth_end	truth_label	proposal_available	representative_unscaled_available	envelope_unscaled_available	event_geometry_available	threshold_available	nms_available	output_cap_available	loss_stage	localized_by_any_class	threshold_subtype
+P24R000001	AU565	chr7	118941971	128943674	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000002	AU565	chr8	48716193	49823002	BFB	True	False	True	True	True	True	True	recovered	True	
+P24R000003	AU565	chr8	71428617	80933929	BFB	True	False	True	True	True	True	True	one_to_one_collision	True	
+P24R000004	AU565	chr8	111477375	123294792	BFB	True	True	True	True	True	True	True	one_to_one_collision	True	
+P24R000056	AU565	chr10	39686683	71714103	chromothripsis	True	True	True	True	False	False	False	score_threshold	True	localized_wrong_class
+P24R000057	AU565	chr20	232508	26436232	chromothripsis	True	False	True	False	False	False	False	event_geometry	False	
+P24R000092	AU565	chr8	49900406	141246208	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000093	AU565	chr20	26436233	58962673	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000005	BT474	chr9	34393242	35445141	BFB	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000006	BT474	chr15	23704366	25321279	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000007	BT474	chr17	36895900	39827455	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000008	BT474	chr17	48295981	53868784	BFB	True	True	True	True	True	True	True	one_to_one_collision	True	
+P24R000009	BT474	chr20	47160683	58833898	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000094	BT474	chr11	58205877	103045940	seismic_amplification	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000058	C4I	chr18	4677817	15460899	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000059	CERV186	chr17	425281	22813679	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000012	CERV196	chr6	62066249	64658826	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000043	CERV196	chr6	62712967	64457862	ecDNA	True	True	True	False	False	False	False	event_geometry	True	
+P24R000044	CERV196	chr13	33978076	34838074	ecDNA	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000013	CERV215	chr11	101295180	102968814	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000045	CERV215	chr11	101195180	103072489	ecDNA	True	True	True	True	True	True	True	recovered	True	
+P24R000014	CFPAC1	chr17	37419896	38329991	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000060	CFPAC1	chr11	51078349	134475140	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000010	CaSki	chr6	63479869	65364968	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000011	CaSki	chr11	99652393	104396306	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000061	CaSki	chr3	14765313	90772458	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000062	CaSki	chr3	90772459	186374094	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000015	DOTC2	chr1	118954345	121760338	BFB	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000086	H1395	chr3	62945799	85636034	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000087	H2009	chr1	45850147	122026459	chromothripsis	False	False	True	False	False	False	False	proposal_miss	False	
+P24R000088	H2009	chr1	122026460	191009373	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000089	H2009	chr3	90772459	145984473	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000090	HCC1937	chr14	21675556	98441206	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000091	HCC1954	chr9	43389636	127156923	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000105	HCC1954	chr8	71218390	132831515	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000106	HCC1954	chr9	1919565	43389635	seismic_amplification	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000107	HCC1954	chr19	28004177	53879920	seismic_amplification	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000108	HCC1954	chr21	10864561	46343898	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000016	HOS	chr17	26524822	27903817	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000017	HT3	chr17	68459442	70760129	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000018	HT3	chr4	185970068	188970881	BFB	True	False	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000080	HT3	chr2	4885699	92188145	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000081	HT3	chr4	147311641	160025632	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000019	MDA_MD_361	chr17	35429860	36160687	BFB	True	True	True	False	False	False	False	event_geometry	True	
+P24R000063	MDA_MD_361	chr1	122026460	246642866	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000064	MDA_MD_361	chr2	140960389	192115393	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000065	MDA_MD_361	chr6	1637832	58553888	chromothripsis	True	True	True	True	False	False	False	score_threshold	True	localized_wrong_class
+P24R000066	MDA_MD_361	chr12	61075541	105505912	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000095	MDA_MD_361	chr9	817463	42160154	seismic_amplification	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000096	MDA_MD_361	chr17	35169434	74791971	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000097	MDA_MD_361	chr20	26436233	59523338	seismic_amplification	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000067	MDA_MD_453	chr3	90772459	197670953	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000068	MDA_MD_453	chr5	46485901	180693943	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000069	MDA_MD_453	chr11	51078349	98865981	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000098	MDA_MD_453	chr17	39541413	82664462	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000070	MS751	chr11	13827104	51078348	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000071	OMC1	chr19	2026826	24498980	chromothripsis	True	False	True	False	False	False	False	event_geometry	False	
+P24R000020	QGU	chr11	97342704	102602155	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000021	QGU	chr18	2775117	5152294	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000046	QGU	chr11	100242562	102702499	ecDNA	True	True	True	True	True	True	True	recovered	True	
+P24R000047	QGU	chr18	2675117	5185295	ecDNA	True	True	True	True	True	True	True	recovered	True	
+P24R000072	QGU	chr12	34769408	124999920	chromothripsis	False	False	False	False	False	False	False	proposal_miss	False	
+P24R000024	SCC090	chr9	97717139	97952089	BFB	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000048	SCC090	chr9	97710199	98055196	ecDNA	True	True	True	False	False	False	False	event_geometry	False	
+P24R000049	SCC152	chr9	97710199	98055196	ecDNA	True	True	True	True	True	True	True	recovered	True	
+P24R000025	SCC154	chr11	101163433	104064145	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000026	SIHA	chr20	31691139	31989770	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000078	SIHA	chr5	46485901	175032070	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000079	SIHA	chr15	20376581	100267333	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000104	SIHA	chr16	36311159	86894599	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000027	SKBR3	chr3	169331657	175268293	BFB	True	False	True	False	False	False	False	event_geometry	True	
+P24R000028	SKBR3	chr7	107418023	117419433	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000029	SKBR3	chr8	71428617	80933929	BFB	True	False	True	False	False	False	False	event_geometry	True	
+P24R000030	SKBR3	chr8	111477375	123294792	BFB	True	True	True	True	True	True	False	output_cap	True	
+P24R000073	SKBR3	chr20	232508	26436232	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000099	SKBR3	chr8	48596717	141246208	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000100	SKBR3	chr20	26436233	58962673	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000037	SNU1000	chr11	100077104	102913625	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000038	SNU1000	chr2	194427727	197928776	BFB	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000074	SNU1000	chr19	2400267	24498980	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000039	SNU1005	chr5	54410260	56219562	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000050	SNU1005	chr5	54309756	56019737	ecDNA	True	True	True	True	True	True	True	recovered	True	
+P24R000075	SNU1005	chr14	22983503	105234054	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000084	SNU1245	chr5	1140623	46485900	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000085	SNU1245	chr5	46485901	180302292	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000040	SNU1299	chr20	31247043	33157127	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000041	SNU1299	chr11	99700440	104487133	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000082	SNU17	chr4	1065666	49712061	chromothripsis	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000083	SNU17	chr4	49712062	189337402	chromothripsis	True	False	True	False	False	False	False	event_geometry	False	
+P24R000031	SNU682	chr11	32407739	37906386	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000032	SNU703	chr11	69831727	70650938	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000033	SNU703	chr18	1919087	4205244	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000034	SNU703	chr12	64593783	70568404	BFB	True	True	True	True	True	True	False	output_cap	False	
+P24R000051	SNU703	chr11	69730653	70565676	ecDNA	True	True	True	True	False	False	False	score_threshold	True	localized_wrong_class
+P24R000052	SNU703	chr18	1820111	4305243	ecDNA	True	True	True	True	True	True	True	recovered	True	
+P24R000053	SNU703	chrX	24028691	24328794	ecDNA	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000035	SNU778	chr11	88380790	88502560	BFB	True	True	True	True	False	False	False	score_threshold	False	no_surviving_localization
+P24R000036	SNU902	chr19	10623268	11581942	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000054	SNU902	chr19	10519558	11584521	ecDNA	True	True	True	True	False	False	False	score_threshold	True	localized_wrong_class
+P24R000076	SNU902	chr10	5593438	39686682	chromothripsis	True	False	False	False	False	False	False	event_geometry	False	
+P24R000101	SNU902	chr19	12140036	20261057	seismic_amplification	True	False	True	False	False	False	False	event_geometry	False	
+P24R000042	SUIT	chr8	32759575	34960770	BFB	True	True	True	False	False	False	False	event_geometry	True	
+P24R000022	ScaBER	chr1	92472550	94566619	BFB	True	True	True	True	True	True	True	recovered	True	
+P24R000023	ScaBER	chr1	105385095	109648201	BFB	True	False	True	False	False	False	False	event_geometry	False	
+P24R000055	ScaBER	chr1	92405815	94470855	ecDNA	True	True	True	True	True	True	True	recovered	True	
+P24R000077	ScaBER	chr9	13656598	38179501	chromothripsis	True	True	True	True	True	True	True	recovered	True	
+P24R000102	ZR7530	chr8	45288732	144608042	seismic_amplification	True	True	True	True	True	True	True	recovered	True	
+P24R000103	ZR7530	chr17	26769695	65686606	seismic_amplification	True	True	True	True	False	False	False	score_threshold	True	localized_wrong_class

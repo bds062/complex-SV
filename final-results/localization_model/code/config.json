@@ -1,0 +1,21 @@
+{
+  "seed": 24,
+  "outer_fold_size": 10,
+  "minimum_validation_events_per_class": 5,
+  "hidden_dim": 96,
+  "dropout": 0.35,
+  "epochs": 300,
+  "patience": 35,
+  "learning_rate": 0.001,
+  "weight_decay": 0.003,
+  "hard_negative_ratio": 6,
+  "minimum_hard_negatives": 64,
+  "overlap_coefficient_threshold": 0.5,
+  "matching_metric": "overlap_coefficient",
+  "calibration_selection_metric": "f2",
+  "recalibrate_saved_models": false,
+  "scale_grid": [0.67, 0.8, 1.0, 1.15, 1.25, 1.5],
+  "threshold_quantiles": [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.875, 0.9, 0.925, 0.95, 0.96, 0.97, 0.98, 0.985, 0.99, 0.995],
+  "maximum_predictions_per_sample_grid": [2, 4, 8, 12],
+  "nms_modes": ["containment", "cluster_containment"]
+}

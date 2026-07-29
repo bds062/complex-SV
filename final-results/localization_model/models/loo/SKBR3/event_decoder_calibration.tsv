@@ -1,0 +1,5 @@
+label	threshold	scale	region_mode	nms_mode	maximum_per_sample	calls	predictions	true_predictions	recall	precision	f1	f2
+ecDNA	0.5590122938156128	0.67	representative	none	2	5	5	3	0.6	0.6	0.6	0.6
+chromothripsis	0.5546258687973022	1.0	envelope	none	8	7	21	5	0.7142857142857143	0.23809523809523808	0.35714285714285715	0.5102040816326532
+BFB	0.4160260558128357	0.67	representative	none	2	10	8	6	0.6	0.75	0.6666666666666665	0.625
+seismic_amplification	0.7500525116920471	0.67	representative	none	2	5	3	3	0.6	1.0	0.7499999999999999	0.6521739130434783

@@ -1,0 +1,4 @@
+test_sample	split	n_samples	n_events	ecDNA	chromothripsis	BFB	seismic_amplification
+SCC090	train	43	82	7	31	32	12
+SCC090	validation	4	24	5	5	9	5
+SCC090	test	1	2	1	0	1	0

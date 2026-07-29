@@ -1,0 +1,4 @@
+test_sample	split	n_samples	n_events	ecDNA	chromothripsis	BFB	seismic_amplification
+SCC152	train	43	80	7	29	32	12
+SCC152	validation	4	27	5	7	10	5
+SCC152	test	1	1	1	0	0	0

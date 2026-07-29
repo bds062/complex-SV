@@ -1,0 +1,16 @@
+truth_label	loss_stage	labels
+BFB	event_geometry	5
+BFB	one_to_one_collision	3
+BFB	output_cap	2
+BFB	recovered	26
+BFB	score_threshold	6
+chromothripsis	event_geometry	4
+chromothripsis	proposal_miss	2
+chromothripsis	recovered	10
+chromothripsis	score_threshold	20
+ecDNA	event_geometry	2
+ecDNA	recovered	7
+ecDNA	score_threshold	4
+seismic_amplification	event_geometry	1
+seismic_amplification	recovered	10
+seismic_amplification	score_threshold	6

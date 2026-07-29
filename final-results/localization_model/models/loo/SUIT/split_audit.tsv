@@ -1,0 +1,4 @@
+test_sample	split	n_samples	n_events	ecDNA	chromothripsis	BFB	seismic_amplification
+SUIT	train	43	80	8	29	31	12
+SUIT	validation	4	27	5	7	10	5
+SUIT	test	1	1	0	0	1	0
