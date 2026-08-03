@@ -1,8 +1,7 @@
 # Integration tests
 
-The tests exercise the packaged release on one real genome. The committed
-defaults point to the AU565 inputs on the Kolmogorov Lab HPC. No source data or
-generated test output is copied into Git.
+The tests exercise the packaged release on one real genome. The
+default file points to the AU565 inputs on Biowulf.
 
 ## Configure paths
 
@@ -39,7 +38,7 @@ test/run_test.sh quick test/paths.hpc.env
 
 This checks dependencies and model artifacts, rebuilds all four-class label
 tables, and runs the candidate generator. The default cap of 25 proposals
-keeps it suitable as a smoke test; it is not a benchmark run.
+allows this command as a smoke test.
 
 ## Full test
 
@@ -47,11 +46,10 @@ keeps it suitable as a smoke test; it is not a benchmark run.
 test/run_test.sh full test/paths.hpc.env
 ```
 
-The full mode additionally embeds candidates, applies the localization
-ensemble, embeds every chromosome, and applies the chromosome ensemble. Set
+The full mode additionally embeds candidates, applies the all-48 localization
+model, embeds every chromosome, and applies the all-48 chromosome model. Set
 `TEST_DEVICE=cuda` when a compatible GPU is available. The full test verifies
-integration and checkpoint compatibility; its capped single-genome predictions
-must not be interpreted as held-out performance.
+integration and checkpoint compatibility.
 
 Both modes fail immediately for missing inputs, malformed labels, dependency
 problems, or unsuccessful pipeline stages. All outputs are written beneath

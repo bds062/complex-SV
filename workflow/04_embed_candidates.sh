@@ -16,8 +16,8 @@ shift 3
 exec "$python_bin" "$repo_dir/training/train_candidate_region_classifier.py" \
     --manifest "$manifest" \
     --candidate_regions "$candidates" \
-    --cn_checkpoint "$repo_dir/models/pretrained/cn_encoder.pt" \
-    --graph_checkpoint "$repo_dir/models/pretrained/sv_graph_encoder.pt" \
+    --cn_checkpoint "$repo_dir/models/pretrained_featurizer/cn_encoder.pt" \
+    --graph_checkpoint "$repo_dir/models/pretrained_featurizer/sv_graph_encoder.pt" \
     --output_dir "$output_dir" \
     --class_names "ecDNA,chromothripsis,BFB,seismic_amplification" \
     --embedding_normalization none \

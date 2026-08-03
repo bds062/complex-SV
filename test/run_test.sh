@@ -55,8 +55,8 @@ echo "[4/7] Embedding localized candidates"
     "$TEST_OUTPUT_DIR/localization_features" \
     --device "${TEST_DEVICE:-cpu}"
 
-echo "[5/7] Applying the localization ensemble"
-"$python_bin" "$repo_dir/workflow/06_predict_localization_ensemble.py" \
+echo "[5/7] Applying the all-48 localization model"
+"$python_bin" "$repo_dir/workflow/10_predict_localization.py" \
     --candidates "$TEST_OUTPUT_DIR/candidates/merged_candidate_regions.csv" \
     --embedding-bundle "$TEST_OUTPUT_DIR/localization_features/embeddings.npz" \
     --selected-embeddings "$TEST_OUTPUT_DIR/localization_features/selected_embedding_features.npz" \
@@ -70,8 +70,8 @@ echo "[6/7] Embedding chromosomes"
     "$TEST_OUTPUT_DIR/chromosome_features" \
     --device "${TEST_DEVICE:-cpu}"
 
-echo "[7/7] Applying the chromosome ensemble"
-"$python_bin" "$repo_dir/workflow/09_predict_chromosome_ensemble.py" \
+echo "[7/7] Applying the all-48 chromosome model"
+"$python_bin" "$repo_dir/workflow/11_predict_chromosomes.py" \
     --embedding-dir "$TEST_OUTPUT_DIR/chromosome_features/embeddings" \
     --tabular "$TEST_OUTPUT_DIR/chromosome_features/chromosome_tabular.tsv" \
     --output "$TEST_OUTPUT_DIR/chromosome_predictions" \

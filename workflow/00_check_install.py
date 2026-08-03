@@ -43,8 +43,14 @@ def main() -> None:
 
     if not args.skip_models:
         expected = [
-            args.repo / "models/pretrained/cn_encoder.pt",
-            args.repo / "models/pretrained/sv_graph_encoder.pt",
+            args.repo / "models/pretrained_featurizer/cn_encoder.pt",
+            args.repo / "models/pretrained_featurizer/sv_graph_encoder.pt",
+            args.repo / "models/localization_all48/model.pt",
+            args.repo / "models/localization_all48/decoder_calibration.tsv",
+            args.repo / "models/localization_all48/metadata.json",
+            args.repo / "models/localization_all48/cv_epoch_selection.tsv",
+            args.repo / "models/localization_all48/cv_decoder_selections.tsv",
+            args.repo / "models/chromosome_all48/model.pt",
             args.repo / "models/localization_loo",
             args.repo / "models/chromosome_fivefold",
         ]

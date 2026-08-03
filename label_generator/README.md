@@ -1,8 +1,6 @@
 # Label generation
 
-This directory converts curated outputs from the three upstream event callers
-into the two supervised label resolutions used by complex-SV. It does not use
-model predictions or candidate proposals.
+Generates method-based calls into supervised label resolutions used by complex-SV. Independent of model predictions and candidate proposals.
 
 ## Inputs
 

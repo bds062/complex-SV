@@ -15,8 +15,8 @@ mkdir -p "$output_dir"
 
 "$python_bin" "$repo_dir/discovery/embed_corpus.py" \
     --manifest "$manifest" \
-    --cn_checkpoint "$repo_dir/models/pretrained/cn_encoder.pt" \
-    --graph_checkpoint "$repo_dir/models/pretrained/sv_graph_encoder.pt" \
+    --cn_checkpoint "$repo_dir/models/pretrained_featurizer/cn_encoder.pt" \
+    --graph_checkpoint "$repo_dir/models/pretrained_featurizer/sv_graph_encoder.pt" \
     --output_dir "$output_dir/embeddings" \
     --candidate_source chromosomes \
     --embedding_normalization none \

@@ -1,7 +1,7 @@
 # complex-SV
 
 A research pipeline for detecting complex structural-variant events from
-[Wakhan](https://github.com/KolmogorovLab/Wakhan) copy-number segments and
+[Wakhan](https://github.com/KolmogorovLab/Wakhan) copy-number alterations and
 [Severus](https://github.com/KolmogorovLab/Severus) structural-variant calls.
 
 The repository supports two related tasks:
@@ -20,21 +20,16 @@ points. The upstream [label generator](label_generator/README.md),
 Held-out predictions, aggregate metrics, labels, and primary figures are
 provided in [`benchmarks/`](benchmarks/).
 
-> **Status:** This is research software, not a clinical diagnostic. The
-> packaged supervised models were evaluated by genome-level cross-validation
-> on a small cancer cell-line cohort. Calls on new cohorts require independent
-> validation.
+> **Status:** This tool is still in progress. Only 48 cell lines were used for training, and we hope to expand this set and the tool's capabilities to short read callers soon. Please reach out to bds062@umd.edu for any questions, comments, or concerns.
+
+[View the project poster (PDF)](Complex_SV_Poster_2026.pdf)
 
 ## Method overview
 
-```text
-Wakhan segments ──> masked CN encoder ─┐
-                                      ├─> candidate/chromosome representation
-Severus VCF ──────> masked graph MAE ──┘
-                                      │
-           localized path             ├─> proposals ─> MIL scorer ─> frozen decoder
-           chromosome path            └─> chromosome MLP ─> multilabel calls
-```
+![End-to-end complex-SV pipeline](docs/figures/pipeline.png)
+
+*The complete method, from Wakhan and Severus outputs through frozen
+featurization and the localized or chromosome-level prediction heads.*
 
 The frozen encoders generate a 402-dimensional base representation: 256 CN
 features, 64 regional SV features, 64 global SV features, and 18 segment
@@ -44,11 +39,11 @@ slots. The chromosome model sets the proposal slots to zero.
 
 The selected localization evaluation reached precision 0.325, recall 0.491,
 F1 0.391, and F2 0.445 at overlap coefficient >= 0.5. The chromosome model
-reached precision 0.320, recall 0.545, F1 0.403, and F2 0.478. See the
-model-specific training notes for the full protocol:
+reached precision 0.320, recall 0.545, F1 0.403, and F2 0.478. Detailed labels,
+out-of-fold predictions, metrics, and figures are provided under:
 
-- [localization model](benchmarks/localization/TRAINING.md)
-- [chromosome model](benchmarks/chromosome/TRAINING.md)
+- [localization benchmark](benchmarks/localization/README.md)
+- [chromosome benchmark](benchmarks/chromosome/README.md)
 - [chromosome-level ensemble](benchmarks/ensemble/README.md)
 
 ## 1. Installation
@@ -65,10 +60,26 @@ conda activate complex-SV
 python workflow/00_check_install.py
 ```
 
-An existing Severus environment can be extended, but a separate environment is
-recommended so the validated SV-calling installation is not changed. See the
-[environment guide](ENVIRONMENT.md) for Severus reuse, GPU/CUDA verification,
-and installation alternatives.
+The same environment can be reused for Severus and complex-SV:
+
+```bash
+conda env update --name severus_env --file environment.yml
+conda activate severus_env
+python workflow/00_check_install.py
+severus --help
+```
+
+Do not use `--prune` when updating an existing Severus environment. A separate
+`complex-SV` environment remains preferable for reproducibility because it
+isolates the PyTorch stack from a validated caller installation. On a GPU node,
+confirm the installed build with:
+
+```bash
+python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"
+```
+
+If necessary, replace PyTorch with the wheel that matches the cluster CUDA
+runtime.
 
 The project is currently designed for GRCh38. Candidate generation uses the
 bundled [centromere coordinates](data/grch38.cen_coord.curated.bed).
@@ -89,7 +100,7 @@ sample_B	/absolute/path/sample_B	/absolute/path/sample_B.severus.vcf
 must point to the Severus VCF for the same genome. Sample identifiers must be
 unique and consistent with the training-label tables.
 
-The original 48-genome publication manifest and a utility for appending new
+The original 48-genome manifest \(5 CASTLE and 43 New Cell Line)and a utility for appending new
 samples are provided in [`manifest/`](manifest/README.md). The utility selects
 the Wakhan solution with the largest third score component and validates all
 required files before updating a manifest.
@@ -97,10 +108,42 @@ required files before updating a manifest.
 Use absolute paths in manifests and pretraining lists. It makes Slurm jobs
 independent of their launch directory.
 
+## Quick start: apply the all-48 models
+
+The release includes one final-fit localization model and one final-fit
+chromosome model trained with all 48 genomes. Apply both to a new
+manifest with one command:
+
+```bash
+workflow/12_predict_new_dataset.sh \
+  inputs/new_manifest.tsv \
+  outputs/new_dataset \
+  cuda
+```
+
+This generates candidates, builds frozen CN/SV features, and writes:
+
+- `localized_calls/localized_complex_sv.tsv`: classified genomic intervals;
+- `chromosome_calls/chromosome_predictions.tsv`: probabilities for every
+  chromosome and class;
+- `chromosome_calls/predicted_complex_sv.tsv`: thresholded chromosome calls.
+
+Set `CANDIDATE_PROFILE=sensitive` for recall-oriented proposal generation and
+set `PYTHON_BIN` if the environment interpreter is not named `python`. The
+final-fit checkpoints use all available training genomes and therefore have no
+held-out performance estimate of their own; use the genome-held-out results in
+`benchmarks/` when reporting expected generalization.
+
 ## 3. Pretrain the autoencoders
 
+![Representation pretraining and regional featurization](docs/figures/featurization.png)
+
+*The copy-number and breakpoint-graph pretraining objectives and their use in
+constructing fixed-dimensional candidate-region embeddings.*
+
+
 You can skip this section and use the checkpoints shipped in
-[`models/pretrained/`](models/pretrained/).
+[`models/pretrained_featurizer/`](models/pretrained_featurizer/).
 
 ### 3.1 Copy-number masked autoencoder
 
@@ -157,7 +200,7 @@ newly pretrained checkpoint can replace the default path in the embedding
 commands by passing a later duplicate `--cn_checkpoint` or
 `--graph_checkpoint` argument.
 
-## 4. Use the shipped localization models
+## 4. Use the final-fit localization model
 
 This path returns semi-localized event intervals.
 
@@ -194,10 +237,10 @@ This writes candidate metadata, the 402-dimensional encoder bundle, the
 1,214-dimensional selected local/context representation, and the 37 safe
 tabular features.
 
-### 4.3 Apply the packaged ensemble
+### 4.3 Apply the all-48 checkpoint
 
 ```bash
-python workflow/06_predict_localization_ensemble.py \
+python workflow/10_predict_localization.py \
   --candidates outputs/localized/candidates/merged_candidate_regions.csv \
   --embedding-bundle outputs/localized/features/embeddings.npz \
   --selected-embeddings outputs/localized/features/selected_embedding_features.npz \
@@ -206,15 +249,16 @@ python workflow/06_predict_localization_ensemble.py \
   --device cuda
 ```
 
-`localization_predictions.tsv` contains consensus interval calls.
-`per_checkpoint_calls.tsv` preserves every component-model call for auditing.
-The default requires at least half of the 37 LOO models to call an event cluster.
-Change `--minimum-vote-fraction` to explore the precision/recall tradeoff.
-
-The original per-fold thresholds were selected without each fold's held-out
-genome. However, using all LOO models as a vote ensemble on a new cohort is a
-research extrapolation; the 0.5 ensemble-vote threshold itself has not been
-validated on an independent cohort.
+`localized_complex_sv.tsv` contains the semi-localized event calls and
+`candidate_scores.tsv` preserves every class score for auditing. The default
+checkpoint in `models/localization_all48/` was trained from
+initialization on all 48 cohort genomes for 34 fixed epochs. The epoch count is
+the median best epoch from 37 genome-held-out fits. Decoder thresholds and
+geometry settings are per-class medians or modes of choices made on each fold's
+folds inner-validation genomes; outer held-out labels selected no deployment
+parameter. The 108 training labels occur in 37 genomes. This is the deployment
+model, while the held-out benchmark remains the generalization estimate. Script
+06 remains available for reproducing the LOO vote ensemble.
 
 ## 5. Train the localization model
 
@@ -227,6 +271,8 @@ event_001	sample_A	chr8	127000000	133000000	ecDNA
 
 Allowed labels are `ecDNA`, `chromothripsis`, `BFB`, and
 `seismic_amplification`.
+
+### 5.1 Genome-held-out training
 
 First run candidate generation and feature extraction for the full training
 cohort. Then reproduce the selected event-bag MIL and frozen-decoder
@@ -253,13 +299,35 @@ overlap coefficient >= 0.5 receive direct class supervision; partial overlaps
 receive continuous overlap-quality supervision. Hard-negative mining reduces
 damage from incomplete labels. Validation genomes select early stopping,
 class-specific thresholds, representative-versus-envelope geometry, centered
-boundary scale, containment NMS mode, and per-genome output caps. Test genomes never participate in fitting or calibration.
+boundary scale, containment NMS mode, and per-genome output caps. Test genomes never participate in fitting or
+calibration.
 
 Each run writes held-out predictions and matches, training history, decoder
 calibration and sweep tables, split membership, metrics, and one checkpoint.
 Aggregate only after all labeled test genomes finish. Split strictly by genome.
 
-## 6. Use the shipped chromosome models
+### 5.2 Fit the all-genome deployment checkpoint
+
+After every held-out run completes, fit one deployment model without reusing
+training labels for early stopping or decoder calibration:
+
+```bash
+python workflow/train_localization_all.py \
+  --candidates outputs/train/candidates/merged_candidate_regions.csv \
+  --labels inputs/training_labels.tsv \
+  --embedding-bundle outputs/train/features/embeddings.npz \
+  --selected-embeddings outputs/train/features/selected_embedding_features.npz \
+  --tabular-features outputs/train/features/tabular_features.npz \
+  --cv-runs outputs/train/localization_cv \
+  --output outputs/train/localization_all
+```
+
+Each CV-run directory must contain `training_history.tsv` and
+`event_decoder_calibration.tsv`. The script fixes training duration to the
+median held-out-fold best epoch, aggregates only inner-validation-selected
+decoder settings, and then trains from initialization using all genomes.
+
+## 6. Use the final-fit chromosome model
 
 This path predicts classes per chromosome and intentionally skips proposal
 generation, localization, geometry adjustment, and NMS.
@@ -272,10 +340,10 @@ workflow/07_embed_chromosomes.sh \
   outputs/chromosome
 ```
 
-### 6.2 Apply the packaged five-fold ensemble
+### 6.2 Apply the all-48 checkpoint
 
 ```bash
-python workflow/09_predict_chromosome_ensemble.py \
+python workflow/11_predict_chromosomes.py \
   --embedding-dir outputs/chromosome/embeddings \
   --tabular outputs/chromosome/chromosome_tabular.tsv \
   --output outputs/chromosome/predictions \
@@ -284,8 +352,12 @@ python workflow/09_predict_chromosome_ensemble.py \
 
 The output is multilabel: one chromosome may receive multiple classes.
 `chromosome_predictions.tsv` contains all chromosome-class probabilities and
-vote fractions; `predicted_complex_sv.tsv` contains calls passing the default
-majority-vote rule.
+thresholds; `predicted_complex_sv.tsv` contains thresholded calls. The final
+head was fit on all 48 genomes for 38 epochs, the median best epoch from the
+five held-out folds. Its per-class thresholds are medians of the five
+validation-selected F2 thresholds rather than thresholds fitted to its own
+training predictions. Script 09 remains available for reproducing the
+five-fold vote ensemble.
 
 ## 7. Train the chromosome model
 
@@ -308,41 +380,26 @@ on validation genomes. Split by genome: chromosomes from a test genome must
 never occur in training or calibration. The independent LOO jobs can be
 launched as a Slurm array.
 
-## 8. Which model should I use?
+## 8. Repository layout
 
-Use the localization model when the required output is an event interval or
-when several same-class events may occur on one chromosome. Its recall is
-bounded by proposal generation and its precision is affected by thresholding
-and event geometry.
-
-Use the chromosome model when the question is only whether a chromosome
-contains a class. It avoids proposal and localization losses and can detect
-multilabel chromosomes, but it cannot identify event boundaries.
-
-For precision-oriented chromosome screening, require agreement between the
-chromosome model and localization calls aggregated to chromosome. In the held-
-out analysis this AND rule achieved F1 0.480. For recall-oriented screening,
-use the OR rule, which achieved F2 0.524. Those figures are cross-validation
-results, not external-cohort estimates.
-
-## 9. Repository layout
+The `data/`, `discovery/`, and `model/` packages are all active parts of the
+supported pipeline. `data/` parses caller output and constructs base features;
+`discovery/` extracts candidate and chromosome representations; and `model/`
+defines the neural heads used by training and inference.
 
 ```text
 benchmarks/     labels, held-out predictions, metrics, and primary figures
 candidate_generator/ label-free Wakhan/Severus proposal pipeline
 configs/        versioned method configuration
 data/           Wakhan/Severus parsing and feature construction
+docs/figures/   publication diagrams embedded in the documentation
 discovery/      candidate and chromosome embedding extraction
 label_generator/ curated caller TSV normalization and provenance
 manifest/       publication cohort manifest and sample-discovery updater
 model/          localization, event-decoder, and chromosome architectures
-models/         pretrained encoders and supervised release ensembles
+models/         frozen featurizers, final-fit models, and evaluation ensembles
 pretrain/       masked-autoencoder implementations and trainers
 test/           configurable single-genome integration tests
 training/       candidate feature preparation and shared loss functions
 workflow/       supported numbered training and inference commands
 ```
-
-Large generated embeddings and run outputs are intentionally ignored by Git.
-Only publication inputs, aggregate results, and reusable checkpoints belong in
-the repository.

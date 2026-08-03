@@ -1,6 +1,5 @@
 name: complex-SV
 
-# The Conda portion is a superset of KolmogorovLab/Severus/environment.yml.
 channels:
   - conda-forge
   - bioconda

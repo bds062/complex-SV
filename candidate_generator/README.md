@@ -1,8 +1,14 @@
 # Candidate generation
 
-This directory contains the label-free proposal stage for localized complex-SV
+Label-free proposal stage for localized complex-SV
 detection. It consumes Wakhan copy-number output and Severus structural-variant
-calls; class labels and external complex-SV caller predictions are never read.
+calls to identify candidate complex regions.
+
+![Candidate generation and training-label assignment](../docs/figures/candidate_generation.png)
+
+*Candidate proposals are generated from copy-number and SV evidence. During
+training, proposals are associated with curated event labels by genomic
+overlap; labels are not used when generating candidates for a new genome.*
 
 ## Input manifest
 
@@ -14,7 +20,7 @@ sample_A	/absolute/path/sample_A	/absolute/path/sample_A.severus.vcf
 ```
 
 `wakhan_root` is the prefix associated with the paired haplotype BEDs and the
-Wakhan integer-CNA VCF. See the root README for accepted forms.
+Wakhan integer-CNA VCF.
 
 ## Run
 

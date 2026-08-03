@@ -1,0 +1,5 @@
+label	threshold	scale	region_mode	nms_mode	maximum_per_sample	selection_source	n_cv_folds
+ecDNA	0.5045630931854248	0.67	representative	none	2	median_or_mode_of_inner_validation_selected_CV_values	37
+chromothripsis	0.6546570658683777	0.67	representative	none	2	median_or_mode_of_inner_validation_selected_CV_values	37
+BFB	0.4733799397945404	1.0	representative	none	2	median_or_mode_of_inner_validation_selected_CV_values	37
+seismic_amplification	0.7821382284164429	0.67	representative	none	2	median_or_mode_of_inner_validation_selected_CV_values	37
