@@ -24,9 +24,9 @@ are ignored. Coordinates must use GRCh38.
 
 These source TSVs are curated caller outputs:
 
-- BFB/BFB-like events: BFBArchitect;
-- chromothripsis and seismic amplification: ShatterSeek-derived criteria;
-- ecDNA: CoRAL circular-amplicon calls.
+- BFB and BFB-like events: [BFBArchitect](https://github.com/AmpliconSuite/BFBArchitect);
+- chromothripsis and seismic amplification: [ShatterSeek](https://github.com/parklab/ShatterSeek)-derived criteria;
+- ecDNA: [CoRAL](https://github.com/AmpliconSuite/CoRAL) circular-amplicon calls.
 
 Caller installation and execution are upstream prerequisites. Because these
 tools have independent environments and versioning, this repository begins at

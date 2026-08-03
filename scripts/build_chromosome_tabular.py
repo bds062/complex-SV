@@ -12,10 +12,10 @@ import pandas as pd
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from data.severus_parser import parse_severus  # noqa: E402
-from data.wakhan_parser import parse_wakhan  # noqa: E402
+from genomic_features.severus_parser import parse_severus  # noqa: E402
+from genomic_features.wakhan_parser import parse_wakhan  # noqa: E402
 
-from data.chromosome_features import summarize  # noqa: E402
+from genomic_features.chromosome_features import summarize  # noqa: E402
 
 
 def main() -> None:

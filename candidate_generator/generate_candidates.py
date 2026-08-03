@@ -23,7 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO = SCRIPT_DIR.parent
 sys.path.insert(0, str(REPO))
 
-from data.candidate_features import (  # noqa: E402
+from genomic_features.candidate_features import (  # noqa: E402
     _chrom_arm,
     _split_interval_by_arm,
     _summarize_candidate_intervals,
@@ -521,7 +521,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--output_dir", type=Path, required=True)
-    parser.add_argument("--centromeres", type=Path, default=REPO / "data/grch38.cen_coord.curated.bed")
+    parser.add_argument("--centromeres", type=Path, default=REPO / "genomic_features/grch38.cen_coord.curated.bed")
     parser.add_argument("--max_small_segment_size", type=int, default=5_000_000)
     parser.add_argument("--min_small_run_segments", type=int, default=2)
     parser.add_argument("--high_copy_ratio", type=float, default=2.0)

@@ -60,6 +60,6 @@ not the localization model's classification threshold.
 - `candidate_generator_summary.json`: parameters and proposal counts;
 - `failed_samples.csv`: present only with failures under `--keep_going`.
 
-The coordinates are consumed directly by `workflow/04_embed_candidates.sh`.
+The coordinates are consumed directly by `scripts/04_embed_candidates.sh`.
 All defaults are versioned in `generate_candidates.py`; advanced values are
 listed by `python candidate_generator/generate_candidates.py --help`.

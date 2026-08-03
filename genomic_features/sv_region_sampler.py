@@ -21,7 +21,7 @@ try:
     from torch_geometric.data import HeteroData
 except ImportError as exc:  # pragma: no cover - dependency message only
     raise ImportError(
-        "torch-geometric is required for complex_sv.data.sv_region_sampler. "
+        "torch-geometric is required for complex_sv.genomic_features.sv_region_sampler. "
         "Install a PyG build matching your PyTorch version."
     ) from exc
 

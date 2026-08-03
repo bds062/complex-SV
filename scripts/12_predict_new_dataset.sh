@@ -18,13 +18,13 @@ mkdir -p "$output_dir"
 "$repo_dir/candidate_generator/run.sh" \
     "$manifest" "$output_dir/candidates" --profile "$profile" --keep_going
 
-"$repo_dir/workflow/04_embed_candidates.sh" \
+"$repo_dir/scripts/04_embed_candidates.sh" \
     "$manifest" \
     "$output_dir/candidates/merged_candidate_regions.csv" \
     "$output_dir/localization_features" \
     --device "$device"
 
-"$python_bin" "$repo_dir/workflow/10_predict_localization.py" \
+"$python_bin" "$repo_dir/scripts/10_predict_localization.py" \
     --candidates "$output_dir/candidates/merged_candidate_regions.csv" \
     --embedding-bundle "$output_dir/localization_features/embeddings.npz" \
     --selected-embeddings "$output_dir/localization_features/selected_embedding_features.npz" \
@@ -32,10 +32,10 @@ mkdir -p "$output_dir"
     --output "$output_dir/localized_calls" \
     --device "$device"
 
-"$repo_dir/workflow/07_embed_chromosomes.sh" \
+"$repo_dir/scripts/07_embed_chromosomes.sh" \
     "$manifest" "$output_dir/chromosome_features" --device "$device"
 
-"$python_bin" "$repo_dir/workflow/11_predict_chromosomes.py" \
+"$python_bin" "$repo_dir/scripts/11_predict_chromosomes.py" \
     --embedding-dir "$output_dir/chromosome_features/embeddings" \
     --tabular "$output_dir/chromosome_features/chromosome_tabular.tsv" \
     --output "$output_dir/chromosome_calls" \

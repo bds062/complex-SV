@@ -29,7 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from discovery import embed_corpus
+from genomic_features import embedding
 from training.train_classifier_head import enforce_candidate_resolution, load_embedding_table
 from utils import set_seed
 
@@ -644,7 +644,7 @@ def run(args: argparse.Namespace) -> None:
     compatibility_loo = loso_to_leave_one_out(cv_annotated, class_names)
     compatibility_loo.to_csv(out_dir / "anchor_leave_one_out.tsv", sep="\t", index=False)
     classifier_distance_tau = 1.0 - float(selected_objectness_tau)
-    embed_corpus.write_visualizations(embeddings, metadata, compatibility_distances, compatibility_loo, out_dir, tau=classifier_distance_tau)
+    embedding.write_visualizations(embeddings, metadata, compatibility_distances, compatibility_loo, out_dir, tau=classifier_distance_tau)
 
     torch.save(
         {

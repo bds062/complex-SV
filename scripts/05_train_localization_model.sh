@@ -19,7 +19,7 @@ candidates="$1"; labels="$2"; embedding_bundle="$3"; selected="$4"
 tabular="$5"; test_sample="$6"; output_dir="$7"
 shift 7
 
-exec "$python_bin" "$repo_dir/workflow/train_localization_loo.py" \
+exec "$python_bin" "$repo_dir/scripts/train_localization_loo.py" \
     --candidates "$candidates" \
     --labels "$labels" \
     --embedding-bundle "$embedding_bundle" \

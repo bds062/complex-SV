@@ -30,18 +30,18 @@ except ImportError:  # pragma: no cover
     Batch = None  # type: ignore
 
 from config import CNEncoderConfig, GraphEncoderConfig
-from data.anchor_manifest import canonical_sample_id
-from data.cn_resampler import CN_CHANNELS, get_arm_bounds, region_to_tensor
-from data.graph_builder import build_sample_graph
-from data.region_proposal import (
+from genomic_features.anchor_manifest import canonical_sample_id
+from genomic_features.cn_resampler import CN_CHANNELS, get_arm_bounds, region_to_tensor
+from genomic_features.graph_builder import build_sample_graph
+from genomic_features.region_proposal import (
     candidates_to_frame,
     label_rows_to_candidates,
     merge_candidates,
     propose_cn_candidates,
 )
-from data.severus_parser import N_CONT, build_node_features, parse_severus
-from data.wakhan_parser import parse_wakhan
-from model.prototypes import PrototypeCache
+from genomic_features.severus_parser import N_CONT, build_node_features, parse_severus
+from genomic_features.wakhan_parser import parse_wakhan
+from architectures.prototypes import PrototypeCache
 from pretrain.cn_encoder import CNMaskedAutoencoder
 from pretrain.graph_encoder import SVGraphMAE
 from utils import get_device, l2_normalize, torch_load_checkpoint

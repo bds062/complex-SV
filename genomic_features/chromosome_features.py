@@ -81,7 +81,7 @@ def assemble_model_inputs(
     tabular_path: str | Path,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """Assemble the 1,254-dimensional whole-chromosome model input."""
-    from model.chromosome import SAFE_FEATURES, canonical_chrom
+    from architectures.chromosome import SAFE_FEATURES, canonical_chrom
 
     embedding_dir = Path(embedding_dir)
     bundle = np.load(embedding_dir / "embeddings.npz", allow_pickle=True)

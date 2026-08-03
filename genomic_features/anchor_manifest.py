@@ -28,7 +28,7 @@ import pandas as pd
 try:
     from .severus_parser import infer_sample_id_from_vcf
     from .wakhan_parser import parse_wakhan, resolve_wakhan_bed_root
-except ImportError:  # Support direct execution as python data/anchor_manifest.py.
+except ImportError:  # Support direct execution as python genomic_features/anchor_manifest.py.
     from severus_parser import infer_sample_id_from_vcf  # type: ignore
     from wakhan_parser import parse_wakhan, resolve_wakhan_bed_root  # type: ignore
 

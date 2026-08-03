@@ -2,7 +2,7 @@
 Stage 2b heterogeneous graph Transformer encoder and graph MAE.
 
 This module contains model definitions only.  Graph construction and parsing
-live in complex_sv.data.*.
+live in complex_sv.genomic_features.*.
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ except ImportError as exc:  # pragma: no cover - dependency message only
 
 try:
     from config import GraphEncoderConfig
-    from data.graph_builder import EDGE_ATTR_DIM, EDGE_TYPES
-    from data.severus_parser import N_FEAT
+    from genomic_features.graph_builder import EDGE_ATTR_DIM, EDGE_TYPES
+    from genomic_features.severus_parser import N_FEAT
 except ImportError:  # Allows direct local imports during early development.
     GraphEncoderConfig = Any  # type: ignore[misc,assignment]
     EDGE_PROXIMITY = ("sv", "proximal_to", "sv")

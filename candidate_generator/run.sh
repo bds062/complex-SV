@@ -15,5 +15,5 @@ shift 2
 exec "$python_bin" "$repo_dir/candidate_generator/generate_candidates.py" \
     "$manifest" \
     --output_dir "$output_dir" \
-    --centromeres "$repo_dir/data/grch38.cen_coord.curated.bed" \
+    --centromeres "$repo_dir/genomic_features/grch38.cen_coord.curated.bed" \
     "$@"

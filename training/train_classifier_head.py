@@ -28,8 +28,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from discovery import embed_corpus
-from model.heads import ComplexSVClassifierHead
+from genomic_features import embedding
+from architectures.heads import ComplexSVClassifierHead
 from training.losses import complex_sv_objectness_type_loss
 from utils import set_seed
 
@@ -742,7 +742,7 @@ def run(args: argparse.Namespace) -> None:
     compatibility_loo.to_csv(out_dir / "anchor_leave_one_out.tsv", sep="\t", index=False)
     # Legacy visualization helpers expect lower-is-better distance tau.
     classifier_distance_tau = 1.0 - float(selected_tau)
-    embed_corpus.write_visualizations(
+    embedding.write_visualizations(
         embeddings,
         metadata,
         compatibility_distances,

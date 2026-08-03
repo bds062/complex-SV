@@ -29,7 +29,7 @@ printf 'sample_id\twakhan_root\tseverus_vcf\n%s\t%s\t%s\n' \
     "$SAMPLE_ID" "$WAKHAN_ROOT" "$SEVERUS_VCF" > "$manifest"
 
 echo "[1/3] Checking the installation and packaged checkpoints"
-"$python_bin" "$repo_dir/workflow/00_check_install.py"
+"$python_bin" "$repo_dir/scripts/00_check_install.py"
 
 echo "[2/3] Rebuilding normalized labels"
 "$python_bin" "$repo_dir/label_generator/generate_labels.py" \
@@ -49,14 +49,14 @@ if [[ "$mode" == "quick" ]]; then
 fi
 
 echo "[4/7] Embedding localized candidates"
-"$repo_dir/workflow/04_embed_candidates.sh" \
+"$repo_dir/scripts/04_embed_candidates.sh" \
     "$manifest" \
     "$TEST_OUTPUT_DIR/candidates/merged_candidate_regions.csv" \
     "$TEST_OUTPUT_DIR/localization_features" \
     --device "${TEST_DEVICE:-cpu}"
 
 echo "[5/7] Applying the all-48 localization model"
-"$python_bin" "$repo_dir/workflow/10_predict_localization.py" \
+"$python_bin" "$repo_dir/scripts/10_predict_localization.py" \
     --candidates "$TEST_OUTPUT_DIR/candidates/merged_candidate_regions.csv" \
     --embedding-bundle "$TEST_OUTPUT_DIR/localization_features/embeddings.npz" \
     --selected-embeddings "$TEST_OUTPUT_DIR/localization_features/selected_embedding_features.npz" \
@@ -65,13 +65,13 @@ echo "[5/7] Applying the all-48 localization model"
     --device "${TEST_DEVICE:-cpu}"
 
 echo "[6/7] Embedding chromosomes"
-"$repo_dir/workflow/07_embed_chromosomes.sh" \
+"$repo_dir/scripts/07_embed_chromosomes.sh" \
     "$manifest" \
     "$TEST_OUTPUT_DIR/chromosome_features" \
     --device "${TEST_DEVICE:-cpu}"
 
 echo "[7/7] Applying the all-48 chromosome model"
-"$python_bin" "$repo_dir/workflow/11_predict_chromosomes.py" \
+"$python_bin" "$repo_dir/scripts/11_predict_chromosomes.py" \
     --embedding-dir "$TEST_OUTPUT_DIR/chromosome_features/embeddings" \
     --tabular "$TEST_OUTPUT_DIR/chromosome_features/chromosome_tabular.tsv" \
     --output "$TEST_OUTPUT_DIR/chromosome_predictions" \

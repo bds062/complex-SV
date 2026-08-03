@@ -8,7 +8,7 @@ fusion-time SVModel components, and post-pretraining visualization scripts.
 Input convention
 ----------------
 Copy-number tensors use shape [B, n_bins, n_cn_channels]. The channel order is
-provided by data.cn_resampler.CN_CHANNELS.
+provided by genomic_features.cn_resampler.CN_CHANNELS.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ except ImportError:  # Allows direct local imports during early development.
     CNEncoderConfig = Any  # type: ignore[misc,assignment]
 
 try:
-    from data.cn_resampler import CN_CHANNELS
+    from genomic_features.cn_resampler import CN_CHANNELS
 except ImportError:  # Keeps this module importable during isolated prototyping.
     CN_CHANNELS = [
         "cn_total",

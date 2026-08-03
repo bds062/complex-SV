@@ -14,7 +14,7 @@ this parser reads:
 Rows may also point directly at either HP BED file; the sibling HP file is then
 resolved automatically. VCF input is intentionally unsupported.
 
-The public output schema is consumed by complex_sv.data.cn_resampler:
+The public output schema is consumed by complex_sv.genomic_features.cn_resampler:
 
     sample_id, chrom, start, end, cn_total, cn_hp1, cn_hp2,
     log_coverage_total, coverage_hp1_fraction, coverage_hp2_fraction,

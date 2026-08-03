@@ -37,8 +37,8 @@ except ImportError as exc:  # pragma: no cover - dependency message only
 
 try:
     from config import GraphEncoderConfig
-    from data.severus_parser import BINARY_COLS, CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
-    from data.sv_region_sampler import GRAPH_AUX_TARGET_NAMES, build_region_graphs, build_sv_bp_windows, window_metadata_frame
+    from genomic_features.severus_parser import BINARY_COLS, CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
+    from genomic_features.sv_region_sampler import GRAPH_AUX_TARGET_NAMES, build_region_graphs, build_sv_bp_windows, window_metadata_frame
     from pretrain.graph_encoder import SVGraphMAE
     from utils import get_device, l2_normalize, save_checkpoint, set_seed, setup_logging
 except ImportError:
@@ -47,8 +47,8 @@ except ImportError:
         sys.path.insert(0, str(ROOT))
 
     from config import GraphEncoderConfig
-    from data.severus_parser import BINARY_COLS, CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
-    from data.sv_region_sampler import GRAPH_AUX_TARGET_NAMES, build_region_graphs, build_sv_bp_windows, window_metadata_frame
+    from genomic_features.severus_parser import BINARY_COLS, CONTINUOUS_COLS, N_CONT, N_FEAT, build_node_features, parse_all_severus
+    from genomic_features.sv_region_sampler import GRAPH_AUX_TARGET_NAMES, build_region_graphs, build_sv_bp_windows, window_metadata_frame
     from pretrain.graph_encoder import SVGraphMAE
     from utils import get_device, l2_normalize, save_checkpoint, set_seed, setup_logging
 

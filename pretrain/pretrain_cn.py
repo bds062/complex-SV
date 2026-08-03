@@ -37,8 +37,8 @@ from tqdm import tqdm
 
 try:
     from config import CNEncoderConfig
-    from data.cn_resampler import CN_CHANNELS, build_bp_window_tensors
-    from data.wakhan_parser import parse_all_wakhan
+    from genomic_features.cn_resampler import CN_CHANNELS, build_bp_window_tensors
+    from genomic_features.wakhan_parser import parse_all_wakhan
     from utils import get_device, save_checkpoint, set_seed, setup_logging
     from pretrain.cn_encoder import CNMaskedAutoencoder
 except ImportError:
@@ -47,8 +47,8 @@ except ImportError:
         sys.path.insert(0, str(ROOT))
 
     from config import CNEncoderConfig
-    from data.cn_resampler import CN_CHANNELS, build_bp_window_tensors
-    from data.wakhan_parser import parse_all_wakhan
+    from genomic_features.cn_resampler import CN_CHANNELS, build_bp_window_tensors
+    from genomic_features.wakhan_parser import parse_all_wakhan
     from utils import get_device, save_checkpoint, set_seed, setup_logging
     from pretrain.cn_encoder import CNMaskedAutoencoder
 

@@ -15,8 +15,8 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from model import localization as model_code  # noqa: E402
-from model import event_decoder as event_code  # noqa: E402
+from architectures import localization as model_code  # noqa: E402
+from architectures import event_decoder as event_code  # noqa: E402
 
 
 def main() -> None:

@@ -29,9 +29,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from discovery import embed_corpus
-from data.anchor_manifest import canonical_sample_id
-from data.cn_resampler import get_arm_bounds
+from genomic_features import embedding
+from genomic_features.anchor_manifest import canonical_sample_id
+from genomic_features.cn_resampler import get_arm_bounds
 from training.train_multilabel_classifier_head import (
     _class_counts,
     _hidden_dims,
@@ -559,7 +559,7 @@ def _candidate_dict(row: pd.Series) -> dict[str, Any]:
     }
 
 
-def _chrom_segments(bundle: embed_corpus.SampleBundle, chrom: object) -> pd.DataFrame:
+def _chrom_segments(bundle: embedding.SampleBundle, chrom: object) -> pd.DataFrame:
     df = bundle.wakhan_df
     if df.empty:
         return pd.DataFrame()
@@ -567,7 +567,7 @@ def _chrom_segments(bundle: embed_corpus.SampleBundle, chrom: object) -> pd.Data
     return df.loc[mask].copy()
 
 
-def _context_interval(bundle: embed_corpus.SampleBundle, chrom: str, arm: str) -> tuple[str, int, int]:
+def _context_interval(bundle: embedding.SampleBundle, chrom: str, arm: str) -> tuple[str, int, int]:
     chrom_df = _chrom_segments(bundle, chrom)
     if chrom_df.empty:
         return "candidate", 0, 0
@@ -711,7 +711,7 @@ def select_embedding_features(
     output_dir.mkdir(parents=True, exist_ok=True)
     np.savez(output_dir / "selected_embedding_features.npz", embeddings=selected.astype(np.float32), embedding_features=selected_mode)
     (output_dir / "embedding_features.txt").write_text(f"{selected_mode}\n", encoding="utf-8")
-    embed_corpus.write_embedding_outputs(selected, metadata, output_dir)
+    embedding.write_embedding_outputs(selected, metadata, output_dir)
     return selected.astype(np.float32), metadata, selected_mode
 
 
@@ -726,9 +726,9 @@ def embed_candidate_table(
     strict: bool,
     device: torch.device,
 ) -> tuple[np.ndarray, pd.DataFrame]:
-    cn_model, cn_cfg = embed_corpus.load_cn_encoder(cn_checkpoint, device=device, strict=strict)
-    graph_model, graph_cfg, graph_scaler = embed_corpus.load_graph_encoder(graph_checkpoint, device=device, strict=strict)
-    bundles = embed_corpus.load_sample_bundles(manifest, graph_cfg=graph_cfg, graph_scaler=graph_scaler)
+    cn_model, cn_cfg = embedding.load_cn_encoder(cn_checkpoint, device=device, strict=strict)
+    graph_model, graph_cfg, graph_scaler = embedding.load_graph_encoder(graph_checkpoint, device=device, strict=strict)
+    bundles = embedding.load_sample_bundles(manifest, graph_cfg=graph_cfg, graph_scaler=graph_scaler)
 
     local_embeddings: list[np.ndarray] = []
     final_embeddings: list[np.ndarray] = []
@@ -745,7 +745,7 @@ def embed_candidate_table(
         if sample_id not in bundles:
             raise KeyError(f"Candidate {candidate['candidate_id']} references sample_id={sample_id}, absent from manifest")
         bundle = bundles[sample_id]
-        local_embedding, meta = embed_corpus.embed_candidate(candidate, bundle, cn_model, cn_cfg, graph_model, device)
+        local_embedding, meta = embedding.embed_candidate(candidate, bundle, cn_model, cn_cfg, graph_model, device)
 
         context_scope, context_start, context_end = _context_interval(bundle, str(candidate["chrom"]), str(candidate.get("arm", "")))
         if context_start == 0 and context_end == 0:
@@ -764,7 +764,7 @@ def embed_candidate_table(
         }
         cache_key = (sample_id, str(candidate["chrom"]), context_scope, int(context_start), int(context_end))
         if cache_key not in context_cache:
-            context_embedding, _context_meta = embed_corpus.embed_candidate(
+            context_embedding, _context_meta = embedding.embed_candidate(
                 context_candidate,
                 bundle,
                 cn_model,
@@ -830,15 +830,15 @@ def embed_candidate_table(
     output_dir.mkdir(parents=True, exist_ok=True)
     candidates_df.to_csv(output_dir / "candidate_regions_from_csv.tsv", sep="\t", index=False)
     np.savez(output_dir / "local_region_embeddings_raw.npz", embeddings=raw_local)
-    embed_corpus.write_raw_embedding_outputs(raw_final, metadata, output_dir)
-    embeddings = embed_corpus.apply_embedding_normalization(
+    embedding.write_raw_embedding_outputs(raw_final, metadata, output_dir)
+    embeddings = embedding.apply_embedding_normalization(
         raw_final,
         metadata,
         mode=embedding_normalization,
         output_dir=output_dir,
         min_background=int(sample_baseline_min_candidates),
     )
-    embed_corpus.write_embedding_outputs(embeddings, metadata, output_dir)
+    embedding.write_embedding_outputs(embeddings, metadata, output_dir)
     return embeddings, metadata
 
 
@@ -1990,7 +1990,7 @@ def run(args: argparse.Namespace) -> None:
     if not class_names:
         raise ValueError("--class_names must include at least one class")
 
-    manifest = embed_corpus.read_manifest(args.manifest)
+    manifest = embedding.read_manifest(args.manifest)
     candidates_df = read_candidate_regions(args.candidate_regions, class_names, allow_unlabeled=bool(args.unlabeled_candidates))
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     log.info("Using device=%s; candidates=%d classes=%s", device, len(candidates_df), class_names)
@@ -2429,7 +2429,7 @@ def run(args: argparse.Namespace) -> None:
     compatibility_distances = predictions_to_distance_table(predictions, class_names)
     compatibility_distances.to_csv(output_dir / "prototype_distances.tsv", sep="\t", index=False)
     try:
-        embed_corpus.write_visualizations(
+        embedding.write_visualizations(
             embeddings,
             metadata,
             compatibility_distances,
@@ -2538,7 +2538,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--embeddings_only", action="store_true", help="Prepare embeddings and tabular features, then stop before model training.")
     parser.add_argument("--unlabeled_candidates", action="store_true", help="Allow candidate tables without class columns for embedding-only deployment inference.")
     parser.add_argument("--embedding_features", choices=("full", "coords"), default="full", help="Embedding feature subset for the model branch: full 1214D local/context/diff/coords or coords-only 8D.")
-    parser.add_argument("--embedding_normalization", choices=embed_corpus.EMBEDDING_NORMALIZATION_CHOICES, default="sample_residual")
+    parser.add_argument("--embedding_normalization", choices=embedding.EMBEDDING_NORMALIZATION_CHOICES, default="sample_residual")
     parser.add_argument("--sample_baseline_min_candidates", type=int, default=3)
     parser.add_argument("--hidden_dims", default="128")
     parser.add_argument("--tabular_features", default="safe", help="Tabular candidate CSV features to use: safe, off, or comma-separated column names.")

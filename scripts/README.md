@@ -1,4 +1,4 @@
-# Numbered workflow
+# Command-line scripts
 
 Run commands from the repository root. Set `PYTHON_BIN` when the desired
 interpreter is not named `python`.

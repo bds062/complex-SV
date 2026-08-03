@@ -16,7 +16,7 @@ python_bin="${PYTHON_BIN:-python}"
 embedding_dir="$1"; tabular="$2"; labels="$3"; test_sample="$4"; output="$5"
 shift 5
 
-exec "$python_bin" "$repo_dir/workflow/train_chromosome_loo.py" \
+exec "$python_bin" "$repo_dir/scripts/train_chromosome_loo.py" \
     --embedding-dir "$embedding_dir" \
     --tabular "$tabular" \
     --labels "$labels" \

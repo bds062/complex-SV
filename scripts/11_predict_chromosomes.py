@@ -14,8 +14,8 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-from data.chromosome_features import assemble_model_inputs  # noqa: E402
-from model.chromosome import CLASSES, ChromosomeModel  # noqa: E402
+from genomic_features.chromosome_features import assemble_model_inputs  # noqa: E402
+from architectures.chromosome import CLASSES, ChromosomeModel  # noqa: E402
 
 
 def main() -> None:

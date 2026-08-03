@@ -11,12 +11,12 @@ models, and the cross-validation components used for the reported benchmarks.
 | `localization_loo/` | Genome-held-out localization scorers and decoder calibrations used for evaluation |
 | `chromosome_fivefold/` | Five chromosome-level classifiers used for evaluation |
 
-Use `workflow/10_predict_localization.py` and
-`workflow/11_predict_chromosomes.py` to apply the all-48 checkpoints directly,
-or `workflow/12_predict_new_dataset.sh` to run both paths from a new manifest.
+Use `scripts/10_predict_localization.py` and
+`scripts/11_predict_chromosomes.py` to apply the all-48 checkpoints directly,
+or `scripts/12_predict_new_dataset.sh` to run both paths from a new manifest.
 The all-48 models are final fits and do not provide an independent performance
 estimate; use the held-out results in `benchmarks/` for that purpose. The
-localization fit is reproducible with `workflow/train_localization_all.py`; it
+localization fit is reproducible with `scripts/train_localization_all.py`; it
 requires the original feature files, labels, and completed held-out run
 directories.
 

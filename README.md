@@ -1,5 +1,7 @@
 # complex-SV
 
+> **Status:** This tool is still in progress. Only 48 cell lines were used for training, and we hope to expand this set and the tool's capabilities to short read callers soon. Please reach out to bds062@umd.edu for any questions, comments, or concerns.
+
 A research pipeline for detecting complex structural-variant events from
 [Wakhan](https://github.com/KolmogorovLab/Wakhan) copy-number alterations and
 [Severus](https://github.com/KolmogorovLab/Severus) structural-variant calls.
@@ -13,14 +15,12 @@ The repository supports two related tasks:
   anywhere on each chromosome. This model is multilabel and does not localize
   an event.
 
-The numbered commands in [`workflow/`](workflow/) are the supported model entry
+The numbered scripts in [`scripts/`](scripts/) are the supported model entry
 points. The upstream [label generator](label_generator/README.md),
 [candidate generator](candidate_generator/README.md), and replaceable
 [integration-test configuration](test/README.md) are documented separately.
 Held-out predictions, aggregate metrics, labels, and primary figures are
 provided in [`benchmarks/`](benchmarks/).
-
-> **Status:** This tool is still in progress. Only 48 cell lines were used for training, and we hope to expand this set and the tool's capabilities to short read callers soon. Please reach out to bds062@umd.edu for any questions, comments, or concerns.
 
 [View the project poster (PDF)](Complex_SV_Poster_2026.pdf)
 
@@ -57,7 +57,7 @@ cd complex-SV
 
 conda env create --file environment.yml
 conda activate complex-SV
-python workflow/00_check_install.py
+python scripts/00_check_install.py
 ```
 
 The same environment can be reused for Severus and complex-SV:
@@ -65,7 +65,7 @@ The same environment can be reused for Severus and complex-SV:
 ```bash
 conda env update --name severus_env --file environment.yml
 conda activate severus_env
-python workflow/00_check_install.py
+python scripts/00_check_install.py
 severus --help
 ```
 
@@ -82,7 +82,7 @@ If necessary, replace PyTorch with the wheel that matches the cluster CUDA
 runtime.
 
 The project is currently designed for GRCh38. Candidate generation uses the
-bundled [centromere coordinates](data/grch38.cen_coord.curated.bed).
+bundled [centromere coordinates](genomic_features/grch38.cen_coord.curated.bed).
 
 ## 2. Input files
 
@@ -115,7 +115,7 @@ chromosome model trained with all 48 genomes. Apply both to a new
 manifest with one command:
 
 ```bash
-workflow/12_predict_new_dataset.sh \
+scripts/12_predict_new_dataset.sh \
   inputs/new_manifest.tsv \
   outputs/new_dataset \
   cuda
@@ -157,7 +157,7 @@ Create a text file containing one Wakhan root per line:
 Then run:
 
 ```bash
-workflow/01_pretrain_cn_encoder.sh \
+scripts/01_pretrain_cn_encoder.sh \
   inputs/wakhan_roots.txt \
   outputs/pretraining/cn \
   --epochs 100 \
@@ -182,7 +182,7 @@ Create a text file containing one Severus VCF per line:
 Then run:
 
 ```bash
-workflow/02_pretrain_sv_encoder.sh \
+scripts/02_pretrain_sv_encoder.sh \
   inputs/severus_vcfs.txt \
   outputs/pretraining/sv \
   --epochs 100 \
@@ -226,7 +226,7 @@ and false-positive burden.
 ### 4.2 Embed candidates
 
 ```bash
-workflow/04_embed_candidates.sh \
+scripts/04_embed_candidates.sh \
   inputs/manifest.tsv \
   outputs/localized/candidates/merged_candidate_regions.csv \
   outputs/localized/features \
@@ -240,7 +240,7 @@ tabular features.
 ### 4.3 Apply the all-48 checkpoint
 
 ```bash
-python workflow/10_predict_localization.py \
+python scripts/10_predict_localization.py \
   --candidates outputs/localized/candidates/merged_candidate_regions.csv \
   --embedding-bundle outputs/localized/features/embeddings.npz \
   --selected-embeddings outputs/localized/features/selected_embedding_features.npz \
@@ -279,7 +279,7 @@ cohort. Then reproduce the selected event-bag MIL and frozen-decoder
 cross-validation:
 
 ```bash
-workflow/05_train_localization_model.sh \
+scripts/05_train_localization_model.sh \
   outputs/train/candidates/merged_candidate_regions.csv \
   inputs/training_labels.tsv \
   outputs/train/features/embeddings.npz \
@@ -312,7 +312,7 @@ After every held-out run completes, fit one deployment model without reusing
 training labels for early stopping or decoder calibration:
 
 ```bash
-python workflow/train_localization_all.py \
+python scripts/train_localization_all.py \
   --candidates outputs/train/candidates/merged_candidate_regions.csv \
   --labels inputs/training_labels.tsv \
   --embedding-bundle outputs/train/features/embeddings.npz \
@@ -335,7 +335,7 @@ generation, localization, geometry adjustment, and NMS.
 ### 6.1 Prepare one representation per chromosome
 
 ```bash
-workflow/07_embed_chromosomes.sh \
+scripts/07_embed_chromosomes.sh \
   inputs/manifest.tsv \
   outputs/chromosome
 ```
@@ -343,7 +343,7 @@ workflow/07_embed_chromosomes.sh \
 ### 6.2 Apply the all-48 checkpoint
 
 ```bash
-python workflow/11_predict_chromosomes.py \
+python scripts/11_predict_chromosomes.py \
   --embedding-dir outputs/chromosome/embeddings \
   --tabular outputs/chromosome/chromosome_tabular.tsv \
   --output outputs/chromosome/predictions \
@@ -365,7 +365,7 @@ After step 07, provide a label table with columns `sample_id`, `chrom`, and
 `label`. Run one independent job per labeled test genome:
 
 ```bash
-workflow/08_train_chromosome_model.sh \
+scripts/08_train_chromosome_model.sh \
   outputs/chromosome/embeddings \
   outputs/chromosome/chromosome_tabular.tsv \
   inputs/chromosome_labels.tsv \
@@ -382,24 +382,23 @@ launched as a Slurm array.
 
 ## 8. Repository layout
 
-The `data/`, `discovery/`, and `model/` packages are all active parts of the
-supported pipeline. `data/` parses caller output and constructs base features;
-`discovery/` extracts candidate and chromosome representations; and `model/`
-defines the neural heads used by training and inference.
+The `genomic_features/` and `architectures/` packages implement the core
+method. `genomic_features/` parses caller output, constructs genomic features,
+and applies the frozen featurizers to candidate regions and chromosomes.
+`architectures/` defines the supervised prediction heads and event decoder.
 
 ```text
 benchmarks/     labels, held-out predictions, metrics, and primary figures
 candidate_generator/ label-free Wakhan/Severus proposal pipeline
 configs/        versioned method configuration
-data/           Wakhan/Severus parsing and feature construction
+genomic_features/ Wakhan/Severus parsing and genomic feature construction
 docs/figures/   publication diagrams embedded in the documentation
-discovery/      candidate and chromosome embedding extraction
 label_generator/ curated caller TSV normalization and provenance
 manifest/       publication cohort manifest and sample-discovery updater
-model/          localization, event-decoder, and chromosome architectures
+architectures/  localization, event-decoder, and chromosome architectures
 models/         frozen featurizers, final-fit models, and evaluation ensembles
 pretrain/       masked-autoencoder implementations and trainers
 test/           configurable single-genome integration tests
 training/       candidate feature preparation and shared loss functions
-workflow/       supported numbered training and inference commands
+scripts/       supported numbered training and inference commands
 ```

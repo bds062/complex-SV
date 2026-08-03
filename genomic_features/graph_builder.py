@@ -2,7 +2,7 @@
 Build PyTorch Geometric heterogeneous SV graphs from parsed Severus records.
 
 This module contains no model code.  It converts the canonical DataFrame and
-node-feature matrix produced by data.severus_parser into the
+node-feature matrix produced by genomic_features.severus_parser into the
 HeteroData objects consumed by the graph encoder and downstream region proposal.
 
 Every graph always contains the required edge types, even when an edge
@@ -24,7 +24,7 @@ try:
     from torch_geometric.data import HeteroData
 except ImportError as exc:  # pragma: no cover - dependency message only
     raise ImportError(
-        "torch-geometric is required for complex_sv.data.graph_builder. "
+        "torch-geometric is required for complex_sv.genomic_features.graph_builder. "
         "Install a PyG build matching your PyTorch version."
     ) from exc
 
