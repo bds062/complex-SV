@@ -13,48 +13,9 @@ import torch
 
 
 REPO = Path(__file__).resolve().parents[1]
-MODEL_CODE = REPO / "final-results/chromosome_model/code"
-sys.path.insert(0, str(MODEL_CODE))
-from chromosome_model import CLASSES, SAFE_FEATURES, ChromosomeModel, canonical_chrom  # noqa: E402
-
-
-def prepare_features(embedding_dir: Path, tabular_path: Path) -> tuple[np.ndarray, pd.DataFrame]:
-    bundle = np.load(embedding_dir / "embeddings.npz", allow_pickle=True)
-    base = np.asarray(bundle["embeddings"], dtype=np.float32)
-    meta = pd.read_csv(embedding_dir / "candidate_embeddings.tsv", sep="\t").fillna("")
-    if len(meta) != len(base) or base.shape[1] != 402:
-        raise ValueError(f"Expected matching metadata and 402D embeddings; got {len(meta)} rows and {base.shape}")
-    meta["chrom"] = meta["chrom"].map(canonical_chrom)
-    if meta.duplicated(["sample_id", "chrom"]).any():
-        raise ValueError("Expected exactly one embedding per sample/chromosome")
-
-    spans = (
-        pd.to_numeric(meta["end_bp"], errors="coerce").fillna(0).to_numpy()
-        - pd.to_numeric(meta["start_bp"], errors="coerce").fillna(0).to_numpy()
-    ).clip(min=1)
-    coordinates = np.column_stack([
-        np.zeros(len(meta)), np.ones(len(meta)), np.full(len(meta), 0.5), np.ones(len(meta)),
-        np.minimum(np.log1p(spans / 1_000_000.0) / 5.0, 1.0),
-        np.minimum(np.log1p(spans / 1_000_000.0) / 6.0, 1.0),
-        np.zeros(len(meta)), np.ones(len(meta)),
-    ]).astype(np.float32)
-    embedding_features = np.concatenate([base, base, np.zeros_like(base), coordinates], axis=1)
-
-    tabular = pd.read_csv(tabular_path, sep="\t").fillna(0)
-    tabular["chrom"] = tabular["chrom"].map(canonical_chrom)
-    tabular = tabular.set_index(["sample_id", "chrom"])
-    tabular_rows = []
-    for row in meta.itertuples(index=False):
-        values = tabular.loc[(str(row.sample_id), str(row.chrom))]
-        tabular_rows.append([float(pd.to_numeric(values.get(name, 0), errors="coerce") or 0) for name in SAFE_FEATURES])
-    x = np.concatenate([
-        embedding_features,
-        np.asarray(tabular_rows, dtype=np.float32),
-        np.zeros((len(meta), 3), dtype=np.float32),
-    ], axis=1)
-    if x.shape[1] != 1254:
-        raise ValueError(f"Expected 1,254 model inputs, found {x.shape[1]}")
-    return x, meta
+sys.path.insert(0, str(REPO))
+from data.chromosome_features import assemble_model_inputs  # noqa: E402
+from model.chromosome import CLASSES, ChromosomeModel  # noqa: E402
 
 
 def main() -> None:
@@ -63,7 +24,7 @@ def main() -> None:
     parser.add_argument("--tabular", required=True)
     parser.add_argument(
         "--checkpoint-dir",
-        default=str(REPO / "final-results/chromosome_model/models/fivefold"),
+        default=str(REPO / "models/chromosome_fivefold"),
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--minimum-vote-fraction", type=float, default=0.5)
@@ -71,7 +32,7 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
-    x, meta = prepare_features(Path(args.embedding_dir), Path(args.tabular))
+    x, meta = assemble_model_inputs(args.embedding_dir, args.tabular)
     checkpoints = sorted(Path(args.checkpoint_dir).glob("*.pt"))
     if not checkpoints:
         raise FileNotFoundError(f"No .pt checkpoints found under {args.checkpoint_dir}")

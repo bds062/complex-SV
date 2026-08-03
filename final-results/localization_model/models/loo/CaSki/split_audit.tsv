@@ -1,4 +1,0 @@
-test_sample	split	n_samples	n_events	ecDNA	chromothripsis	BFB	seismic_amplification
-CaSki	train	43	78	8	28	30	12
-CaSki	validation	4	26	5	6	10	5
-CaSki	test	1	4	0	2	2	0

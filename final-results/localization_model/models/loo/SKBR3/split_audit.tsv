@@ -1,4 +1,0 @@
-test_sample	split	n_samples	n_events	ecDNA	chromothripsis	BFB	seismic_amplification
-SKBR3	train	43	74	8	28	28	10
-SKBR3	validation	4	27	5	7	10	5
-SKBR3	test	1	7	0	1	4	2

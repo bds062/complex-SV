@@ -13,7 +13,7 @@ interpreter is not named `python`.
 | 05 | `05_train_localization_model.sh` | Train one localization LOO split |
 | 06 | `06_predict_localization_ensemble.py` | Apply shipped localization models |
 | 07 | `07_embed_chromosomes.sh` | Build whole-chromosome features |
-| 08 | `08_reproduce_chromosome_cv.sh` | Reproduce chromosome LOO/five-fold runs |
+| 08 | `08_train_chromosome_model.sh` | Train one chromosome LOO split |
 | 09 | `09_predict_chromosome_ensemble.py` | Apply shipped chromosome models |
 
 The [root manual](../README.md) defines input schemas, complete commands,

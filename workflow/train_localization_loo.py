@@ -14,10 +14,9 @@ import torch
 
 
 REPO = Path(__file__).resolve().parents[1]
-MODEL_CODE = REPO / "final-results/localization_model/code"
-sys.path.insert(0, str(MODEL_CODE))
-import candidate_bag_model as model_code  # noqa: E402
-import frozen_event_decoder as event_code  # noqa: E402
+sys.path.insert(0, str(REPO))
+from model import localization as model_code  # noqa: E402
+from model import event_decoder as event_code  # noqa: E402
 
 
 def main() -> None:
@@ -28,7 +27,7 @@ def main() -> None:
     parser.add_argument("--selected-embeddings", required=True)
     parser.add_argument("--tabular-features", required=True)
     parser.add_argument("--test-sample", required=True)
-    parser.add_argument("--config", default=str(MODEL_CODE / "config.json"))
+    parser.add_argument("--config", default=str(REPO / "configs/localization.json"))
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()

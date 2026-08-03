@@ -45,8 +45,8 @@ def main() -> None:
         expected = [
             args.repo / "models/pretrained/cn_encoder.pt",
             args.repo / "models/pretrained/sv_graph_encoder.pt",
-            args.repo / "final-results/localization_model/models/loo",
-            args.repo / "final-results/chromosome_model/models/fivefold",
+            args.repo / "models/localization_loo",
+            args.repo / "models/chromosome_fivefold",
         ]
         for path in expected:
             if path.exists():

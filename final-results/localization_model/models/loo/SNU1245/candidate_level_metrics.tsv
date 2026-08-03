@@ -1,4 +1,0 @@
-split	n_labels	n_predictions	true_predictions	localization_recall	classified_recall	classified_precision	classified_f1	classified_f2	test_sample
-train	81	295	75	0.9382716049382716	0.9259259259259259	0.2542372881355932	0.39893617021276595	0.6058158319870758	SNU1245
-validation	25	55	21	0.92	0.84	0.38181818181818183	0.5250000000000001	0.6774193548387097	SNU1245
-test	2	0	0	0.0	0.0	0.0	0.0	0.0	SNU1245

@@ -25,7 +25,7 @@ exec "$python_bin" "$repo_dir/workflow/train_localization_loo.py" \
     --embedding-bundle "$embedding_bundle" \
     --selected-embeddings "$selected" \
     --tabular-features "$tabular" \
-    --config "$repo_dir/final-results/localization_model/code/config.json" \
+    --config "$repo_dir/configs/localization.json" \
     --test-sample "$test_sample" \
     --output "$output_dir" \
     "$@"

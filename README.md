@@ -14,8 +14,8 @@ The repository supports two related tasks:
   an event.
 
 The numbered commands in [`workflow/`](workflow/) are the supported entry
-points. Research snapshots and result provenance remain in
-[`final-results/`](final-results/).
+points. Held-out predictions, aggregate metrics, labels, and primary figures
+are provided in [`benchmarks/`](benchmarks/).
 
 > **Status:** This is research software, not a clinical diagnostic. The
 > packaged supervised models were evaluated by genome-level cross-validation
@@ -44,9 +44,9 @@ F1 0.391, and F2 0.445 at overlap coefficient >= 0.5. The chromosome model
 reached precision 0.320, recall 0.545, F1 0.403, and F2 0.478. See the
 model-specific training notes for the full protocol:
 
-- [localization model](final-results/localization_model/TRAINING.md)
-- [chromosome model](final-results/chromosome_model/TRAINING.md)
-- [ensemble and false-positive analysis](final-results/ensemble_and_fp_analysis/README.md)
+- [localization model](benchmarks/localization/TRAINING.md)
+- [chromosome model](benchmarks/chromosome/TRAINING.md)
+- [chromosome-level ensemble](benchmarks/ensemble/README.md)
 
 ## 1. Installation
 
@@ -248,14 +248,11 @@ overlap coefficient >= 0.5 receive direct class supervision; partial overlaps
 receive continuous overlap-quality supervision. Hard-negative mining reduces
 damage from incomplete labels. Validation genomes select early stopping,
 class-specific thresholds, representative-versus-envelope geometry, centered
-boundary scale, containment NMS mode, and per-genome output caps. Test genomes
-never participate in fitting or
-calibration.
+boundary scale, containment NMS mode, and per-genome output caps. Test genomes never participate in fitting or calibration.
 
-The command writes OOF predictions, event matches, fold metrics, training
-histories, calibration sweeps, and one checkpoint per outer fold. Split only by
-genome; never place chromosomes from one genome into both training and test
-sets.
+Each run writes held-out predictions and matches, training history, decoder
+calibration and sweep tables, split membership, metrics, and one checkpoint.
+Aggregate only after all labeled test genomes finish. Split strictly by genome.
 
 ## 6. Use the shipped chromosome models
 
@@ -285,29 +282,26 @@ The output is multilabel: one chromosome may receive multiple classes.
 vote fractions; `predicted_complex_sv.tsv` contains calls passing the default
 majority-vote rule.
 
-## 7. Reproduce chromosome-model training
+## 7. Train the chromosome model
 
-The exact 48-genome prepared dataset and source labels are packaged with the
-final result snapshot. Reproduce one LOO run or one grouped five-fold run with:
+After step 07, provide a label table with columns `sample_id`, `chrom`, and
+`label`. Run one independent job per labeled test genome:
 
 ```bash
-workflow/08_reproduce_chromosome_cv.sh loo AU565 outputs/chromosome_cv/AU565
-workflow/08_reproduce_chromosome_cv.sh grouped5 0 outputs/chromosome_cv/fold_0
+workflow/08_train_chromosome_model.sh \
+  outputs/chromosome/embeddings \
+  outputs/chromosome/chromosome_tabular.tsv \
+  inputs/chromosome_labels.tsv \
+  AU565 \
+  outputs/chromosome_cv/AU565
 ```
 
 The model uses weighted multilabel BCE. Observed positives receive weight 1.0,
 missing classes on another labeled chromosome receive weight 0.25, and fully
 unlabeled chromosomes receive weight 0.10. Per-class F2 thresholds are selected
-on validation genomes. Run the independent LOO samples or five folds as a Slurm
-array when scaling the experiment; examples are retained under
-`final-results/chromosome_model/code/`.
-
-The packaged chromosome trainer is a provenance-locked reproduction entry
-point. To retrain on a different cohort, generate equivalent whole-chromosome
-embeddings, a `chromosome_tabular.tsv`, and a label table with
-`sample_id`, `chrom`, and `label`; then adapt the paths in the snapshot or
-promote that data loader into the public workflow. Do not silently reuse the
-packaged 48-genome labels for a new cohort.
+on validation genomes. Split by genome: chromosomes from a test genome must
+never occur in training or calibration. The independent LOO jobs can be
+launched as a Slurm array.
 
 ## 8. Which model should I use?
 
@@ -329,16 +323,17 @@ results, not external-cohort estimates.
 ## 9. Repository layout
 
 ```text
-data/                 Wakhan/Severus parsing and proposal utilities
-pretrain/             CN and SV masked-autoencoder implementations
-discovery/            region/chromosome embedding extraction
-training/             candidate classifier training and application
-workflow/             supported numbered commands
-models/pretrained/    shipped frozen CN and SV encoders
-final-results/        selected metrics, CV checkpoints, figures, and provenance
-docs/                 additional method documentation
+benchmarks/     labels, held-out predictions, metrics, and primary figures
+configs/        versioned method configuration
+data/           Wakhan/Severus parsing and feature construction
+discovery/      candidate and chromosome embedding extraction
+model/          localization, event-decoder, and chromosome architectures
+models/         pretrained encoders and supervised release ensembles
+pretrain/       masked-autoencoder implementations and trainers
+training/       candidate feature preparation and shared loss functions
+workflow/       supported numbered training and inference commands
 ```
 
 Large generated embeddings and run outputs are intentionally ignored by Git.
-Keep manifests, labels, configuration, aggregate metrics, and final checkpoints
-needed to reproduce a release.
+Only publication inputs, aggregate results, and reusable checkpoints belong in
+the repository.

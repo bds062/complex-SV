@@ -15,9 +15,7 @@ sys.path.insert(0, str(REPO))
 from data.severus_parser import parse_severus  # noqa: E402
 from data.wakhan_parser import parse_wakhan  # noqa: E402
 
-MODEL_CODE = REPO / "final-results/chromosome_model/code"
-sys.path.insert(0, str(MODEL_CODE))
-from build_chromosome_tabular import summarize  # noqa: E402
+from data.chromosome_features import summarize  # noqa: E402
 
 
 def main() -> None:

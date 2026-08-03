@@ -1,4 +1,0 @@
-split	n_labels	n_predictions	true_predictions	localization_recall	classified_recall	classified_precision	classified_f1	classified_f2	test_sample
-train	82	317	79	0.9634146341463414	0.9634146341463414	0.24921135646687698	0.39598997493734334	0.6124031007751938	MS751
-validation	25	60	22	0.92	0.88	0.36666666666666664	0.5176470588235295	0.6875	MS751
-test	1	10	0	0.0	0.0	0.0	0.0	0.0	MS751

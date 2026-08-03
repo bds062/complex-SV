@@ -13,10 +13,9 @@ import torch
 
 
 REPO = Path(__file__).resolve().parents[1]
-MODEL_CODE = REPO / "final-results/localization_model/code"
-sys.path.insert(0, str(MODEL_CODE))
-import candidate_bag_model as model_code  # noqa: E402
-import frozen_event_decoder as event_code  # noqa: E402
+sys.path.insert(0, str(REPO))
+from model import localization as model_code  # noqa: E402
+from model import event_decoder as event_code  # noqa: E402
 
 
 def main() -> None:
@@ -27,7 +26,7 @@ def main() -> None:
     parser.add_argument("--tabular-features", required=True, help="37D tabular_features.npz.")
     parser.add_argument(
         "--checkpoint-dir",
-        default=str(REPO / "final-results/localization_model/models/loo"),
+        default=str(REPO / "models/localization_loo"),
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--minimum-vote-fraction", type=float, default=0.5)

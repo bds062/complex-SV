@@ -1,2 +1,0 @@
-split	n_candidates	n_labeled	n_empty	tp	fp	fn	tn	objectness_precision	objectness_recall	objectness_f1	class_exact_match_labeled	class_any_match_labeled
-logo	336	237	99	221	49	16	50	0.8185185185185185	0.9324894514767933	0.8717948717948718	0.17721518987341772	0.8649789029535865

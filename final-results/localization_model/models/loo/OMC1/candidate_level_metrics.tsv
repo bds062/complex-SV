@@ -1,4 +1,0 @@
-split	n_labels	n_predictions	true_predictions	localization_recall	classified_recall	classified_precision	classified_f1	classified_f2	test_sample
-train	82	246	72	0.9024390243902439	0.8780487804878049	0.2926829268292683	0.43902439024390244	0.627177700348432	OMC1
-validation	25	36	18	0.72	0.72	0.5	0.5901639344262295	0.6617647058823529	OMC1
-test	1	1	0	0.0	0.0	0.0	0.0	0.0	OMC1

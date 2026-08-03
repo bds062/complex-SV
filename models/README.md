@@ -1,21 +1,21 @@
-# Packaged models
+# Model release
 
-`pretrained/` contains the frozen representation encoders used by the final
-experiments:
+The repository includes the frozen representation encoders and supervised
+cross-validation ensembles used in the reported experiments.
 
-- `cn_encoder.pt`: masked copy-number autoencoder trained on Wakhan haplotype
-  segment windows;
-- `sv_graph_encoder.pt`: masked graph autoencoder trained on regional Severus
-  breakpoint graphs.
+| Directory | Contents |
+|---|---|
+| `pretrained/` | CN masked autoencoder and Severus graph autoencoder |
+| `localization_loo/` | 37 genome-held-out localization scorers and decoder calibrations |
+| `chromosome_fivefold/` | Five chromosome-level multilabel classifiers |
 
-The supervised checkpoints remain beside their provenance and metrics:
+Verify encoder integrity from this directory with:
 
-- `final-results/localization_model/models/loo/`: 37 localization LOO models;
-- `final-results/chromosome_model/models/fivefold/`: five chromosome models;
-- `final-results/chromosome_model/models/loo/`: 37 chromosome LOO models.
+```bash
+cd models/pretrained
+sha256sum -c SHA256SUMS
+```
 
-LOO and five-fold files are evaluation/cross-fit artifacts, not a single
-train-all model. The numbered inference scripts use them as vote ensembles and
-report the vote fraction. This is useful for research application to new
-genomes, but the ensemble threshold has not been validated on an independent
-external cohort.
+The supervised files are cross-validation components rather than train-all
+deployment checkpoints. The inference commands report ensemble vote fractions;
+their ensemble decision thresholds require validation on an independent cohort.

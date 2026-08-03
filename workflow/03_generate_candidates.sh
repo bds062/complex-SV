@@ -12,7 +12,7 @@ manifest="$1"
 output_dir="$2"
 shift 2
 
-exec "$python_bin" "$repo_dir/scripts/generate_standalone_candidate_regions.py" \
+exec "$python_bin" "$repo_dir/workflow/generate_candidates.py" \
     "$manifest" \
     --output_dir "$output_dir" \
     --centromeres "$repo_dir/data/grch38.cen_coord.curated.bed" \
