@@ -92,6 +92,11 @@ sample_B	/absolute/path/sample_B	/absolute/path/sample_B.severus.vcf
 must point to the Severus VCF for the same genome. Sample identifiers must be
 unique and consistent with the training-label tables.
 
+The original 48-genome publication manifest and a utility for appending new
+samples are provided in [`manifest/`](manifest/README.md). The utility selects
+the Wakhan solution with the largest third score component and validates all
+required files before updating a manifest.
+
 Use absolute paths in manifests and pretraining lists. It makes Slurm jobs
 independent of their launch directory.
 
@@ -332,6 +337,7 @@ configs/        versioned method configuration
 data/           Wakhan/Severus parsing and feature construction
 discovery/      candidate and chromosome embedding extraction
 label_generator/ curated caller TSV normalization and provenance
+manifest/       publication cohort manifest and sample-discovery updater
 model/          localization, event-decoder, and chromosome architectures
 models/         pretrained encoders and supervised release ensembles
 pretrain/       masked-autoencoder implementations and trainers
