@@ -53,25 +53,22 @@ model-specific training notes for the full protocol:
 
 ## 1. Installation
 
-Python 3.10 or newer is recommended. Install PyTorch for the CUDA or CPU
-platform first, then install the remaining dependencies:
+The recommended installation uses the supplied Conda environment, which is a
+superset of the KolmogorovLab/Severus environment:
 
 ```bash
 git clone git@github.com:srinivasabd/complex-SV.git
 cd complex-SV
 
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install torch
-python -m pip install -r requirements.txt
-
+conda env create --file environment.yml
+conda activate complex-SV
 python workflow/00_check_install.py
 ```
 
-PyTorch Geometric must match the installed PyTorch/CUDA build. If the generic
-installation does not resolve compatible wheels, follow the official PyG
-installation matrix.
+An existing Severus environment can be extended, but a separate environment is
+recommended so the validated SV-calling installation is not changed. See the
+[environment guide](ENVIRONMENT.md) for Severus reuse, GPU/CUDA verification,
+and installation alternatives.
 
 The project is currently designed for GRCh38. Candidate generation uses the
 bundled [centromere coordinates](data/grch38.cen_coord.curated.bed).
