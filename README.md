@@ -13,9 +13,12 @@ The repository supports two related tasks:
   anywhere on each chromosome. This model is multilabel and does not localize
   an event.
 
-The numbered commands in [`workflow/`](workflow/) are the supported entry
-points. Held-out predictions, aggregate metrics, labels, and primary figures
-are provided in [`benchmarks/`](benchmarks/).
+The numbered commands in [`workflow/`](workflow/) are the supported model entry
+points. The upstream [label generator](label_generator/README.md),
+[candidate generator](candidate_generator/README.md), and replaceable
+[integration-test configuration](test/README.md) are documented separately.
+Held-out predictions, aggregate metrics, labels, and primary figures are
+provided in [`benchmarks/`](benchmarks/).
 
 > **Status:** This is research software, not a clinical diagnostic. The
 > packaged supervised models were evaluated by genome-level cross-validation
@@ -159,7 +162,7 @@ This path returns semi-localized event intervals.
 ### 4.1 Generate label-free proposals
 
 ```bash
-workflow/03_generate_candidates.sh \
+candidate_generator/run.sh \
   inputs/manifest.tsv \
   outputs/localized/candidates \
   --profile balanced \
@@ -324,12 +327,15 @@ results, not external-cohort estimates.
 
 ```text
 benchmarks/     labels, held-out predictions, metrics, and primary figures
+candidate_generator/ label-free Wakhan/Severus proposal pipeline
 configs/        versioned method configuration
 data/           Wakhan/Severus parsing and feature construction
 discovery/      candidate and chromosome embedding extraction
+label_generator/ curated caller TSV normalization and provenance
 model/          localization, event-decoder, and chromosome architectures
 models/         pretrained encoders and supervised release ensembles
 pretrain/       masked-autoencoder implementations and trainers
+test/           configurable single-genome integration tests
 training/       candidate feature preparation and shared loss functions
 workflow/       supported numbered training and inference commands
 ```

@@ -8,7 +8,7 @@ interpreter is not named `python`.
 | 00 | `00_check_install.py` | Validate dependencies and packaged models |
 | 01 | `01_pretrain_cn_encoder.sh` | Pretrain the Wakhan CN autoencoder |
 | 02 | `02_pretrain_sv_encoder.sh` | Pretrain the Severus graph autoencoder |
-| 03 | `03_generate_candidates.sh` | Generate label-free candidate intervals |
+| 03 | `03_generate_candidates.sh` | Compatibility entry point for `candidate_generator/run.sh` |
 | 04 | `04_embed_candidates.sh` | Build localization-model features |
 | 05 | `05_train_localization_model.sh` | Train one localization LOO split |
 | 06 | `06_predict_localization_ensemble.py` | Apply shipped localization models |
