@@ -60,6 +60,10 @@ conda activate complex-SV
 python scripts/00_check_install.py
 ```
 
+All runtime and training dependencies, including PyTorch and PyTorch
+Geometric, are installed by Conda from `conda-forge`/`bioconda`; there is no
+secondary pip installation phase.
+
 The same environment can be reused for Severus and complex-SV:
 
 ```bash
@@ -71,15 +75,25 @@ severus --help
 
 Do not use `--prune` when updating an existing Severus environment. A separate
 `complex-SV` environment remains preferable for reproducibility because it
-isolates the PyTorch stack from a validated caller installation. On a GPU node,
-confirm the installed build with:
+isolates the PyTorch stack from a validated caller installation.
+
+The portable environment selects a CPU PyTorch build when CUDA is not visible
+to Conda. To use a GPU, run the following on a GPU node after creating the
+environment:
+
+```bash
+conda install --name complex-SV --channel conda-forge "pytorch-gpu>=2.1,<3"
+```
+
+Then confirm the installed build with:
 
 ```bash
 python -c "import torch; print(torch.version.cuda, torch.cuda.is_available())"
 ```
 
-If necessary, replace PyTorch with the wheel that matches the cluster CUDA
-runtime.
+When an HPC login node hides the GPU driver, either run the installation in an
+interactive GPU allocation or set `CONDA_OVERRIDE_CUDA` to the CUDA version
+supported by the cluster driver before the `conda install` command.
 
 The project is currently designed for GRCh38. Candidate generation uses the
 bundled [centromere coordinates](genomic_features/grch38.cen_coord.curated.bed).
@@ -133,6 +147,72 @@ set `PYTHON_BIN` if the environment interpreter is not named `python`. The
 final-fit checkpoints use all available training genomes and therefore have no
 held-out performance estimate of their own; use the genome-held-out results in
 `benchmarks/` when reporting expected generalization.
+
+## Apply the localization model to one genome
+
+The shipped localization checkpoint can be applied directly to one new genome.
+It uses the same two signal sources as training: a Wakhan copy-number BED root
+and the matching Severus VCF. The BED argument may be a
+`*_copynumbers_segments` prefix or either `*_HP_1.bed`/`*_HP_2.bed` member;
+the companion haplotype BED is resolved automatically.
+
+```bash
+python scripts/13_predict_localization_single.py \
+  --sample-name SAMPLE_A \
+  --bed-root /absolute/path/SAMPLE_A_copynumbers_segments \
+  --severus-vcf /absolute/path/SAMPLE_A.severus.vcf \
+  --output-dir outputs/SAMPLE_A_localization \
+  --device auto
+```
+
+`--bed-root`, `--wakhan-root`, and `--wakhan-file` are aliases for the same
+Wakhan input. By default, the command uses the final localization model fit on
+all 48 training genomes and the balanced candidate profile. Add
+`--profile sensitive` for the recall-oriented candidate generator, or
+`--checkpoint /path/to/model.pt` to use another compatible final-fit model.
+
+The command generates candidates, embeds them with the shipped frozen
+featurizers, applies the calibrated localizer/decoder, and writes:
+
+```text
+outputs/SAMPLE_A_localization/
+├── predictions.tsv
+├── plots/
+│   ├── BFB/*.png
+│   ├── chromothripsis/*.png
+│   ├── ecDNA/*.png
+│   ├── seismic_amplification/*.png
+│   └── selected_predictions.tsv
+├── input_manifest.tsv
+├── run_summary.json
+├── candidates/
+├── features/
+└── localized_calls/
+```
+
+`predictions.tsv` has one row per final localized class call. Its main fields
+are:
+
+| Field | Meaning |
+|---|---|
+| `prediction_id` | Stable identifier for the call in this run |
+| `sample_name` | CLI sample name |
+| `chromosome`, `chromosome_arm` | Predicted chromosome and arm; arm is blank when the full chromosome is shown |
+| `region`, `start`, `end` | Predicted interval as `chrom:start-end`; coordinates are zero-based with an inclusive end |
+| `prediction` | Predicted broad class: BFB, chromothripsis, ecDNA, or seismic amplification |
+| `score`, `threshold`, `score_margin` | Model score, calibrated class threshold, and their difference |
+| `plot_status`, `plot_path` | Plot result and path relative to the run output directory |
+| `original_start`, `original_end`, `boundary_scale` | Proposal interval before final boundary calibration and the applied scale |
+| `cluster_id`, `cluster_size`, `region_mode`, `nms_mode` | Candidate-cluster and decoder provenance |
+
+Every row in `predictions.tsv` receives a PNG under `plots/<prediction>/`.
+Each plot spans the entire chromosome arm containing the call; a call crossing
+the centromere, or one without a resolvable arm, is shown across the entire
+chromosome. The blue outline marks only the localized `start`-to-`end`
+interval. The three tracks show Severus SV arcs, Wakhan haplotype copy number,
+and breakpoint evidence. `plots/selected_predictions.tsv` is the plot index.
+If no call passes the calibrated decoder, `predictions.tsv` is a valid
+header-only table and no prediction PNGs are produced.
 
 ## 3. Pretrain the autoencoders
 

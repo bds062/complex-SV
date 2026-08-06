@@ -22,10 +22,8 @@ dependencies:
   - pandas>=2.0,<4
   - scikit-learn>=1.3,<2
   - tqdm>=4.65
-  - pip>=23
 
-  # Current PyTorch releases are installed as wheels. PyG's basic operators do
-  # not require the optional compiled extension packages used by advanced PyG.
-  - pip:
-      - torch>=2.1,<3
-      - torch-geometric>=2.5,<3
+  # PyTorch and PyG are resolved from conda-forge; no pip phase is required.
+  # This portable specification selects a CPU build when CUDA is not visible.
+  - pytorch>=2.1,<3
+  - torch-geometric>=2.5,<3

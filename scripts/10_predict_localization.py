@@ -90,9 +90,20 @@ def main() -> None:
             int(values["maximum_per_sample"]),
         )
         if not class_calls.empty:
+            class_calls["threshold"] = float(values["threshold"])
+            class_calls["maximum_per_sample"] = int(values["maximum_per_sample"])
             calls.append(class_calls)
 
-    predictions = pd.concat(calls, ignore_index=True) if calls else pd.DataFrame()
+    prediction_columns = [
+        "event_id", "representative_candidate_id", "sample_id", "chrom",
+        "cluster_id", "cluster_size", "original_start", "original_end",
+        "start", "end", "score", "label", "scale", "region_mode",
+        "nms_mode", "threshold", "maximum_per_sample",
+    ]
+    predictions = (
+        pd.concat(calls, ignore_index=True).reindex(columns=prediction_columns)
+        if calls else pd.DataFrame(columns=prediction_columns)
+    )
     if not predictions.empty:
         predictions = predictions.sort_values(
             ["sample_id", "score"], ascending=[True, False]

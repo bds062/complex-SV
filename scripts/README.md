@@ -18,10 +18,13 @@ interpreter is not named `python`.
 | 10 | `10_predict_localization.py` | Apply the final localization model fit on all 48 genomes |
 | 11 | `11_predict_chromosomes.py` | Apply the final chromosome model fit on all 48 genomes |
 | 12 | `12_predict_new_dataset.sh` | Run both final models on a new manifest |
+| 13 | `13_predict_localization_single.py` | Localize one genome and plot every final prediction |
 
 The [root manual](../README.md) defines input schemas, complete commands,
 training behavior, output files, and limitations. Scripts 05, 06, 08, and 09
-are evaluation/reproduction paths. Scripts 10--12 are the supported application
-paths for new datasets. `train_localization_all.py` creates a final all-genome
-localization fit after deriving its fixed epoch count and decoder settings from
-completed genome-held-out runs.
+are evaluation/reproduction paths. Scripts 10--13 are the supported application
+paths for new datasets. `plot_localized_predictions.py` is the
+whole-arm/chromosome plotting helper used by script 13.
+`train_localization_all.py` creates a final all-genome localization fit after
+deriving its fixed epoch count and decoder settings from completed
+genome-held-out runs.
